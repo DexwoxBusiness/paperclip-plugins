@@ -65,6 +65,14 @@ export default definePlugin({
     // TODO(PCLIP-3): ctx.tools.register(TOOL_NAMES.getWorkItem, async (input) => { ... });
   },
 
+  /**
+   * Host routing contract (verified in server/src/routes/plugins.ts):
+   * ONLY `POST /api/plugins/:pluginId/webhooks/:endpointKey` dispatches here,
+   * and the host rejects (404) any endpointKey not declared in the manifest
+   * before the worker is invoked. Method and path enforcement are therefore
+   * host-owned; the endpointKey check below is defense-in-depth for the
+   * multi-endpoint future, not a routing gate.
+   */
   async onWebhook(input: PluginWebhookInput): Promise<void> {
     const ctx = context;
     const handler = webhookHandler;

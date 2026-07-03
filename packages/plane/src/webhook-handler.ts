@@ -68,12 +68,21 @@ export function deliveryHash(rawBody: string): string {
   return createHash("sha256").update(rawBody, "utf8").digest("hex");
 }
 
-/** Observability write that can never affect control flow. */
+/**
+ * Observability write that can never affect control flow. One retry for
+ * transient state-store hiccups; a persistent failure is logged and dropped
+ * (the host independently records every delivery in plugin_webhook_deliveries,
+ * so plugin-level history loss degrades detail, not auditability).
+ */
 async function recordSafely(deps: WebhookHandlerDeps, entry: DeliveryRecord): Promise<void> {
   try {
     await deps.recordDelivery(entry);
-  } catch (error) {
-    deps.log("failed to record delivery", { requestId: entry.requestId, error: String(error) });
+  } catch {
+    try {
+      await deps.recordDelivery(entry);
+    } catch (error) {
+      deps.log("failed to record delivery", { requestId: entry.requestId, error: String(error) });
+    }
   }
 }
 
@@ -85,8 +94,15 @@ export interface PlaneWebhookHandler {
  * Create a handler instance. The in-flight set lives per instance: within one
  * worker process it serializes concurrent same-body deliveries because the
  * membership check + insert happen synchronously (no await in between).
- * Cross-process dedupe remains best-effort via the persisted seen store; the
- * reconciliation job (PCLIP-5) is the correctness backstop.
+ *
+ * KNOWN LIMITATION (accepted): cross-process dedupe is best-effort via the
+ * persisted seen store. In Paperclip's current deployment model this is moot —
+ * plugins run as ONE out-of-process worker per plugin on a single-node,
+ * self-hosted instance (PLUGIN_SPEC "Current implementation caveats"), so all
+ * deliveries for this plugin flow through one in-flight set. If Paperclip ever
+ * ships multi-node plugin workers, replace the seen store with an atomic
+ * check-and-set. Either way the reconciliation job (PCLIP-5) is the
+ * correctness backstop, converging any duplicate side effects.
  */
 export function createPlaneWebhookHandler(deps: WebhookHandlerDeps): PlaneWebhookHandler {
   const inFlight = new Set<string>();

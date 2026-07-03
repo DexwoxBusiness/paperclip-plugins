@@ -240,15 +240,22 @@ export function createDeliveryRecorder(store: SeenStore, historyKey = "webhook-d
     // otherwise duplicates inflate the bounded history and accelerate
     // eviction of older records (Kody, round 4). Each handler path records
     // at most one outcome per requestId, so the pair is a stable key.
-    const alreadyRecorded = history.some(
+    //
+    // The `at` timestamp is generated once per delivery: on retry, the
+    // EXISTING history entry is mirrored into last-delivery, so PCLIP-8
+    // consumers see the original recording time, not the retry time (Kody).
+    const existingIndex = history.findIndex(
       (h) => h.requestId === entry.requestId && h.outcome === entry.outcome,
     );
-    if (!alreadyRecorded) {
-      history.push(stamped);
+    let record: Record<string, unknown>;
+    if (existingIndex >= 0) {
+      record = history[existingIndex];
+    } else {
+      record = stamped;
+      history.push(record);
       while (history.length > capacity) history.shift();
       await store.set(historyKey, history);
     }
-    // Mirror write is a same-content overwrite on retry — inherently idempotent.
-    await store.set("last-delivery", stamped);
+    await store.set("last-delivery", record);
   };
 }

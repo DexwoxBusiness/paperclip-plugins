@@ -263,9 +263,12 @@ describe("createDeliveryRecorder — retry after partial failure is idempotent (
     // Retry (as recordSafely does): must NOT re-append.
     await record({ requestId: "px-1", outcome: "accepted" });
 
-    const history = stateData.get("history") as Array<{ requestId: string }>;
+    const history = stateData.get("history") as Array<{ requestId: string; at: string }>;
     expect(history).toHaveLength(1);
     expect(stateData.get("last-delivery")).toMatchObject({ requestId: "px-1", outcome: "accepted" });
+    // Kody round 5: the mirror must carry the ORIGINAL recording timestamp,
+    // not a fresh one from the retry.
+    expect((stateData.get("last-delivery") as { at: string }).at).toBe(history[0].at);
   });
 
   it("still records distinct outcomes for the same requestId key shape", async () => {

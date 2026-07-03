@@ -158,6 +158,14 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Backstop sync frequency for Plane CE webhook reliability bugs (#4097, #6848). PCLIP-5",
         default: DEFAULT_CONFIG.reconcileIntervalMinutes,
       },
+      enabledEvents: {
+        type: "array",
+        items: { type: "string", enum: ["issue", "issue_comment", "project", "cycle", "module"] },
+        title: "Enabled webhook event types",
+        description:
+          "Allowlist of Plane event types to process. Defaults to issue + issue_comment (the PCLIP-1 sync surface); other types are recorded 'ignored'. Add project/cycle/module to opt in. An empty list falls back to the default rather than ignoring everything. PCLIP-1",
+        default: [...DEFAULT_CONFIG.enabledEvents],
+      },
     },
     required: ["planeApiKeyRef", "planeBaseUrl", "planeWorkspaceSlug", "webhookSecret", "defaultCompanyId"],
   },

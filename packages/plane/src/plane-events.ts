@@ -10,6 +10,14 @@
 export type PlaneEventType = "issue" | "issue_comment" | "project" | "cycle" | "module" | (string & {});
 export type PlaneEventAction = "created" | "updated" | "deleted" | (string & {});
 
+/**
+ * Default webhook event-type allowlist (PCLIP-1 scope). `issue` and
+ * `issue_comment` are the sync surface; `project`/`cycle`/`module` are OPTIONAL
+ * and OFF by default — an operator opts them in via the `enabledEvents` config.
+ * Kept lowercase to match Plane's payload `event` field verbatim.
+ */
+export const DEFAULT_ENABLED_EVENTS: readonly string[] = ["issue", "issue_comment"];
+
 export interface PlaneWebhookPayload {
   event: PlaneEventType;
   action: PlaneEventAction;

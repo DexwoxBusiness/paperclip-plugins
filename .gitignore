@@ -6,3 +6,5 @@ dist/
 !.env.example
 coverage/
 .DS_Store
+CLAUDE.md
+packages/plane/docs/*

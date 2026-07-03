@@ -6,8 +6,10 @@ import {
   createPlaneWebhookHandler,
   createSeenStore,
   deliveryHash,
+  resolveEnabledEvents,
   type DeliveryRecord,
   type ParsedPlaneEvent,
+  type PlaneWebhookHandler,
   type WebhookHandlerDeps,
 } from "../src/webhook-handler.js";
 
@@ -33,6 +35,14 @@ interface DepsOptions {
   secret?: string;
   routeEvent?: (event: ParsedPlaneEvent) => Promise<void>;
   recordDelivery?: (entry: DeliveryRecord) => Promise<void>;
+  /** Event-type allowlist for the test; defaults to the built-in default (issue + issue_comment). */
+  enabledEvents?: unknown;
+}
+
+/** Default gate: mirrors the worker (resolveEnabledEvents over config). */
+function makeIsEventTypeEnabled(enabledEvents?: unknown) {
+  const allow = resolveEnabledEvents({ enabledEvents });
+  return async (eventType: string) => allow.has(eventType);
 }
 
 function makeDeps(options: DepsOptions = {}): { deps: WebhookHandlerDeps; recorded: Recorded } {
@@ -48,6 +58,7 @@ function makeDeps(options: DepsOptions = {}): { deps: WebhookHandlerDeps; record
     markSeen: seenStore.markSeen,
     recordDelivery:
       options.recordDelivery ?? (async (entry) => void recorded.deliveries.push(entry)),
+    isEventTypeEnabled: makeIsEventTypeEnabled(options.enabledEvents),
     routeEvent:
       options.routeEvent ?? (async (event) => void recorded.routed.push(event)),
     log: (message) => void recorded.logs.push(message),
@@ -150,6 +161,7 @@ describe("createPlaneWebhookHandler (PCLIP-1)", () => {
       getSecret: async () => SECRET,
       isSeen: seenStore.isSeen,
       markSeen: seenStore.markSeen,
+      isEventTypeEnabled: makeIsEventTypeEnabled(),
       recordDelivery: async (entry) => void shared.deliveries.push(entry),
       routeEvent: async (event) => {
         shared.routed.push(event);
@@ -181,6 +193,7 @@ describe("createPlaneWebhookHandler (PCLIP-1)", () => {
       getSecret: async () => SECRET,
       isSeen: seenStore.isSeen,
       markSeen: seenStore.markSeen,
+      isEventTypeEnabled: makeIsEventTypeEnabled(),
       recordDelivery: async (entry) => void shared.deliveries.push(entry),
       routeEvent: async (event) => {
         if (failFirst) {
@@ -359,6 +372,7 @@ describe("resolveEmitCompanyId (Kody round 7: no silent event drops)", () => {
       getSecret: async () => SECRET,
       isSeen: seenStore.isSeen,
       markSeen: seenStore.markSeen,
+      isEventTypeEnabled: makeIsEventTypeEnabled(),
       recordDelivery: async (entry) => void shared.deliveries.push(entry),
       routeEvent: async (event) => {
         // Mirrors worker.routeEvent: resolve company (throws when unconfigured), then emit.
@@ -375,6 +389,89 @@ describe("resolveEmitCompanyId (Kody round 7: no silent event drops)", () => {
 
     expect(shared.routed).toHaveLength(1);
     expect(shared.deliveries.map((d) => d.outcome)).toEqual(["failed", "accepted"]);
+  });
+});
+
+describe("resolveEnabledEvents (PCLIP-1 event gating zero-state)", () => {
+  it("falls back to the default allowlist on unset, empty, or whitespace config", () => {
+    for (const cfg of [{}, { enabledEvents: [] }, { enabledEvents: ["  ", ""] }, { enabledEvents: "issue" }]) {
+      const set = resolveEnabledEvents(cfg as { enabledEvents?: unknown });
+      expect([...set].sort()).toEqual(["issue", "issue_comment"]);
+    }
+  });
+
+  it("respects an explicit list and normalizes case/whitespace", () => {
+    const set = resolveEnabledEvents({ enabledEvents: [" Issue ", "PROJECT"] });
+    expect([...set].sort()).toEqual(["issue", "project"]);
+    expect(set.has("issue_comment")).toBe(false); // narrowing is intentional and visible
+  });
+
+  it("ignores non-string entries without crashing", () => {
+    const set = resolveEnabledEvents({ enabledEvents: ["issue", 42, null, { x: 1 }] });
+    expect([...set]).toEqual(["issue"]);
+  });
+});
+
+describe("event-type gating in the handler (PCLIP-1)", () => {
+  it("ignores an optional event type (project) by default and does not route it", async () => {
+    const { deps, recorded } = makeDeps();
+    const handler = createPlaneWebhookHandler(deps);
+
+    await handler.handle(signedRequest(makeBody({ event: "project" }), "gate-1"));
+
+    expect(recorded.routed).toHaveLength(0);
+    expect(recorded.deliveries[0]).toMatchObject({
+      outcome: "ignored",
+      detail: "event type 'project' not enabled",
+    });
+  });
+
+  it("routes issue_comment by default (part of the default surface)", async () => {
+    const { deps, recorded } = makeDeps();
+    const handler = createPlaneWebhookHandler(deps);
+
+    await handler.handle(signedRequest(makeBody({ event: "issue_comment" }), "gate-2"));
+
+    expect(recorded.routed).toHaveLength(1);
+    expect(recorded.deliveries[0]).toMatchObject({ outcome: "accepted" });
+  });
+
+  it("routes an opted-in optional type when enabledEvents includes it", async () => {
+    const { deps, recorded } = makeDeps({ enabledEvents: ["issue", "project"] });
+    const handler = createPlaneWebhookHandler(deps);
+
+    await handler.handle(signedRequest(makeBody({ event: "project" }), "gate-3"));
+
+    expect(recorded.routed).toHaveLength(1);
+    expect(recorded.routed[0]).toMatchObject({ event: "project" });
+  });
+
+  it("does NOT mark an ignored (disabled) event seen — enabling it later processes the same body", async () => {
+    const shared: Recorded = { deliveries: [], routed: [], logs: [] };
+    const stateData = new Map<string, unknown>();
+    const seenStore = createSeenStore({
+      get: async (k) => stateData.get(k) ?? null,
+      set: async (k, v) => void stateData.set(k, v),
+    });
+    let projectEnabled = false;
+    const handler: PlaneWebhookHandler = createPlaneWebhookHandler({
+      getSecret: async () => SECRET,
+      isSeen: seenStore.isSeen,
+      markSeen: seenStore.markSeen,
+      isEventTypeEnabled: async (t) =>
+        resolveEnabledEvents({ enabledEvents: projectEnabled ? ["issue", "project"] : undefined }).has(t),
+      recordDelivery: async (entry) => void shared.deliveries.push(entry),
+      routeEvent: async (event) => void shared.routed.push(event),
+      log: (m) => void shared.logs.push(m),
+    });
+    const body = makeBody({ event: "project" });
+
+    await handler.handle(signedRequest(body, "gate-4a")); // ignored (disabled)
+    projectEnabled = true; // operator opts project in
+    await handler.handle(signedRequest(body, "gate-4b")); // now processed, NOT a duplicate
+
+    expect(shared.routed).toHaveLength(1);
+    expect(shared.deliveries.map((d) => d.outcome)).toEqual(["ignored", "accepted"]);
   });
 });
 

@@ -5,6 +5,7 @@ import {
   createPlaneWebhookHandler,
   createSeenStore,
   resolveEmitCompanyId,
+  resolveEnabledEvents,
   type PlaneWebhookHandler,
 } from "./webhook-handler.js";
 
@@ -45,6 +46,12 @@ export default definePlugin({
       markSeen: seenStore.markSeen,
       // Bounded history + last-delivery mirror (PCLIP-8 reads this).
       recordDelivery: createDeliveryRecorder(state),
+      // Event-type allowlist read fresh per delivery (live config, like the
+      // secret). Default: issue + issue_comment; project/cycle/module opt-in.
+      isEventTypeEnabled: async (eventType) => {
+        const config = (await ctx.config.get()) as { enabledEvents?: unknown };
+        return resolveEnabledEvents(config).has(eventType);
+      },
       routeEvent: async (event) => {
         // AC #1 "routed to the event handler": verified deliveries are emitted
         // onto the plugin event bus as `plugin.dexwox.plane-sync.plane-event`
@@ -52,8 +59,9 @@ export default definePlugin({
         // to apply project mapping + label filter and upsert via PCLIP-6;
         // until per-mapping company resolution lands there, the emit target
         // company comes from `defaultCompanyId` config.
-        // Scope note: `issue` and `issue_comment` events are the sync surface;
-        // `project` events are OPTIONAL per PCLIP-1 and may be ignored unless configured.
+        // Scope note: routeEvent only ever sees ENABLED event types — the
+        // handler's isEventTypeEnabled gate ignores optional types
+        // (project/cycle/module) before this point unless opted into config.
         const config = (await ctx.config.get()) as { defaultCompanyId?: string };
         // Fail loudly if unconfigured: throwing makes the handler record
         // "failed" and the host return 502, so the delivery stays retryable —

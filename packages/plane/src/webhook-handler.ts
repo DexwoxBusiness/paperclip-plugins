@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { parsePlaneEvent, type ParsedPlaneEvent } from "./plane-events.js";
+import { DEFAULT_ENABLED_EVENTS, parsePlaneEvent, type ParsedPlaneEvent, type PlaneEventType } from "./plane-events.js";
 import { extractPlaneSignature, verifyPlaneSignature } from "./signature.js";
 
 export type { ParsedPlaneEvent } from "./plane-events.js";
@@ -77,6 +77,25 @@ export function resolveEmitCompanyId(config: { defaultCompanyId?: string }): str
   return companyId;
 }
 
+/**
+ * Resolve the event-type allowlist from config (PCLIP-1 event gating).
+ *
+ * Zero-state design (engineering standard #2/#3 — no silent mass-drop):
+ * an unset, empty, or all-whitespace `enabledEvents` falls back to
+ * DEFAULT_ENABLED_EVENTS rather than ignoring EVERY delivery. To narrow or
+ * widen the surface, set an explicit non-empty list (entries are trimmed and
+ * lowercased to match Plane's payload `event` field). Enabling an optional
+ * type (e.g. "project") is therefore an intentional, visible config act.
+ */
+export function resolveEnabledEvents(config: { enabledEvents?: unknown }): Set<string> {
+  const raw = config.enabledEvents;
+  const normalized = (Array.isArray(raw) ? raw : [])
+    .filter((e): e is string => typeof e === "string")
+    .map((e) => e.trim().toLowerCase())
+    .filter((e) => e.length > 0);
+  return new Set(normalized.length > 0 ? normalized : DEFAULT_ENABLED_EVENTS);
+}
+
 export interface WebhookHandlerDeps {
   /** Webhook HMAC secret from plugin config. */
   getSecret(): Promise<string>;
@@ -86,6 +105,12 @@ export interface WebhookHandlerDeps {
   markSeen(deliveryHash: string): Promise<void>;
   /** Record delivery outcome for observability (PCLIP-8 feeds off this). Failures are swallowed + logged. */
   recordDelivery(entry: DeliveryRecord): Promise<void>;
+  /**
+   * True if this Plane event type is in the configured allowlist. Read fresh
+   * per delivery (like getSecret) so live config changes take effect without a
+   * worker restart. Non-core types are recorded "ignored" and never routed.
+   */
+  isEventTypeEnabled(eventType: PlaneEventType): Promise<boolean>;
   /** Route an accepted, deduped event (PCLIP-2 mapping consumes this). */
   routeEvent(event: ParsedPlaneEvent): Promise<void>;
   log(message: string, fields?: Record<string, unknown>): void;
@@ -190,6 +215,24 @@ export function createPlaneWebhookHandler(deps: WebhookHandlerDeps): PlaneWebhoo
         if (!parsed) {
           await recordSafely(deps, { requestId: request.requestId, outcome: "ignored", detail: "not a Plane event" });
           deps.log("plane webhook ignored: not a Plane event", { requestId: request.requestId });
+          return;
+        }
+
+        // PCLIP-1 event gating: optional event types (project/cycle/module) are
+        // OFF unless opted in via `enabledEvents`. An ignored delivery is NOT
+        // marked seen (consistent with the JSON/not-a-Plane-event branches): if
+        // the type is later enabled, a re-delivery or reconciliation processes
+        // it. The outcome is recorded so the no-op is observable (standard #3).
+        if (!(await deps.isEventTypeEnabled(parsed.event))) {
+          await recordSafely(deps, {
+            requestId: request.requestId,
+            outcome: "ignored",
+            detail: `event type '${parsed.event}' not enabled`,
+          });
+          deps.log("plane webhook ignored: event type not enabled", {
+            requestId: request.requestId,
+            event: parsed.event,
+          });
           return;
         }
 

@@ -166,6 +166,27 @@ const manifest: PaperclipPluginManifestV1 = {
           "Allowlist of Plane event types to process. Defaults to issue + issue_comment (the PCLIP-1 sync surface); other types are recorded 'ignored'. Add project/cycle/module to opt in. An empty list falls back to the default rather than ignoring everything. PCLIP-1",
         default: [...DEFAULT_CONFIG.enabledEvents],
       },
+      syncRules: {
+        type: "array",
+        title: "Sync rules (Plane project -> Paperclip project)",
+        description:
+          "Map each Plane project to a Paperclip company + project, with an optional label filter (a Plane label UUID; only issues carrying it sync). Editable here without a restart. Unmapped Plane projects are acknowledged and skipped. PCLIP-2",
+        default: [...DEFAULT_CONFIG.syncRules],
+        items: {
+          type: "object",
+          properties: {
+            planeProjectId: { type: "string", title: "Plane project UUID" },
+            companyId: { type: "string", title: "Paperclip company UUID" },
+            paperclipProjectId: { type: "string", title: "Paperclip project UUID" },
+            labelFilter: {
+              type: "string",
+              title: "Label filter (Plane label UUID, optional)",
+              description: "Only issues carrying this Plane label sync. Name-based filtering arrives with the Plane client (PCLIP-3).",
+            },
+          },
+          required: ["planeProjectId", "companyId", "paperclipProjectId"],
+        },
+      },
     },
     required: ["planeApiKeyRef", "planeBaseUrl", "planeWorkspaceSlug", "webhookSecret", "defaultCompanyId"],
   },

@@ -1,5 +1,5 @@
 import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
-import { JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.js";
+import { ISSUE_ORIGIN_KIND, JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.js";
 import {
   createDeliveryRecorder,
   createPlaneWebhookHandler,
@@ -9,15 +9,23 @@ import {
   type PlaneWebhookHandler,
 } from "./webhook-handler.js";
 import { createIdMappingStore, type IdMappingStore } from "./id-mapping.js";
+import {
+  createSyncRulesHandler,
+  normalizeSyncRules,
+  validateSyncRulesConfig,
+  type IssuesPort,
+  type ProjectLookupPort,
+  type SyncRulesHandler,
+} from "./sync-rules.js";
 
 /**
  * Plane Sync worker.
  *
  * Implemented:
  *  - PCLIP-1  Webhook intake + HMAC verification (constant-time), dedupe, delivery history
+ *  - PCLIP-2  Sync rules: Plane project -> Paperclip project + label filter (sync-rules.ts)
  *  - PCLIP-6  Bidirectional ID mapping in plugin_entities with sync cursor (id-mapping.ts)
  * Backlog (Plane project PCLIP, module "Plane Plugin"):
- *  - PCLIP-2  Sync rules: Plane project -> Paperclip project mapping + label filter (consumes idMapping.link/resolve)
  *  - PCLIP-3  Agent tools (get/search/create/comment/update)
  *  - PCLIP-4  Outbound mirror with echo-loop guard (uses idMapping.resolveByPaperclipId)
  *  - PCLIP-5  Reconciliation job (heals #4097/#6848 webhook gaps; uses cursor + markStale)
@@ -28,6 +36,8 @@ let webhookHandler: PlaneWebhookHandler | undefined;
 // cursor, backed by plugin_entities. PCLIP-2 (mapping/upsert) and PCLIP-5
 // (reconciliation) consume this.
 let idMapping: IdMappingStore | undefined;
+// PCLIP-2 sync-rules handler (project mapping + label filter -> upsert Paperclip issue).
+let syncHandler: SyncRulesHandler | undefined;
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
 
@@ -43,6 +53,36 @@ export default definePlugin({
     const seenStore = createSeenStore(state);
     // PCLIP-6: entity-backed ID mapping store (Postgres-persisted, survives restart).
     idMapping = createIdMappingStore(ctx.entities);
+
+    // PCLIP-2: sync-rules handler. IssuesPort wraps ctx.issues; origin
+    // (kind+id) gives idempotent create so a link failure never duplicates.
+    const issuesPort: IssuesPort = {
+      findByOrigin: async ({ companyId, originKind, originId }) => {
+        const found = await ctx.issues.list({ companyId, originKind, originId, limit: 1 });
+        return found[0] ? { id: found[0].id } : null;
+      },
+      create: async (input) => {
+        const issue = await ctx.issues.create({
+          companyId: input.companyId,
+          projectId: input.projectId,
+          title: input.title,
+          description: input.description,
+          originKind: ISSUE_ORIGIN_KIND,
+          originId: input.originId,
+        });
+        return { id: issue.id };
+      },
+      update: async ({ issueId, companyId, title, description }) => {
+        await ctx.issues.update(issueId, { title, description }, companyId);
+      },
+    };
+    syncHandler = createSyncRulesHandler({
+      getRules: async () => normalizeSyncRules((await ctx.config.get() as { syncRules?: unknown }).syncRules),
+      idMapping,
+      issues: issuesPort,
+      originKind: ISSUE_ORIGIN_KIND,
+      log: (message, fields) => ctx.logger.info(message, fields),
+    });
 
     webhookHandler = createPlaneWebhookHandler({
       getSecret: async () => {
@@ -60,19 +100,18 @@ export default definePlugin({
         return resolveEnabledEvents(config).has(eventType);
       },
       routeEvent: async (event) => {
-        // AC #1 "routed to the event handler": verified deliveries are emitted
-        // onto the plugin event bus as `plugin.dexwox.plane-sync.plane-event`
-        // (requires `events.emit`, declared in the manifest). PCLIP-2 subscribes
-        // to apply project mapping + label filter and upsert via PCLIP-6;
-        // until per-mapping company resolution lands there, the emit target
-        // company comes from `defaultCompanyId` config.
-        // Scope note: routeEvent only ever sees ENABLED event types — the
-        // handler's isEventTypeEnabled gate ignores optional types
-        // (project/cycle/module) before this point unless opted into config.
+        // PCLIP-2 is the AUTHORITATIVE consumer: apply sync rules and upsert the
+        // mapped Paperclip issue IN-PROCESS. Running it here (not via a bus
+        // self-subscription) means a sync failure throws -> host 502 -> Plane
+        // retries, and the upsert is idempotent (origin + PCLIP-6 mapping), so
+        // retries never duplicate. Scope note: only ENABLED event types reach
+        // here (the isEventTypeEnabled gate ran upstream).
+        await syncHandler!.handle(event);
+
+        // Also emit onto the plugin event bus for any external subscribers
+        // (telemetry / other plugins). defaultCompanyId is required in the
+        // manifest; keep the fail-loud resolution so a misconfig is visible.
         const config = (await ctx.config.get()) as { defaultCompanyId?: string };
-        // Fail loudly if unconfigured: throwing makes the handler record
-        // "failed" and the host return 502, so the delivery stays retryable —
-        // a verified event is never dropped behind an HTTP 200.
         const companyId = resolveEmitCompanyId(config);
         await ctx.events.emit("plane-event", companyId, {
           event: event.event,
@@ -103,6 +142,30 @@ export default definePlugin({
     });
 
     // TODO(PCLIP-3): ctx.tools.register(TOOL_NAMES.getWorkItem, async (input) => { ... });
+  },
+
+  /**
+   * PCLIP-2 AC #5: the host calls this after start, on save, and on "Test
+   * Connection". Reject sync rules that reference unknown Paperclip projects
+   * (checked via ctx.projects.get) or are malformed, with clear messages, so an
+   * invalid mapping never persists.
+   */
+  async onValidateConfig(config: Record<string, unknown>) {
+    const ctx = context;
+    const lookup: ProjectLookupPort = {
+      projectExists: async (companyId, projectId) => {
+        // Before setup / without context we can only validate structure; skip
+        // the existence check rather than block (host calls this post-start).
+        if (!ctx) return true;
+        try {
+          return (await ctx.projects.get(projectId, companyId)) !== null;
+        } catch {
+          return false;
+        }
+      },
+    };
+    const result = await validateSyncRulesConfig(config.syncRules, lookup);
+    return { ok: result.ok, errors: result.errors, warnings: result.warnings };
   },
 
   /**

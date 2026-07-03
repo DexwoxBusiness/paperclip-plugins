@@ -45,9 +45,30 @@ export default definePlugin({
       // Bounded history + last-delivery mirror (PCLIP-8 reads this).
       recordDelivery: createDeliveryRecorder(state),
       routeEvent: async (event) => {
-        // TODO(PCLIP-2): apply project mapping + label filter, upsert Paperclip issue via ID mapping (PCLIP-6).
+        // AC #1 "routed to the event handler": verified deliveries are emitted
+        // onto the plugin event bus as `plugin.dexwox.plane-sync.plane-event`
+        // (requires `events.emit`, declared in the manifest). PCLIP-2 subscribes
+        // to apply project mapping + label filter and upsert via PCLIP-6;
+        // until per-mapping company resolution lands there, the emit target
+        // company comes from `defaultCompanyId` config.
         // Scope note: `issue` and `issue_comment` events are the sync surface;
         // `project` events are OPTIONAL per PCLIP-1 and may be ignored unless configured.
+        const config = (await ctx.config.get()) as { defaultCompanyId?: string };
+        if (config.defaultCompanyId) {
+          await ctx.events.emit("plane-event", config.defaultCompanyId, {
+            event: event.event,
+            action: event.action,
+            entityId: event.entityId,
+            projectId: event.projectId,
+            workspaceId: event.workspaceId,
+            payload: event.payload,
+          });
+        } else {
+          ctx.logger.info("plane event received but defaultCompanyId is not configured; event not emitted", {
+            event: event.event,
+            action: event.action,
+          });
+        }
         ctx.logger.info("plane event routed", {
           event: event.event,
           action: event.action,

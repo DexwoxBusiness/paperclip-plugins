@@ -146,6 +146,13 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Shared secret used to verify X-Plane-Signature on inbound webhooks. PCLIP-1",
         default: DEFAULT_CONFIG.webhookSecret,
       },
+      defaultCompanyId: {
+        type: "string",
+        title: "Default Company ID",
+        description:
+          "Paperclip company UUID that verified Plane events are emitted to (plugin event bus) until per-mapping company resolution lands with the sync rules (PCLIP-2).",
+        default: "",
+      },
       reconcileIntervalMinutes: {
         type: "number",
         title: "Reconciliation interval (minutes)",

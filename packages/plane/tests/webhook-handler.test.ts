@@ -307,6 +307,32 @@ describe("createDeliveryRecorder (Codex: history, not just last)", () => {
   });
 });
 
+describe("deliveryStatus (AC #4 success/failure mapping)", () => {
+  it("maps outcomes to the AC's success/failure taxonomy", async () => {
+    const { deliveryStatus } = await import("../src/webhook-handler.js");
+    expect(deliveryStatus("accepted")).toBe("success");
+    expect(deliveryStatus("duplicate")).toBe("success");
+    expect(deliveryStatus("ignored")).toBe("success");
+    expect(deliveryStatus("rejected")).toBe("failure");
+    expect(deliveryStatus("failed")).toBe("failure");
+  });
+
+  it("stamps status onto every recorded delivery", async () => {
+    const stateData = new Map<string, unknown>();
+    const record = createDeliveryRecorder(
+      { get: async (k) => stateData.get(k) ?? null, set: async (k, v) => void stateData.set(k, v) },
+      "history",
+      10,
+    );
+
+    await record({ requestId: "st-1", outcome: "accepted" });
+    await record({ requestId: "st-2", outcome: "rejected" });
+
+    const history = stateData.get("history") as Array<{ status: string }>;
+    expect(history.map((h) => h.status)).toEqual(["success", "failure"]);
+  });
+});
+
 describe("deliveryHash", () => {
   it("is stable for identical bodies and distinct for different bodies", () => {
     expect(deliveryHash("abc")).toBe(deliveryHash("abc"));

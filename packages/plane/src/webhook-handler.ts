@@ -29,6 +29,10 @@ export type { ParsedPlaneEvent } from "./plane-events.js";
  * the error name/message); the external caller observes 502. AC #2's
  * "401" is therefore satisfied at the plugin layer, not the HTTP layer.
  * A host-side statusCode passthrough would be an upstream contribution.
+ *
+ * SUCCESS PATH (also verified in the same host route): when the worker's
+ * handleWebhook resolves without throwing, the host responds HTTP 200
+ * {deliveryId, status:"success"} — AC #1's "accepted (2xx)" is host-provided.
  */
 export class WebhookRejectedError extends Error {
   readonly statusCode = 401;
@@ -42,6 +46,18 @@ export interface DeliveryRecord {
   requestId: string;
   outcome: "accepted" | "rejected" | "duplicate" | "ignored" | "failed";
   detail?: string;
+}
+
+/**
+ * AC #4 taxonomy mapping (explicit per review): every outcome reduces to a
+ * success/failure status. accepted/duplicate/ignored are successful handling
+ * of a delivery (duplicate and ignored are deliberate no-ops, not errors);
+ * rejected/failed are failures. The plugin-state history (webhook-deliveries)
+ * plus the host's plugin_webhook_deliveries table together form the delivery
+ * history; the query/UI surface over the plugin-state view ships with PCLIP-8.
+ */
+export function deliveryStatus(outcome: DeliveryRecord["outcome"]): "success" | "failure" {
+  return outcome === "rejected" || outcome === "failed" ? "failure" : "success";
 }
 
 export interface WebhookHandlerDeps {
@@ -228,7 +244,7 @@ export function createSeenStore(store: SeenStore, stateKey = "seen-deliveries", 
  */
 export function createDeliveryRecorder(store: SeenStore, historyKey = "webhook-deliveries", capacity = 200) {
   return async function recordDelivery(entry: DeliveryRecord): Promise<void> {
-    const stamped = { ...entry, at: new Date().toISOString() };
+    const stamped = { ...entry, status: deliveryStatus(entry.outcome), at: new Date().toISOString() };
     const raw = await store.get(historyKey);
     const history: Array<Record<string, unknown>> = Array.isArray(raw)
       ? (raw as Array<Record<string, unknown>>)

@@ -446,6 +446,27 @@ describe("event-type gating in the handler (PCLIP-1)", () => {
     expect(recorded.routed[0]).toMatchObject({ event: "project" });
   });
 
+  it("normalizes a mixed-case core event type and routes it (Kody: case mismatch)", async () => {
+    const { deps, recorded } = makeDeps();
+    const handler = createPlaneWebhookHandler(deps);
+    await handler.handle(signedRequest(makeBody({ event: "Issue", action: "Created" }), "case-1"));
+    expect(recorded.routed).toHaveLength(1);
+    expect(recorded.routed[0]).toMatchObject({ event: "issue", action: "created" });
+    expect(recorded.deliveries[0]).toMatchObject({ outcome: "accepted", detail: "issue.created" });
+  });
+
+  it("normalizes a mixed-case optional type so the gate is case-consistent", async () => {
+    const off = makeDeps();
+    await createPlaneWebhookHandler(off.deps).handle(signedRequest(makeBody({ event: "Project" }), "case-2"));
+    expect(off.recorded.routed).toHaveLength(0);
+    expect(off.recorded.deliveries[0]).toMatchObject({ outcome: "ignored", detail: "event type 'project' not enabled" });
+
+    const on = makeDeps({ enabledEvents: ["issue", "project"] });
+    await createPlaneWebhookHandler(on.deps).handle(signedRequest(makeBody({ event: "Project" }), "case-3"));
+    expect(on.recorded.routed).toHaveLength(1);
+    expect(on.recorded.routed[0]).toMatchObject({ event: "project" });
+  });
+
   it("does NOT mark an ignored (disabled) event seen — enabling it later processes the same body", async () => {
     const shared: Recorded = { deliveries: [], routed: [], logs: [] };
     const stateData = new Map<string, unknown>();

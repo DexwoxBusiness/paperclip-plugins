@@ -42,6 +42,17 @@ describe("verifyPlaneSignature (PCLIP-1)", () => {
     expect(verifyPlaneSignature(BODY, "deadbeef", SECRET)).toBe(false); // wrong length
   });
 
+  it("rejects signatures of any length without throwing (constant-time path, no length short-circuit)", () => {
+    const correct = computePlaneSignature(BODY, SECRET); // 64 hex chars
+    expect(() => {
+      expect(verifyPlaneSignature(BODY, "a", SECRET)).toBe(false); // far too short
+      expect(verifyPlaneSignature(BODY, correct + "00", SECRET)).toBe(false); // too long
+      expect(verifyPlaneSignature(BODY, correct.slice(0, 63), SECRET)).toBe(false); // one nibble short
+      expect(verifyPlaneSignature(BODY, "z".repeat(64), SECRET)).toBe(false); // right length, non-hex
+    }).not.toThrow();
+    expect(verifyPlaneSignature(BODY, correct, SECRET)).toBe(true); // still accepts the correct one
+  });
+
   it("rejects when no secret is configured", () => {
     const sig = computePlaneSignature(BODY, SECRET);
     expect(verifyPlaneSignature(BODY, sig, "")).toBe(false);

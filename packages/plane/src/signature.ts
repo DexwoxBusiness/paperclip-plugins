@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 /**
  * Plane webhook signature verification (PCLIP-1).
@@ -17,8 +17,10 @@ export function computePlaneSignature(rawBody: string, secret: string): string {
 /**
  * Constant-time verification of an inbound Plane webhook signature.
  *
- * Returns false for a missing/empty/malformed header, a wrong-length digest,
- * or a digest mismatch — never throws on attacker-controlled input.
+ * Returns false for a missing/empty header or any digest mismatch — never
+ * throws on attacker-controlled input, and (AC #5) the comparison path is
+ * constant-time end to end: there is NO length short-circuit and no
+ * variable-time hex validation that could leak the expected digest's shape.
  */
 export function verifyPlaneSignature(
   rawBody: string,
@@ -31,17 +33,27 @@ export function verifyPlaneSignature(
 
   const expectedHex = computePlaneSignature(rawBody, secret);
   const providedHex = header.trim().toLowerCase();
-  if (!/^[0-9a-f]+$/.test(providedHex)) return false;
+  return constantTimeEqual(expectedHex, providedHex);
+}
 
-  const expected = Buffer.from(expectedHex, "hex");
-  const provided = Buffer.from(providedHex, "hex");
-  // The length check is REQUIRED: timingSafeEqual throws on unequal-length
-  // inputs. It does not weaken the constant-time property — HMAC-SHA-256 hex
-  // digests are fixed-length (64 chars), so length reveals nothing secret;
-  // the timing-sensitive byte comparison itself is always timingSafeEqual.
-  if (expected.length !== provided.length) return false;
-
-  return timingSafeEqual(expected, provided);
+/**
+ * Constant-time string equality with NO length short-circuit (AC #5).
+ *
+ * `timingSafeEqual` throws on unequal-length buffers, so comparing the raw hex
+ * digests directly forces a length check that branches BEFORE the constant-time
+ * compare — a (theoretical) timing side channel on the expected digest, and the
+ * exact concern raised in review. Instead we use the double-HMAC construction:
+ * both inputs are reduced to fixed 32-byte MACs under a fresh per-call random
+ * key, then compared with `timingSafeEqual`. The MAC outputs are always
+ * equal-length regardless of input length, so neither the length nor the
+ * content of `expected` (the secret-derived signature) can leak through timing.
+ * Correctness: a === b iff HMAC_k(a) === HMAC_k(b) by collision resistance.
+ */
+function constantTimeEqual(a: string, b: string): boolean {
+  const key = randomBytes(32);
+  const macA = createHmac("sha256", key).update(a, "utf8").digest();
+  const macB = createHmac("sha256", key).update(b, "utf8").digest();
+  return timingSafeEqual(macA, macB);
 }
 
 /** Extract the Plane signature header from a headers record (case-insensitive). */

@@ -53,9 +53,14 @@ export function parsePlaneEvent(body: unknown): ParsedPlaneEvent | null {
     ? candidate.data
     : undefined) as Record<string, unknown> | undefined;
 
+  // Canonicalize event/action to lowercase ONCE at the parse boundary. Plane CE
+  // normally sends lowercase, but normalizing here means every downstream
+  // consumer — the enabledEvents gate, the routeEvent emit, and PCLIP-2 sync
+  // rules — compares against a single canonical form. Fixing it at the source
+  // (not just at the gate call site) closes the case-mismatch class entirely.
   return {
-    event: candidate.event,
-    action: candidate.action,
+    event: candidate.event.toLowerCase(),
+    action: candidate.action.toLowerCase(),
     entityId: typeof data?.id === "string" ? data.id : undefined,
     projectId: typeof data?.project === "string" ? (data.project as string) : undefined,
     workspaceId: typeof candidate.workspace_id === "string" ? candidate.workspace_id : undefined,

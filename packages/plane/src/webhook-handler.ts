@@ -28,7 +28,9 @@ export type { ParsedPlaneEvent } from "./plane-events.js";
  * `statusCode = 401` here is semantic (recorded in delivery history and
  * the error name/message); the external caller observes 502. AC #2's
  * "401" is therefore satisfied at the plugin layer, not the HTTP layer.
- * A host-side statusCode passthrough would be an upstream contribution.
+ * A host-side statusCode passthrough would be an upstream contribution
+ * (tracked as PCLIP-41; full rationale in
+ * docs/adr/0001-webhook-rejection-http-status.md).
  *
  * SUCCESS PATH (also verified in the same host route): when the worker's
  * handleWebhook resolves without throwing, the host responds HTTP 200
@@ -128,9 +130,16 @@ export function deliveryHash(rawBody: string): string {
 
 /**
  * Observability write that can never affect control flow. One retry for
- * transient state-store hiccups; a persistent failure is logged and dropped
- * (the host independently records every delivery in plugin_webhook_deliveries,
- * so plugin-level history loss degrades detail, not auditability).
+ * transient state-store hiccups; a persistent failure is logged and dropped.
+ *
+ * AC #4 is satisfied at TWO independent layers. The host records every delivery
+ * in plugin_webhook_deliveries regardless of this plugin-state write — VERIFIED
+ * in tools/paperclip server/src/routes/plugins.ts (pinned canary/v2026.509.0-canary.1):
+ * it inserts a row with status "pending" before dispatch (~L2327-2337), then
+ * updates it to "success" (~L2352-2359) or "failed" (~L2371-2379) around the
+ * worker call. So plugin-level history loss degrades detail, not auditability;
+ * the plugin history (webhook-deliveries + last-delivery mirror) adds the richer
+ * per-outcome taxonomy that PCLIP-8 surfaces.
  */
 async function recordSafely(deps: WebhookHandlerDeps, entry: DeliveryRecord): Promise<void> {
   try {
@@ -219,10 +228,13 @@ export function createPlaneWebhookHandler(deps: WebhookHandlerDeps): PlaneWebhoo
         }
 
         // PCLIP-1 event gating: optional event types (project/cycle/module) are
-        // OFF unless opted in via `enabledEvents`. An ignored delivery is NOT
-        // marked seen (consistent with the JSON/not-a-Plane-event branches): if
-        // the type is later enabled, a re-delivery or reconciliation processes
-        // it. The outcome is recorded so the no-op is observable (standard #3).
+        // OFF unless opted in via `enabledEvents`. `parsed.event` is already
+        // canonicalized to lowercase in parsePlaneEvent, so this comparison is
+        // case-consistent with the lowercased allowlist (no mixed-case misses).
+        // An ignored delivery is NOT marked seen (consistent with the JSON/
+        // not-a-Plane-event branches): if the type is later enabled, a
+        // re-delivery or reconciliation processes it. The outcome is recorded so
+        // the no-op is observable (standard #3).
         if (!(await deps.isEventTypeEnabled(parsed.event))) {
           await recordSafely(deps, {
             requestId: request.requestId,

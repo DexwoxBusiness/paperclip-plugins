@@ -71,9 +71,15 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 /**
  * Validate the raw syncRules config at save time (PCLIP-2 AC #5): reject
- * malformed rules and unknown Paperclip project IDs with clear messages, and
- * warn on a non-UUID labelFilter (name-based matching needs the Plane client).
- * Pure over a {@link ProjectLookupPort} so it is unit-testable.
+ * malformed rules and unknown project IDs on BOTH sides of the mapping with
+ * clear messages, and warn on a non-UUID labelFilter.
+ *
+ * Plane side: Plane project IDs are UUIDs, but we have no Plane API to check
+ * existence until PCLIP-3, so we validate the UUID FORMAT here (an ill-formed
+ * planeProjectId can never match an event's projectId, so it is rejected).
+ * Paperclip side: existence is checked via {@link ProjectLookupPort}
+ * (ctx.projects.get). The existence lookups run in parallel (Kody perf).
+ * Pure over the port so it is unit-testable.
  */
 export async function validateSyncRulesConfig(raw: unknown, lookup: ProjectLookupPort): Promise<SyncRulesValidation> {
   const errors: string[] = [];
@@ -83,6 +89,7 @@ export async function validateSyncRulesConfig(raw: unknown, lookup: ProjectLooku
   }
   const arr = Array.isArray(raw) ? raw : [];
   const seenPlane = new Set<string>();
+  const existenceChecks: Array<{ at: string; companyId: string; projectId: string }> = [];
   for (let i = 0; i < arr.length; i++) {
     const at = `syncRules[${i}]`;
     const item = arr[i];
@@ -94,19 +101,19 @@ export async function validateSyncRulesConfig(raw: unknown, lookup: ProjectLooku
     const planeProjectId = typeof r.planeProjectId === "string" ? r.planeProjectId.trim() : "";
     const companyId = typeof r.companyId === "string" ? r.companyId.trim() : "";
     const paperclipProjectId = typeof r.paperclipProjectId === "string" ? r.paperclipProjectId.trim() : "";
+
     if (!planeProjectId) errors.push(`${at}: planeProjectId is required`);
+    else if (!UUID_RE.test(planeProjectId)) errors.push(`${at}: planeProjectId "${planeProjectId}" is not a valid Plane project UUID`);
     if (!companyId) errors.push(`${at}: companyId is required`);
     if (!paperclipProjectId) errors.push(`${at}: paperclipProjectId is required`);
+
     if (planeProjectId) {
       if (seenPlane.has(planeProjectId)) errors.push(`${at}: duplicate mapping for Plane project ${planeProjectId}`);
       seenPlane.add(planeProjectId);
     }
-    if (companyId && paperclipProjectId) {
-      const exists = await lookup.projectExists(companyId, paperclipProjectId);
-      if (!exists) {
-        errors.push(`${at}: Paperclip project ${paperclipProjectId} not found in company ${companyId}`);
-      }
-    }
+    // Defer the Paperclip existence check; it hits the host and is parallelized.
+    if (companyId && paperclipProjectId) existenceChecks.push({ at, companyId, projectId: paperclipProjectId });
+
     const labelFilter = typeof r.labelFilter === "string" ? r.labelFilter.trim() : "";
     if (labelFilter && !UUID_RE.test(labelFilter)) {
       warnings.push(
@@ -114,6 +121,16 @@ export async function validateSyncRulesConfig(raw: unknown, lookup: ProjectLooku
       );
     }
   }
+
+  // Run all Paperclip existence lookups concurrently (Kody perf); append their
+  // errors in rule order afterwards so messages stay deterministic.
+  const results = await Promise.all(
+    existenceChecks.map(async (c) => ({ c, exists: await lookup.projectExists(c.companyId, c.projectId) })),
+  );
+  for (const { c, exists } of results) {
+    if (!exists) errors.push(`${c.at}: Paperclip project ${c.projectId} not found in company ${c.companyId}`);
+  }
+
   return { ok: errors.length === 0, errors, warnings };
 }
 
@@ -170,16 +187,23 @@ function extractDescription(payload: unknown): string | undefined {
   return typeof d === "string" ? d : undefined;
 }
 
+/**
+ * Structural mirror of the host's PluginIssueOriginKind (`plugin:${string}`),
+ * declared locally so this module stays SDK-decoupled while remaining assignable
+ * to ctx.issues.create's originKind.
+ */
+export type IssueOriginKind = `plugin:${string}`;
+
 /** Host issue operations this handler needs (wraps ctx.issues). */
 export interface IssuesPort {
   /** Idempotency lookup: an issue previously created for this Plane origin, or null. */
-  findByOrigin(input: { companyId: string; originKind: string; originId: string }): Promise<{ id: string } | null>;
+  findByOrigin(input: { companyId: string; originKind: IssueOriginKind; originId: string }): Promise<{ id: string } | null>;
   create(input: {
     companyId: string;
     projectId: string;
     title: string;
     description?: string;
-    originKind: string;
+    originKind: IssueOriginKind;
     originId: string;
   }): Promise<{ id: string }>;
   update(input: { issueId: string; companyId: string; title?: string; description?: string }): Promise<void>;
@@ -191,7 +215,7 @@ export interface SyncRulesHandlerDeps {
   idMapping: Pick<IdMappingStore, "resolveByPlaneId" | "link" | "markStaleByPlaneId">;
   issues: IssuesPort;
   /** originKind stamped on created issues, e.g. `plugin:dexwox.plane-sync`. */
-  originKind: string;
+  originKind: IssueOriginKind;
   log(message: string, fields?: Record<string, unknown>): void;
 }
 
@@ -235,8 +259,17 @@ export function createSyncRulesHandler(deps: SyncRulesHandlerDeps): SyncRulesHan
         return { kind: "staled", paperclipIssueId: mapped.paperclipIssueId };
       }
 
-      // AC #2: label filter gates created/updated events.
+      // AC #2: the label filter gates every event, not just creates. If an
+      // already-synced issue loses the qualifying label on an update, stop
+      // syncing it — mark the mapping stale (never delete). An unmapped issue
+      // that fails the filter is simply skipped (nothing to create).
       if (rule.labelFilter && !labelMatches(rule.labelFilter, event.payload)) {
+        const mapped = await deps.idMapping.resolveByPlaneId(planeId);
+        if (mapped) {
+          await deps.idMapping.markStaleByPlaneId(planeId);
+          deps.log("plane sync unsynced: qualifying label removed", { planeId, paperclipIssueId: mapped.paperclipIssueId });
+          return { kind: "staled", paperclipIssueId: mapped.paperclipIssueId };
+        }
         deps.log("plane sync skipped: label filter", { planeId, labelFilter: rule.labelFilter });
         return { kind: "skipped", reason: "label-filter" };
       }

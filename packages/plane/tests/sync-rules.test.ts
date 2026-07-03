@@ -11,7 +11,7 @@ import {
   type SyncRule,
 } from "../src/sync-rules.js";
 
-const ORIGIN = "plugin:dexwox.plane-sync";
+const ORIGIN = "plugin:dexwox.plane-sync" as const;
 const RULE: SyncRule = { planeProjectId: "P-A", companyId: "co-1", paperclipProjectId: "pcproj-B", labelFilter: "lbl-agent" };
 
 function issueEvent(overrides: Partial<ParsedPlaneEvent> = {}, data: Record<string, unknown> = {}): ParsedPlaneEvent {
@@ -209,24 +209,44 @@ describe("createSyncRulesHandler (PCLIP-2)", () => {
     const out = await handler.handle(issueEvent({ action: "deleted", entityId: "ghost" }));
     expect(out).toMatchObject({ kind: "skipped", reason: "deleted-unmapped" });
   });
+
+  it("stales an already-synced issue when its qualifying label is removed on update (label filter is authoritative)", async () => {
+    const { handler, issues, idMapping } = makeHandler([RULE]);
+    issues.byId.set("pc-1", { id: "pc-1", companyId: "co-1" });
+    await idMapping.link({ planeId: "plane-1", paperclipIssueId: "pc-1" });
+    // update event with the label removed
+    const out = await handler.handle(issueEvent({ action: "updated" }, { labels: [] }));
+    expect(out).toMatchObject({ kind: "staled", paperclipIssueId: "pc-1" });
+    expect(idMapping.fwd.get("plane-1")?.stale).toBe(true);
+  });
 });
 
 describe("validateSyncRulesConfig (PCLIP-2 AC #5)", () => {
+  const PA = "11111111-1111-4111-8111-111111111111"; // valid Plane project UUID
   const lookup = (known: Set<string>): ProjectLookupPort => ({
     projectExists: async (companyId, projectId) => known.has(`${companyId}/${projectId}`),
   });
 
   it("accepts valid rules whose Paperclip project exists", async () => {
     const res = await validateSyncRulesConfig(
-      [{ planeProjectId: "P-A", companyId: "co-1", paperclipProjectId: "pcproj-B" }],
+      [{ planeProjectId: PA, companyId: "co-1", paperclipProjectId: "pcproj-B" }],
       lookup(new Set(["co-1/pcproj-B"])),
     );
     expect(res).toMatchObject({ ok: true, errors: [] });
   });
 
+  it("rejects an invalid (non-UUID) Plane project ID with a clear message (AC #5, Plane side)", async () => {
+    const res = await validateSyncRulesConfig(
+      [{ planeProjectId: "not-a-uuid", companyId: "co-1", paperclipProjectId: "pcproj-B" }],
+      lookup(new Set(["co-1/pcproj-B"])),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.errors.join("\n")).toMatch(/planeProjectId "not-a-uuid" is not a valid Plane project UUID/);
+  });
+
   it("rejects unknown Paperclip project IDs with a clear message", async () => {
     const res = await validateSyncRulesConfig(
-      [{ planeProjectId: "P-A", companyId: "co-1", paperclipProjectId: "ghost" }],
+      [{ planeProjectId: PA, companyId: "co-1", paperclipProjectId: "ghost" }],
       lookup(new Set()),
     );
     expect(res.ok).toBe(false);
@@ -236,21 +256,44 @@ describe("validateSyncRulesConfig (PCLIP-2 AC #5)", () => {
   it("rejects missing required fields and duplicate Plane project mappings", async () => {
     const res = await validateSyncRulesConfig(
       [
-        { planeProjectId: "P-A", companyId: "co-1", paperclipProjectId: "pcproj-B" },
-        { planeProjectId: "P-A", companyId: "co-1", paperclipProjectId: "pcproj-B" }, // dup
+        { planeProjectId: PA, companyId: "co-1", paperclipProjectId: "pcproj-B" },
+        { planeProjectId: PA, companyId: "co-1", paperclipProjectId: "pcproj-B" }, // dup
         { companyId: "co-1" }, // missing planeProjectId + paperclipProjectId
       ],
       lookup(new Set(["co-1/pcproj-B"])),
     );
     expect(res.ok).toBe(false);
-    expect(res.errors.join("\n")).toMatch(/duplicate mapping for Plane project P-A/);
+    expect(res.errors.join("\n")).toMatch(new RegExp(`duplicate mapping for Plane project ${PA}`));
     expect(res.errors.join("\n")).toMatch(/planeProjectId is required/);
     expect(res.errors.join("\n")).toMatch(/paperclipProjectId is required/);
   });
 
+  it("checks Paperclip existence for multiple rules concurrently (still reports each miss)", async () => {
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const slowLookup: ProjectLookupPort = {
+      projectExists: async () => {
+        concurrent++;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await new Promise((r) => setTimeout(r, 5));
+        concurrent--;
+        return false;
+      },
+    };
+    const rules = [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+      "33333333-3333-4333-8333-333333333333",
+    ].map((id) => ({ planeProjectId: id, companyId: "co-1", paperclipProjectId: `pc-${id}` }));
+    const res = await validateSyncRulesConfig(rules, slowLookup);
+    expect(res.ok).toBe(false);
+    expect(res.errors.filter((e) => e.includes("not found"))).toHaveLength(3);
+    expect(maxConcurrent).toBeGreaterThan(1); // ran in parallel, not sequentially
+  });
+
   it("warns (not errors) on a non-UUID labelFilter", async () => {
     const res = await validateSyncRulesConfig(
-      [{ planeProjectId: "P-A", companyId: "co-1", paperclipProjectId: "pcproj-B", labelFilter: "agent" }],
+      [{ planeProjectId: PA, companyId: "co-1", paperclipProjectId: "pcproj-B", labelFilter: "agent" }],
       lookup(new Set(["co-1/pcproj-B"])),
     );
     expect(res.ok).toBe(true);

@@ -67,7 +67,9 @@ export default definePlugin({
           projectId: input.projectId,
           title: input.title,
           description: input.description,
-          originKind: ISSUE_ORIGIN_KIND,
+          // Honor the caller's originKind (typed `plugin:${string}`) rather than
+          // hardcoding, so origin-based idempotency/traceability is faithful.
+          originKind: input.originKind,
           originId: input.originId,
         });
         return { id: issue.id };
@@ -77,6 +79,8 @@ export default definePlugin({
       },
     };
     syncHandler = createSyncRulesHandler({
+      // Read config fresh per event: ctx.config.get() returns the live saved
+      // value, so settings-UI edits to syncRules apply without a restart (AC #4).
       getRules: async () => normalizeSyncRules((await ctx.config.get() as { syncRules?: unknown }).syncRules),
       idMapping,
       issues: issuesPort,

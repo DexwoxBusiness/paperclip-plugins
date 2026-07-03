@@ -1,0 +1,36 @@
+{
+  "name": "@dexwox/paperclip-plugin-kiwi-tcms",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Kiwi TCMS integration for Paperclip: agent tools for test-case authoring over JSON-RPC and one-way CI results ingest (JUnit/Playwright -> TestRun/TestExecutions) with Plane-ID tagging.",
+  "keywords": ["paperclip-plugin", "paperclip", "kiwi-tcms", "testing", "tcms"],
+  "main": "./dist/index.js",
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsc --watch",
+    "test": "vitest run --passWithNoTests",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "@paperclipai/plugin-sdk": "*",
+    "@paperclipai/shared": "*"
+  },
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "^2026.403.0",
+    "@paperclipai/shared": "^2026.403.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "files": ["dist/"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DexwoxBusiness/paperclip-plugins.git",
+    "directory": "packages/kiwi-tcms"
+  },
+  "license": "MIT"
+}

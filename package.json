@@ -1,0 +1,19 @@
+{
+  "name": "dexwox-paperclip-plugins",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Dexwox suite of Paperclip plugins: Plane sync, MS Teams Chat OS, Kiwi TCMS, Test Context Registry",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "clean": "pnpm -r exec rm -rf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "license": "MIT"
+}

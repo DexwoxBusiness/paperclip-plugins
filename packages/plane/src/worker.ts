@@ -8,21 +8,26 @@ import {
   resolveEnabledEvents,
   type PlaneWebhookHandler,
 } from "./webhook-handler.js";
+import { createIdMappingStore, type IdMappingStore } from "./id-mapping.js";
 
 /**
  * Plane Sync worker.
  *
  * Implemented:
  *  - PCLIP-1  Webhook intake + HMAC verification (constant-time), dedupe, delivery history
+ *  - PCLIP-6  Bidirectional ID mapping in plugin_entities with sync cursor (id-mapping.ts)
  * Backlog (Plane project PCLIP, module "Plane Plugin"):
- *  - PCLIP-2  Sync rules: Plane project -> Paperclip project mapping + label filter
+ *  - PCLIP-2  Sync rules: Plane project -> Paperclip project mapping + label filter (consumes idMapping.link/resolve)
  *  - PCLIP-3  Agent tools (get/search/create/comment/update)
- *  - PCLIP-4  Outbound mirror with echo-loop guard
- *  - PCLIP-5  Reconciliation job (heals #4097/#6848 webhook gaps)
- *  - PCLIP-6  ID mapping in plugin entities with sync cursor
+ *  - PCLIP-4  Outbound mirror with echo-loop guard (uses idMapping.resolveByPaperclipId)
+ *  - PCLIP-5  Reconciliation job (heals #4097/#6848 webhook gaps; uses cursor + markStale)
  */
 let context: PluginContext | undefined;
 let webhookHandler: PlaneWebhookHandler | undefined;
+// PCLIP-6 bidirectional ID mapping (plane_id <-> paperclip_issue_id) with sync
+// cursor, backed by plugin_entities. PCLIP-2 (mapping/upsert) and PCLIP-5
+// (reconciliation) consume this.
+let idMapping: IdMappingStore | undefined;
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
 
@@ -36,6 +41,8 @@ export default definePlugin({
       set: (stateKey: string, value: unknown) => ctx.state.set({ ...INSTANCE_SCOPE, stateKey }, value),
     };
     const seenStore = createSeenStore(state);
+    // PCLIP-6: entity-backed ID mapping store (Postgres-persisted, survives restart).
+    idMapping = createIdMappingStore(ctx.entities);
 
     webhookHandler = createPlaneWebhookHandler({
       getSecret: async () => {
@@ -85,8 +92,14 @@ export default definePlugin({
     });
 
     ctx.jobs.register(JOB_KEYS.reconcile, async (job) => {
-      ctx.logger.info("reconcile run", { runId: job.runId });
-      // TODO(PCLIP-5): page Plane API, diff against entity mapping, heal drift, log healed count.
+      // PCLIP-6: the sync cursor persists across restarts in plugin_entities.
+      // PCLIP-5 will page the Plane API from this watermark, diff against the ID
+      // mapping, mark orphans stale (never delete), and advance the cursor.
+      const cursor = await idMapping!.getCursor();
+      ctx.logger.info("reconcile run", { runId: job.runId, cursor: cursor ?? "(unset)" });
+      // TODO(PCLIP-5): page Plane API from cursor, diff against mapping via
+      // resolveByPlaneId/resolveByPaperclipId, markStaleByPlaneId on orphans,
+      // then idMapping.setCursor(newWatermark) once the page is fully processed.
     });
 
     // TODO(PCLIP-3): ctx.tools.register(TOOL_NAMES.getWorkItem, async (input) => { ... });

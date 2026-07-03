@@ -146,14 +146,28 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Shared secret used to verify X-Plane-Signature on inbound webhooks. PCLIP-1",
         default: DEFAULT_CONFIG.webhookSecret,
       },
+      defaultCompanyId: {
+        type: "string",
+        title: "Default Company ID",
+        description:
+          "REQUIRED. Paperclip company UUID that verified Plane events are emitted to (plugin event bus) until per-mapping company resolution lands with the sync rules (PCLIP-2). Missing config fails deliveries loudly (502, retryable) rather than dropping events.",
+      },
       reconcileIntervalMinutes: {
         type: "number",
         title: "Reconciliation interval (minutes)",
         description: "Backstop sync frequency for Plane CE webhook reliability bugs (#4097, #6848). PCLIP-5",
         default: DEFAULT_CONFIG.reconcileIntervalMinutes,
       },
+      enabledEvents: {
+        type: "array",
+        items: { type: "string", enum: ["issue", "issue_comment", "project", "cycle", "module"] },
+        title: "Enabled webhook event types",
+        description:
+          "Allowlist of Plane event types to process. Defaults to issue + issue_comment (the PCLIP-1 sync surface); other types are recorded 'ignored'. Add project/cycle/module to opt in. An empty list falls back to the default rather than ignoring everything. PCLIP-1",
+        default: [...DEFAULT_CONFIG.enabledEvents],
+      },
     },
-    required: ["planeApiKeyRef", "planeBaseUrl", "planeWorkspaceSlug", "webhookSecret"],
+    required: ["planeApiKeyRef", "planeBaseUrl", "planeWorkspaceSlug", "webhookSecret", "defaultCompanyId"],
   },
 };
 

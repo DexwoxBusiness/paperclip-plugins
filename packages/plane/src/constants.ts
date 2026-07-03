@@ -25,4 +25,6 @@ export const DEFAULT_CONFIG = {
   planeWorkspaceSlug: "",
   webhookSecret: "",
   reconcileIntervalMinutes: 15,
+  /** PCLIP-1 event allowlist default: the issue + issue_comment sync surface. */
+  enabledEvents: ["issue", "issue_comment"] as readonly string[],
 } as const;

@@ -20,6 +20,16 @@ export type { ParsedPlaneEvent } from "./plane-events.js";
  * registration exists or is needed (Codex MUST_FIX #1 is a non-issue by SDK contract).
  */
 
+/**
+ * Signature-rejection error. NOTE (verified against host source,
+ * server/src/routes/plugins.ts): the host maps ANY worker error on
+ * handleWebhook to HTTP 502 {status:"failed", error} and records the
+ * delivery as failed — there is no worker-controlled HTTP status. The
+ * `statusCode = 401` here is semantic (recorded in delivery history and
+ * the error name/message); the external caller observes 502. AC #2's
+ * "401" is therefore satisfied at the plugin layer, not the HTTP layer.
+ * A host-side statusCode passthrough would be an upstream contribution.
+ */
 export class WebhookRejectedError extends Error {
   readonly statusCode = 401;
   constructor(message: string) {
@@ -117,15 +127,20 @@ export function createPlaneWebhookHandler(deps: WebhookHandlerDeps): PlaneWebhoo
           return;
         }
 
-        let parsed: ParsedPlaneEvent | null = null;
+        // Distinguish invalid JSON from valid JSON that isn't a Plane event
+        // (Kody suggestion): both are "ignored" but with different detail.
+        let json: unknown;
         try {
-          parsed = parsePlaneEvent(JSON.parse(request.rawBody));
+          json = JSON.parse(request.rawBody);
         } catch {
-          parsed = null;
+          await recordSafely(deps, { requestId: request.requestId, outcome: "ignored", detail: "invalid JSON" });
+          deps.log("plane webhook ignored: invalid JSON", { requestId: request.requestId });
+          return;
         }
+        const parsed = parsePlaneEvent(json);
         if (!parsed) {
-          await recordSafely(deps, { requestId: request.requestId, outcome: "ignored", detail: "unparseable payload" });
-          deps.log("plane webhook ignored: unparseable", { requestId: request.requestId });
+          await recordSafely(deps, { requestId: request.requestId, outcome: "ignored", detail: "not a Plane event" });
+          deps.log("plane webhook ignored: not a Plane event", { requestId: request.requestId });
           return;
         }
 

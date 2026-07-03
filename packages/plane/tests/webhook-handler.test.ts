@@ -200,14 +200,24 @@ describe("createPlaneWebhookHandler (PCLIP-1)", () => {
     expect(shared.deliveries.map((d) => d.outcome)).toEqual(["failed", "accepted"]);
   });
 
-  it("records but ignores unparseable payloads (signed garbage)", async () => {
+  it("records but ignores invalid JSON (signed garbage)", async () => {
     const { deps, recorded } = makeDeps();
     const handler = createPlaneWebhookHandler(deps);
 
     await handler.handle(signedRequest("not-json", "req-5"));
 
     expect(recorded.routed).toHaveLength(0);
-    expect(recorded.deliveries[0]).toMatchObject({ outcome: "ignored" });
+    expect(recorded.deliveries[0]).toMatchObject({ outcome: "ignored", detail: "invalid JSON" });
+  });
+
+  it("records but ignores valid JSON that is not a Plane event (distinct detail)", async () => {
+    const { deps, recorded } = makeDeps();
+    const handler = createPlaneWebhookHandler(deps);
+
+    await handler.handle(signedRequest(JSON.stringify({ hello: "world" }), "req-6"));
+
+    expect(recorded.routed).toHaveLength(0);
+    expect(recorded.deliveries[0]).toMatchObject({ outcome: "ignored", detail: "not a Plane event" });
   });
 });
 

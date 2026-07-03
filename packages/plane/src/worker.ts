@@ -46,6 +46,8 @@ export default definePlugin({
       recordDelivery: createDeliveryRecorder(state),
       routeEvent: async (event) => {
         // TODO(PCLIP-2): apply project mapping + label filter, upsert Paperclip issue via ID mapping (PCLIP-6).
+        // Scope note: `issue` and `issue_comment` events are the sync surface;
+        // `project` events are OPTIONAL per PCLIP-1 and may be ignored unless configured.
         ctx.logger.info("plane event routed", {
           event: event.event,
           action: event.action,

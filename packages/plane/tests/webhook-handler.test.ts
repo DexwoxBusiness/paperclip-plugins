@@ -239,6 +239,51 @@ describe("createSeenStore", () => {
   });
 });
 
+describe("createDeliveryRecorder — retry after partial failure is idempotent (Kody round 4)", () => {
+  it("does not duplicate a history entry when retried after the mirror write failed", async () => {
+    const stateData = new Map<string, unknown>();
+    let failNextLastDelivery = true;
+    const record = createDeliveryRecorder(
+      {
+        get: async (k) => stateData.get(k) ?? null,
+        set: async (k, v) => {
+          if (k === "last-delivery" && failNextLastDelivery) {
+            failNextLastDelivery = false;
+            throw new Error("transient store failure after history write");
+          }
+          stateData.set(k, v);
+        },
+      },
+      "history",
+      10,
+    );
+
+    // First attempt: history append succeeds, mirror write throws (partial failure).
+    await expect(record({ requestId: "px-1", outcome: "accepted" })).rejects.toThrow("transient");
+    // Retry (as recordSafely does): must NOT re-append.
+    await record({ requestId: "px-1", outcome: "accepted" });
+
+    const history = stateData.get("history") as Array<{ requestId: string }>;
+    expect(history).toHaveLength(1);
+    expect(stateData.get("last-delivery")).toMatchObject({ requestId: "px-1", outcome: "accepted" });
+  });
+
+  it("still records distinct outcomes for the same requestId key shape", async () => {
+    const stateData = new Map<string, unknown>();
+    const record = createDeliveryRecorder(
+      { get: async (k) => stateData.get(k) ?? null, set: async (k, v) => void stateData.set(k, v) },
+      "history",
+      10,
+    );
+
+    await record({ requestId: "px-2", outcome: "failed" });
+    await record({ requestId: "px-3", outcome: "accepted" });
+
+    const history = stateData.get("history") as Array<{ requestId: string }>;
+    expect(history).toHaveLength(2);
+  });
+});
+
 describe("createDeliveryRecorder (Codex: history, not just last)", () => {
   it("appends every delivery to a bounded history and mirrors last-delivery", async () => {
     const stateData = new Map<string, unknown>();

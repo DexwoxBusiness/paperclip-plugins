@@ -230,10 +230,25 @@ export function createDeliveryRecorder(store: SeenStore, historyKey = "webhook-d
   return async function recordDelivery(entry: DeliveryRecord): Promise<void> {
     const stamped = { ...entry, at: new Date().toISOString() };
     const raw = await store.get(historyKey);
-    const history: unknown[] = Array.isArray(raw) ? raw : [];
-    history.push(stamped);
-    while (history.length > capacity) history.shift();
-    await store.set(historyKey, history);
+    const history: Array<Record<string, unknown>> = Array.isArray(raw)
+      ? (raw as Array<Record<string, unknown>>)
+      : [];
+
+    // IDEMPOTENT by (requestId, outcome): recordDelivery performs TWO writes
+    // (history append + last-delivery mirror). A retry after a partial
+    // failure (history write succeeded, mirror failed) must not re-append —
+    // otherwise duplicates inflate the bounded history and accelerate
+    // eviction of older records (Kody, round 4). Each handler path records
+    // at most one outcome per requestId, so the pair is a stable key.
+    const alreadyRecorded = history.some(
+      (h) => h.requestId === entry.requestId && h.outcome === entry.outcome,
+    );
+    if (!alreadyRecorded) {
+      history.push(stamped);
+      while (history.length > capacity) history.shift();
+      await store.set(historyKey, history);
+    }
+    // Mirror write is a same-content overwrite on retry — inherently idempotent.
     await store.set("last-delivery", stamped);
   };
 }

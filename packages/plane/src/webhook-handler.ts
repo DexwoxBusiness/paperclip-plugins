@@ -60,6 +60,23 @@ export function deliveryStatus(outcome: DeliveryRecord["outcome"]): "success" | 
   return outcome === "rejected" || outcome === "failed" ? "failure" : "success";
 }
 
+/**
+ * Fail-loud company resolution for event emission (Kody, round 7): a verified
+ * Plane event must NEVER be silently dropped. Missing/empty defaultCompanyId
+ * throws — the handler records "failed", the host returns 502, the delivery is
+ * NOT marked seen, and Plane's retry reprocesses it once config is fixed.
+ * The manifest also declares the field required, so this is defense-in-depth.
+ */
+export function resolveEmitCompanyId(config: { defaultCompanyId?: string }): string {
+  const companyId = config.defaultCompanyId?.trim();
+  if (!companyId) {
+    throw new Error(
+      "defaultCompanyId is required to emit Plane events — verified deliveries must not be dropped; configure it in plugin settings",
+    );
+  }
+  return companyId;
+}
+
 export interface WebhookHandlerDeps {
   /** Webhook HMAC secret from plugin config. */
   getSecret(): Promise<string>;

@@ -333,6 +333,51 @@ describe("deliveryStatus (AC #4 success/failure mapping)", () => {
   });
 });
 
+describe("resolveEmitCompanyId (Kody round 7: no silent event drops)", () => {
+  it("throws on missing, empty, or whitespace defaultCompanyId", async () => {
+    const { resolveEmitCompanyId } = await import("../src/webhook-handler.js");
+    expect(() => resolveEmitCompanyId({})).toThrow("defaultCompanyId is required");
+    expect(() => resolveEmitCompanyId({ defaultCompanyId: "" })).toThrow("defaultCompanyId is required");
+    expect(() => resolveEmitCompanyId({ defaultCompanyId: "   " })).toThrow("defaultCompanyId is required");
+  });
+
+  it("returns the trimmed company id when configured", async () => {
+    const { resolveEmitCompanyId } = await import("../src/webhook-handler.js");
+    expect(resolveEmitCompanyId({ defaultCompanyId: " company-1 " })).toBe("company-1");
+  });
+
+  it("end-to-end: unconfigured emit fails the delivery (502-path) and leaves it retryable", async () => {
+    const shared: Recorded = { deliveries: [], routed: [], logs: [] };
+    const stateData = new Map<string, unknown>();
+    const seenStore = createSeenStore({
+      get: async (k) => stateData.get(k) ?? null,
+      set: async (k, v) => void stateData.set(k, v),
+    });
+    const { resolveEmitCompanyId } = await import("../src/webhook-handler.js");
+    let configured = false;
+    const handler = createPlaneWebhookHandler({
+      getSecret: async () => SECRET,
+      isSeen: seenStore.isSeen,
+      markSeen: seenStore.markSeen,
+      recordDelivery: async (entry) => void shared.deliveries.push(entry),
+      routeEvent: async (event) => {
+        // Mirrors worker.routeEvent: resolve company (throws when unconfigured), then emit.
+        resolveEmitCompanyId(configured ? { defaultCompanyId: "company-1" } : {});
+        shared.routed.push(event);
+      },
+      log: (m) => void shared.logs.push(m),
+    });
+    const body = makeBody();
+
+    await expect(handler.handle(signedRequest(body, "cfg-1"))).rejects.toThrow("defaultCompanyId is required");
+    configured = true; // operator fixes config; Plane retries
+    await handler.handle(signedRequest(body, "cfg-2"));
+
+    expect(shared.routed).toHaveLength(1);
+    expect(shared.deliveries.map((d) => d.outcome)).toEqual(["failed", "accepted"]);
+  });
+});
+
 describe("deliveryHash", () => {
   it("is stable for identical bodies and distinct for different bodies", () => {
     expect(deliveryHash("abc")).toBe(deliveryHash("abc"));

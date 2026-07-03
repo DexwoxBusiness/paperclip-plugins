@@ -4,6 +4,7 @@ import {
   createDeliveryRecorder,
   createPlaneWebhookHandler,
   createSeenStore,
+  resolveEmitCompanyId,
   type PlaneWebhookHandler,
 } from "./webhook-handler.js";
 
@@ -54,21 +55,18 @@ export default definePlugin({
         // Scope note: `issue` and `issue_comment` events are the sync surface;
         // `project` events are OPTIONAL per PCLIP-1 and may be ignored unless configured.
         const config = (await ctx.config.get()) as { defaultCompanyId?: string };
-        if (config.defaultCompanyId) {
-          await ctx.events.emit("plane-event", config.defaultCompanyId, {
-            event: event.event,
-            action: event.action,
-            entityId: event.entityId,
-            projectId: event.projectId,
-            workspaceId: event.workspaceId,
-            payload: event.payload,
-          });
-        } else {
-          ctx.logger.info("plane event received but defaultCompanyId is not configured; event not emitted", {
-            event: event.event,
-            action: event.action,
-          });
-        }
+        // Fail loudly if unconfigured: throwing makes the handler record
+        // "failed" and the host return 502, so the delivery stays retryable —
+        // a verified event is never dropped behind an HTTP 200.
+        const companyId = resolveEmitCompanyId(config);
+        await ctx.events.emit("plane-event", companyId, {
+          event: event.event,
+          action: event.action,
+          entityId: event.entityId,
+          projectId: event.projectId,
+          workspaceId: event.workspaceId,
+          payload: event.payload,
+        });
         ctx.logger.info("plane event routed", {
           event: event.event,
           action: event.action,
@@ -99,8 +97,9 @@ export default definePlugin({
     const handler = webhookHandler;
     if (!ctx || !handler) throw new Error("plugin context not initialized");
     if (input.endpointKey !== WEBHOOK_KEYS.plane) {
-      ctx.logger.info("unknown webhook endpoint", { endpointKey: input.endpointKey });
-      return;
+      // Same silent-drop class as the companyId guard: a declared-but-unhandled
+      // endpoint must fail loudly (host 502), not vanish behind a 200.
+      throw new Error(`no handler for declared webhook endpoint '${input.endpointKey}'`);
     }
     await handler.handle({ headers: input.headers, rawBody: input.rawBody, requestId: input.requestId });
   },

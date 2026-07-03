@@ -150,8 +150,7 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "Default Company ID",
         description:
-          "Paperclip company UUID that verified Plane events are emitted to (plugin event bus) until per-mapping company resolution lands with the sync rules (PCLIP-2).",
-        default: "",
+          "REQUIRED. Paperclip company UUID that verified Plane events are emitted to (plugin event bus) until per-mapping company resolution lands with the sync rules (PCLIP-2). Missing config fails deliveries loudly (502, retryable) rather than dropping events.",
       },
       reconcileIntervalMinutes: {
         type: "number",
@@ -160,7 +159,7 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_CONFIG.reconcileIntervalMinutes,
       },
     },
-    required: ["planeApiKeyRef", "planeBaseUrl", "planeWorkspaceSlug", "webhookSecret"],
+    required: ["planeApiKeyRef", "planeBaseUrl", "planeWorkspaceSlug", "webhookSecret", "defaultCompanyId"],
   },
 };
 

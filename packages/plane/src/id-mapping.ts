@@ -122,10 +122,16 @@ function toPair(row: EntityRecord): IdMappingPair {
   };
 }
 
+/** Resolve options. Stale mappings are excluded unless includeStale is set. */
+export interface ResolveOpts {
+  /** Include stale (superseded/orphaned) mappings — for audit/reconciliation. */
+  includeStale?: boolean;
+}
+
 export interface IdMappingStore {
   link(input: LinkInput): Promise<IdMappingPair>;
-  resolveByPlaneId(planeId: string, planeType?: string): Promise<IdMappingPair | null>;
-  resolveByPaperclipId(paperclipIssueId: string): Promise<IdMappingPair | null>;
+  resolveByPlaneId(planeId: string, planeType?: string, opts?: ResolveOpts): Promise<IdMappingPair | null>;
+  resolveByPaperclipId(paperclipIssueId: string, opts?: ResolveOpts): Promise<IdMappingPair | null>;
   markStaleByPlaneId(planeId: string, planeType?: string): Promise<IdMappingPair | null>;
   getCursor(): Promise<string | null>;
   setCursor(cursor: string): Promise<void>;
@@ -146,93 +152,137 @@ export function createIdMappingStore(entities: EntitiesPort): IdMappingStore {
     return rows[0] ?? null;
   }
 
-  return {
-    /**
-     * Idempotently link a Plane object to a Paperclip issue.
-     *
-     * Failure-path analysis (engineering standard #1). This performs TWO writes:
-     * the forward row (keyed by Plane ID) then the reverse row (keyed by
-     * Paperclip ID). Crash points:
-     *  - before write 1: nothing persisted; caller retries.
-     *  - after write 1, before write 2: forward resolves, reverse is missing.
-     *    The operation THREW (write 2 error propagates), so the caller (webhook
-     *    handler -> 502 -> Plane retry, or the PCLIP-5 reconciliation job)
-     *    re-invokes link(). Both upserts are idempotent by their unique key, so
-     *    the retry updates the forward row in place and creates the reverse row
-     *    — converging to a consistent pair. Never a duplicate (AC #2).
-     * Each row stores the full pair in `data`, so reconciliation can also repair
-     * a missing complement from whichever row exists.
-     */
-    async link(input: LinkInput): Promise<IdMappingPair> {
-      const planeId = requireId(input.planeId, "planeId");
-      const paperclipIssueId = requireId(input.paperclipIssueId, "paperclipIssueId");
-      const planeType = (input.planeType ?? "issue").trim() || "issue";
-      const data: Record<string, unknown> = {
-        planeId,
-        paperclipIssueId,
-        planeType,
-        stale: false,
-        linkedAt: new Date().toISOString(),
-      };
-      const common = { scopeKind, title: input.title, status: MAPPING_STATUS.active, data } as const;
+  /** Flip a superseded/orphaned row to stale, preserving its data for audit. */
+  async function staleRow(
+    entityType: string,
+    externalId: string,
+    priorData: Record<string, unknown>,
+  ): Promise<void> {
+    await entities.upsert({
+      entityType,
+      scopeKind,
+      externalId,
+      status: MAPPING_STATUS.stale,
+      data: { ...priorData, stale: true, staleAt: new Date().toISOString() },
+    });
+  }
 
-      await entities.upsert({ ...common, entityType: forwardEntityType(planeType), externalId: planeId });
-      await entities.upsert({ ...common, entityType: REVERSE_ENTITY_TYPE, externalId: paperclipIssueId });
+  /** Stale rows are excluded unless includeStale — callers never act on an obsolete pair. */
+  function liveOrNull(row: EntityRecord | null, opts: ResolveOpts): IdMappingPair | null {
+    if (!row) return null;
+    const pair = toPair(row);
+    return pair.stale && !opts.includeStale ? null : pair;
+  }
 
-      return { planeId, paperclipIssueId, planeType, stale: false };
-    },
+  async function resolveByPlaneId(
+    planeId: string,
+    planeType = "issue",
+    opts: ResolveOpts = {},
+  ): Promise<IdMappingPair | null> {
+    const key = planeId?.trim();
+    if (!key) return null;
+    return liveOrNull(await findOne(forwardEntityType(planeType), key), opts);
+  }
 
-    async resolveByPlaneId(planeId: string, planeType = "issue"): Promise<IdMappingPair | null> {
-      const key = planeId?.trim();
-      if (!key) return null;
-      const row = await findOne(forwardEntityType(planeType), key);
-      return row ? toPair(row) : null;
-    },
+  async function resolveByPaperclipId(
+    paperclipIssueId: string,
+    opts: ResolveOpts = {},
+  ): Promise<IdMappingPair | null> {
+    const key = paperclipIssueId?.trim();
+    if (!key) return null;
+    return liveOrNull(await findOne(REVERSE_ENTITY_TYPE, key), opts);
+  }
 
-    async resolveByPaperclipId(paperclipIssueId: string): Promise<IdMappingPair | null> {
-      const key = paperclipIssueId?.trim();
-      if (!key) return null;
-      const row = await findOne(REVERSE_ENTITY_TYPE, key);
-      return row ? toPair(row) : null;
-    },
+  /**
+   * Idempotently link a Plane object to a Paperclip issue, preserving the 1:1
+   * invariant.
+   *
+   * Re-link handling (Codex + Kody). A pair is two rows: forward (keyed by Plane
+   * ID) and reverse (keyed by Paperclip ID). If planeId was previously mapped to
+   * a DIFFERENT paperclipIssueId, the old reverse row still resolves to planeId;
+   * if paperclipIssueId was previously mapped to a different planeId, the old
+   * forward row still resolves to it. Either leaves a live-but-obsolete mapping
+   * that misroutes the outbound mirror / reconciliation. So we stale the
+   * superseded counterpart row(s) to keep the mapping one-to-one.
+   *
+   * Failure-path (engineering standard #1). We READ the prior rows and stale the
+   * superseded counterparts BEFORE overwriting the forward/reverse rows. Reading
+   * first is what makes this re-entrant: until the new rows are committed, a
+   * retry re-reads the same prior partners and re-applies the (idempotent) stale
+   * + upserts, converging without duplicates (AC #2). Writing the new rows first
+   * would erase the prior-partner info a retry needs.
+   */
+  async function link(input: LinkInput): Promise<IdMappingPair> {
+    const planeId = requireId(input.planeId, "planeId");
+    const paperclipIssueId = requireId(input.paperclipIssueId, "paperclipIssueId");
+    const planeType = (input.planeType ?? "issue").trim() || "issue";
 
-    /**
-     * Mark a mapping stale (AC #4): a Plane item deleted upstream must NOT be
-     * silently dropped. We keep both rows for auditability and flip their
-     * `status` to "stale" (plus `data.stale`/`staleAt`), so history and the
-     * host UI can still see the orphan. There is deliberately no delete path.
-     */
-    async markStaleByPlaneId(planeId: string, planeType = "issue"): Promise<IdMappingPair | null> {
-      const existing = await this.resolveByPlaneId(planeId, planeType);
-      if (!existing) return null;
-      const data: Record<string, unknown> = {
-        planeId: existing.planeId,
-        paperclipIssueId: existing.paperclipIssueId,
-        planeType: existing.planeType,
-        stale: true,
-        staleAt: new Date().toISOString(),
-      };
-      const common = { scopeKind, status: MAPPING_STATUS.stale, data } as const;
-      await entities.upsert({ ...common, entityType: forwardEntityType(existing.planeType), externalId: existing.planeId });
-      await entities.upsert({ ...common, entityType: REVERSE_ENTITY_TYPE, externalId: existing.paperclipIssueId });
-      return { ...existing, stale: true };
-    },
+    const priorForward = await findOne(forwardEntityType(planeType), planeId);
+    const priorReverse = await findOne(REVERSE_ENTITY_TYPE, paperclipIssueId);
 
-    /** Read the persistent reconciliation cursor (PCLIP-5), or null if unset. */
-    async getCursor(): Promise<string | null> {
-      const row = await findOne(CURSOR_ENTITY_TYPE, CURSOR_KEY);
-      const value = row?.data?.cursor;
-      return typeof value === "string" ? value : null;
-    },
+    // Stale the superseded counterparts (only when the partner actually changed).
+    const priorPc = priorForward ? String(priorForward.data.paperclipIssueId ?? "") : "";
+    if (priorPc && priorPc !== paperclipIssueId) {
+      await staleRow(REVERSE_ENTITY_TYPE, priorPc, priorForward!.data);
+    }
+    const priorPlane = priorReverse ? String(priorReverse.data.planeId ?? "") : "";
+    if (priorPlane && priorPlane !== planeId) {
+      const priorPlaneType = String(priorReverse!.data.planeType ?? "issue");
+      await staleRow(forwardEntityType(priorPlaneType), priorPlane, priorReverse!.data);
+    }
 
-    /** Persist the reconciliation cursor. Survives restart (Postgres-backed). */
-    async setCursor(cursor: string): Promise<void> {
-      await entities.upsert({
-        entityType: CURSOR_ENTITY_TYPE,
-        scopeKind,
-        externalId: CURSOR_KEY,
-        data: { cursor, updatedAt: new Date().toISOString() },
-      });
-    },
-  };
+    const data: Record<string, unknown> = {
+      planeId,
+      paperclipIssueId,
+      planeType,
+      stale: false,
+      linkedAt: new Date().toISOString(),
+    };
+    const common = { scopeKind, title: input.title, status: MAPPING_STATUS.active, data } as const;
+    await entities.upsert({ ...common, entityType: forwardEntityType(planeType), externalId: planeId });
+    await entities.upsert({ ...common, entityType: REVERSE_ENTITY_TYPE, externalId: paperclipIssueId });
+
+    return { planeId, paperclipIssueId, planeType, stale: false };
+  }
+
+  /**
+   * Mark a mapping stale (AC #4): a Plane item deleted upstream must NOT be
+   * silently dropped. We keep both rows for auditability and flip their `status`
+   * to "stale" (plus `data.stale`/`staleAt`), so history and the host UI can
+   * still see the orphan. There is deliberately no delete path.
+   */
+  async function markStaleByPlaneId(planeId: string, planeType = "issue"): Promise<IdMappingPair | null> {
+    const existing = await resolveByPlaneId(planeId, planeType, { includeStale: true });
+    if (!existing) return null;
+    const data: Record<string, unknown> = {
+      planeId: existing.planeId,
+      paperclipIssueId: existing.paperclipIssueId,
+      planeType: existing.planeType,
+      stale: true,
+      staleAt: new Date().toISOString(),
+    };
+    const common = { scopeKind, status: MAPPING_STATUS.stale, data } as const;
+    await entities.upsert({ ...common, entityType: forwardEntityType(existing.planeType), externalId: existing.planeId });
+    await entities.upsert({ ...common, entityType: REVERSE_ENTITY_TYPE, externalId: existing.paperclipIssueId });
+    return { ...existing, stale: true };
+  }
+
+  /** Read the persistent reconciliation cursor (PCLIP-5), or null if unset. */
+  async function getCursor(): Promise<string | null> {
+    const row = await findOne(CURSOR_ENTITY_TYPE, CURSOR_KEY);
+    const value = row?.data?.cursor;
+    return typeof value === "string" ? value : null;
+  }
+
+  /** Persist the reconciliation cursor. Survives restart (Postgres-backed). */
+  async function setCursor(cursor: string): Promise<void> {
+    await entities.upsert({
+      entityType: CURSOR_ENTITY_TYPE,
+      scopeKind,
+      externalId: CURSOR_KEY,
+      data: { cursor, updatedAt: new Date().toISOString() },
+    });
+  }
+
+  return { link, resolveByPlaneId, resolveByPaperclipId, markStaleByPlaneId, getCursor, setCursor };
 }

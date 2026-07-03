@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import { computePlaneSignature } from "../src/signature.js";
 import {
   WebhookRejectedError,
-  createSeenChecker,
+  createDeliveryRecorder,
+  createPlaneWebhookHandler,
+  createSeenStore,
   deliveryHash,
-  handlePlaneWebhook,
+  type DeliveryRecord,
   type ParsedPlaneEvent,
   type WebhookHandlerDeps,
 } from "../src/webhook-handler.js";
@@ -22,22 +24,32 @@ function makeBody(overrides: Record<string, unknown> = {}): string {
 }
 
 interface Recorded {
-  deliveries: Array<{ requestId: string; outcome: string; detail?: string }>;
+  deliveries: DeliveryRecord[];
   routed: ParsedPlaneEvent[];
   logs: string[];
 }
 
-function makeDeps(secret = SECRET): { deps: WebhookHandlerDeps; recorded: Recorded } {
+interface DepsOptions {
+  secret?: string;
+  routeEvent?: (event: ParsedPlaneEvent) => Promise<void>;
+  recordDelivery?: (entry: DeliveryRecord) => Promise<void>;
+}
+
+function makeDeps(options: DepsOptions = {}): { deps: WebhookHandlerDeps; recorded: Recorded } {
   const recorded: Recorded = { deliveries: [], routed: [], logs: [] };
   const stateData = new Map<string, unknown>();
+  const seenStore = createSeenStore({
+    get: async (k) => stateData.get(k) ?? null,
+    set: async (k, v) => void stateData.set(k, v),
+  });
   const deps: WebhookHandlerDeps = {
-    getSecret: async () => secret,
-    checkAndMarkSeen: createSeenChecker({
-      get: async (k) => stateData.get(k) ?? null,
-      set: async (k, v) => void stateData.set(k, v),
-    }),
-    recordDelivery: async (entry) => void recorded.deliveries.push(entry),
-    routeEvent: async (event) => void recorded.routed.push(event),
+    getSecret: async () => options.secret ?? SECRET,
+    isSeen: seenStore.isSeen,
+    markSeen: seenStore.markSeen,
+    recordDelivery:
+      options.recordDelivery ?? (async (entry) => void recorded.deliveries.push(entry)),
+    routeEvent:
+      options.routeEvent ?? (async (event) => void recorded.routed.push(event)),
     log: (message) => void recorded.logs.push(message),
   };
   return { deps, recorded };
@@ -51,12 +63,12 @@ function signedRequest(rawBody: string, requestId = "req-1") {
   };
 }
 
-describe("handlePlaneWebhook (PCLIP-1)", () => {
+describe("createPlaneWebhookHandler (PCLIP-1)", () => {
   it("accepts a correctly signed payload and routes it", async () => {
     const { deps, recorded } = makeDeps();
-    const body = makeBody();
+    const handler = createPlaneWebhookHandler(deps);
 
-    await handlePlaneWebhook(signedRequest(body), deps);
+    await handler.handle(signedRequest(makeBody()));
 
     expect(recorded.routed).toHaveLength(1);
     expect(recorded.routed[0]).toMatchObject({ event: "issue", action: "created", entityId: "issue-1", projectId: "proj-1" });
@@ -67,9 +79,10 @@ describe("handlePlaneWebhook (PCLIP-1)", () => {
 
   it("rejects a missing signature with 401 and never routes", async () => {
     const { deps, recorded } = makeDeps();
+    const handler = createPlaneWebhookHandler(deps);
 
     await expect(
-      handlePlaneWebhook({ headers: {}, rawBody: makeBody(), requestId: "req-2" }, deps),
+      handler.handle({ headers: {}, rawBody: makeBody(), requestId: "req-2" }),
     ).rejects.toBeInstanceOf(WebhookRejectedError);
 
     expect(recorded.routed).toHaveLength(0);
@@ -80,66 +93,159 @@ describe("handlePlaneWebhook (PCLIP-1)", () => {
 
   it("rejects an invalid signature and logs the attempt", async () => {
     const { deps, recorded } = makeDeps();
+    const handler = createPlaneWebhookHandler(deps);
     const body = makeBody();
 
     await expect(
-      handlePlaneWebhook(
-        { headers: { "X-Plane-Signature": computePlaneSignature(body, "wrong") }, rawBody: body, requestId: "req-3" },
-        deps,
-      ),
+      handler.handle({
+        headers: { "X-Plane-Signature": computePlaneSignature(body, "wrong") },
+        rawBody: body,
+        requestId: "req-3",
+      }),
     ).rejects.toMatchObject({ statusCode: 401 });
 
     expect(recorded.deliveries[0]).toMatchObject({ outcome: "rejected", detail: "invalid signature" });
     expect(recorded.logs).toContain("plane webhook rejected");
   });
 
+  it("still throws the 401 when recordDelivery itself fails (Kody: observability never masks control flow)", async () => {
+    const recorded: Recorded = { deliveries: [], routed: [], logs: [] };
+    const { deps } = makeDeps({
+      recordDelivery: async () => {
+        throw new Error("state store down");
+      },
+    });
+    const depsWithLogs: WebhookHandlerDeps = { ...deps, log: (m) => void recorded.logs.push(m) };
+    const handler = createPlaneWebhookHandler(depsWithLogs);
+
+    await expect(
+      handler.handle({ headers: {}, rawBody: makeBody(), requestId: "req-k1" }),
+    ).rejects.toBeInstanceOf(WebhookRejectedError); // NOT "state store down"
+
+    expect(recorded.logs).toContain("failed to record delivery");
+  });
+
   it("is idempotent for duplicate deliveries (Plane CE #6848)", async () => {
     const { deps, recorded } = makeDeps();
+    const handler = createPlaneWebhookHandler(deps);
     const body = makeBody();
 
-    await handlePlaneWebhook(signedRequest(body, "req-4a"), deps);
-    await handlePlaneWebhook(signedRequest(body, "req-4b"), deps);
+    await handler.handle(signedRequest(body, "req-4a"));
+    await handler.handle(signedRequest(body, "req-4b"));
 
     expect(recorded.routed).toHaveLength(1); // routed exactly once
     expect(recorded.deliveries.map((d) => d.outcome)).toEqual(["accepted", "duplicate"]);
   });
 
+  it("serializes concurrent identical deliveries — only one routes (Kody: atomic check-and-mark)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const shared: Recorded = { deliveries: [], routed: [], logs: [] };
+    const stateData = new Map<string, unknown>();
+    const seenStore = createSeenStore({
+      get: async (k) => stateData.get(k) ?? null,
+      set: async (k, v) => void stateData.set(k, v),
+    });
+    const handler = createPlaneWebhookHandler({
+      getSecret: async () => SECRET,
+      isSeen: seenStore.isSeen,
+      markSeen: seenStore.markSeen,
+      recordDelivery: async (entry) => void shared.deliveries.push(entry),
+      routeEvent: async (event) => {
+        shared.routed.push(event);
+        await gate;
+      },
+      log: (m) => void shared.logs.push(m),
+    });
+    const body = makeBody();
+
+    const first = handler.handle(signedRequest(body, "conc-1"));
+    const second = handler.handle(signedRequest(body, "conc-2"));
+    await second; // completes as in-flight duplicate without routing
+    release();
+    await first;
+
+    expect(shared.routed).toHaveLength(1);
+    expect(shared.deliveries.map((d) => d.outcome).sort()).toEqual(["accepted", "duplicate"]);
+  });
+
+  it("does NOT mark a delivery seen when routing fails — retry reprocesses it (Codex: mark-after-success)", async () => {
+    let failFirst = true;
+    const shared: Recorded = { deliveries: [], routed: [], logs: [] };
+    const stateData = new Map<string, unknown>();
+    const seenStore = createSeenStore({
+      get: async (k) => stateData.get(k) ?? null,
+      set: async (k, v) => void stateData.set(k, v),
+    });
+    const handler = createPlaneWebhookHandler({
+      getSecret: async () => SECRET,
+      isSeen: seenStore.isSeen,
+      markSeen: seenStore.markSeen,
+      recordDelivery: async (entry) => void shared.deliveries.push(entry),
+      routeEvent: async (event) => {
+        if (failFirst) {
+          failFirst = false;
+          throw new Error("transient Paperclip API failure");
+        }
+        shared.routed.push(event);
+      },
+      log: (m) => void shared.logs.push(m),
+    });
+    const body = makeBody();
+
+    await expect(handler.handle(signedRequest(body, "retry-1"))).rejects.toThrow("transient");
+    await handler.handle(signedRequest(body, "retry-2")); // Plane retry
+
+    expect(shared.routed).toHaveLength(1); // retry succeeded, not treated as duplicate
+    expect(shared.deliveries.map((d) => d.outcome)).toEqual(["failed", "accepted"]);
+  });
+
   it("records but ignores unparseable payloads (signed garbage)", async () => {
     const { deps, recorded } = makeDeps();
-    const body = "not-json";
+    const handler = createPlaneWebhookHandler(deps);
 
-    await handlePlaneWebhook(signedRequest(body, "req-5"), deps);
+    await handler.handle(signedRequest("not-json", "req-5"));
 
     expect(recorded.routed).toHaveLength(0);
     expect(recorded.deliveries[0]).toMatchObject({ outcome: "ignored" });
   });
-
-  it("records every delivery outcome (observability AC)", async () => {
-    const { deps, recorded } = makeDeps();
-    const body = makeBody();
-
-    await handlePlaneWebhook(signedRequest(body, "a"), deps); // accepted
-    await handlePlaneWebhook(signedRequest(body, "b"), deps); // duplicate
-    await expect(handlePlaneWebhook({ headers: {}, rawBody: body, requestId: "c" }, deps)).rejects.toThrow(); // rejected
-
-    expect(recorded.deliveries).toHaveLength(3);
-  });
 });
 
-describe("createSeenChecker", () => {
+describe("createSeenStore", () => {
   it("evicts oldest entries beyond capacity (bounded memory)", async () => {
     const stateData = new Map<string, unknown>();
-    const check = createSeenChecker(
+    const store = createSeenStore(
       { get: async (k) => stateData.get(k) ?? null, set: async (k, v) => void stateData.set(k, v) },
       "seen",
       2,
     );
 
-    expect(await check("h1")).toBe(false);
-    expect(await check("h2")).toBe(false);
-    expect(await check("h3")).toBe(false); // evicts h1
-    expect(await check("h1")).toBe(false); // h1 forgotten -> treated as new
-    expect(await check("h3")).toBe(true); // h3 still remembered
+    await store.markSeen("h1");
+    await store.markSeen("h2");
+    await store.markSeen("h3"); // evicts h1
+    expect(await store.isSeen("h1")).toBe(false);
+    expect(await store.isSeen("h2")).toBe(true);
+    expect(await store.isSeen("h3")).toBe(true);
+  });
+});
+
+describe("createDeliveryRecorder (Codex: history, not just last)", () => {
+  it("appends every delivery to a bounded history and mirrors last-delivery", async () => {
+    const stateData = new Map<string, unknown>();
+    const record = createDeliveryRecorder(
+      { get: async (k) => stateData.get(k) ?? null, set: async (k, v) => void stateData.set(k, v) },
+      "history",
+      2,
+    );
+
+    await record({ requestId: "a", outcome: "accepted" });
+    await record({ requestId: "b", outcome: "rejected" });
+    await record({ requestId: "c", outcome: "duplicate" }); // evicts "a"
+
+    const history = stateData.get("history") as Array<{ requestId: string }>;
+    expect(history.map((h) => h.requestId)).toEqual(["b", "c"]);
+    expect(stateData.get("last-delivery")).toMatchObject({ requestId: "c", outcome: "duplicate" });
+    expect((stateData.get("last-delivery") as { at: string }).at).toBeTruthy();
   });
 });
 

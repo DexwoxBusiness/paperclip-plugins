@@ -35,6 +35,10 @@ export function verifyPlaneSignature(
 
   const expected = Buffer.from(expectedHex, "hex");
   const provided = Buffer.from(providedHex, "hex");
+  // The length check is REQUIRED: timingSafeEqual throws on unequal-length
+  // inputs. It does not weaken the constant-time property — HMAC-SHA-256 hex
+  // digests are fixed-length (64 chars), so length reveals nothing secret;
+  // the timing-sensitive byte comparison itself is always timingSafeEqual.
   if (expected.length !== provided.length) return false;
 
   return timingSafeEqual(expected, provided);

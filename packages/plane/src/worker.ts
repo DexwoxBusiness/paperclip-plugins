@@ -1,12 +1,17 @@
 import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.js";
-import { createSeenChecker, handlePlaneWebhook } from "./webhook-handler.js";
+import {
+  createDeliveryRecorder,
+  createPlaneWebhookHandler,
+  createSeenStore,
+  type PlaneWebhookHandler,
+} from "./webhook-handler.js";
 
 /**
  * Plane Sync worker.
  *
  * Implemented:
- *  - PCLIP-1  Webhook intake + HMAC verification (constant-time), dedupe, delivery log
+ *  - PCLIP-1  Webhook intake + HMAC verification (constant-time), dedupe, delivery history
  * Backlog (Plane project PCLIP, module "Plane Plugin"):
  *  - PCLIP-2  Sync rules: Plane project -> Paperclip project mapping + label filter
  *  - PCLIP-3  Agent tools (get/search/create/comment/update)
@@ -15,6 +20,7 @@ import { createSeenChecker, handlePlaneWebhook } from "./webhook-handler.js";
  *  - PCLIP-6  ID mapping in plugin entities with sync cursor
  */
 let context: PluginContext | undefined;
+let webhookHandler: PlaneWebhookHandler | undefined;
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
 
@@ -22,6 +28,32 @@ export default definePlugin({
   async setup(ctx: PluginContext) {
     context = ctx;
     ctx.logger.info(`${PLUGIN_ID} starting`);
+
+    const state = {
+      get: (stateKey: string) => ctx.state.get({ ...INSTANCE_SCOPE, stateKey }),
+      set: (stateKey: string, value: unknown) => ctx.state.set({ ...INSTANCE_SCOPE, stateKey }, value),
+    };
+    const seenStore = createSeenStore(state);
+
+    webhookHandler = createPlaneWebhookHandler({
+      getSecret: async () => {
+        const config = (await ctx.config.get()) as { webhookSecret?: string };
+        return config.webhookSecret ?? "";
+      },
+      isSeen: seenStore.isSeen,
+      markSeen: seenStore.markSeen,
+      // Bounded history + last-delivery mirror (PCLIP-8 reads this).
+      recordDelivery: createDeliveryRecorder(state),
+      routeEvent: async (event) => {
+        // TODO(PCLIP-2): apply project mapping + label filter, upsert Paperclip issue via ID mapping (PCLIP-6).
+        ctx.logger.info("plane event routed", {
+          event: event.event,
+          action: event.action,
+          entityId: event.entityId,
+        });
+      },
+      log: (message, fields) => ctx.logger.info(message, fields),
+    });
 
     ctx.jobs.register(JOB_KEYS.reconcile, async (job) => {
       ctx.logger.info("reconcile run", { runId: job.runId });
@@ -33,38 +65,12 @@ export default definePlugin({
 
   async onWebhook(input: PluginWebhookInput): Promise<void> {
     const ctx = context;
-    if (!ctx) throw new Error("plugin context not initialized");
+    const handler = webhookHandler;
+    if (!ctx || !handler) throw new Error("plugin context not initialized");
     if (input.endpointKey !== WEBHOOK_KEYS.plane) {
       ctx.logger.info("unknown webhook endpoint", { endpointKey: input.endpointKey });
       return;
     }
-
-    const state = {
-      get: (stateKey: string) => ctx.state.get({ ...INSTANCE_SCOPE, stateKey }),
-      set: (stateKey: string, value: unknown) => ctx.state.set({ ...INSTANCE_SCOPE, stateKey }, value),
-    };
-
-    await handlePlaneWebhook(
-      { headers: input.headers, rawBody: input.rawBody, requestId: input.requestId },
-      {
-        getSecret: async () => {
-          const config = (await ctx.config.get()) as { webhookSecret?: string };
-          return config.webhookSecret ?? "";
-        },
-        checkAndMarkSeen: createSeenChecker(state),
-        recordDelivery: async (entry) => {
-          await state.set("last-delivery", { ...entry, at: new Date().toISOString() });
-        },
-        routeEvent: async (event) => {
-          // TODO(PCLIP-2): apply project mapping + label filter, upsert Paperclip issue via ID mapping (PCLIP-6).
-          ctx.logger.info("plane event routed", {
-            event: event.event,
-            action: event.action,
-            entityId: event.entityId,
-          });
-        },
-        log: (message, fields) => ctx.logger.info(message, fields),
-      },
-    );
+    await handler.handle({ headers: input.headers, rawBody: input.rawBody, requestId: input.requestId });
   },
 });

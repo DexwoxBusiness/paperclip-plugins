@@ -21,6 +21,8 @@ export const DEFAULT_CONFIG = {
   paperclipBaseUrl: "http://localhost:3100",
   enableDailyDigest: false,
   digestHour: 9,
+  /** Security default: only secret-refs are honored; raw plaintext URLs are a deliberate legacy opt-in. PCLIP-19 */
+  allowPlaintextWorkflowUrl: false,
 } as const;
 
 /** Teams supports Adaptive Cards ~v1.5 for bot/webhook cards. Do not use newer schema features. (T1) */

@@ -1,16 +1,18 @@
 import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
-import { JOB_KEYS, PLUGIN_ID } from "./constants.js";
+import { DEFAULT_CONFIG, JOB_KEYS, PLUGIN_ID } from "./constants.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
-import { buildNotificationCard, channelFor, createBudgetDedupe, type TeamsNotification } from "./notifications.js";
+import { buildNotificationCard, channelFor, createBudgetDedupe, type ChannelKind, type TeamsNotification } from "./notifications.js";
 import { classifyWorkflowRef, resolveWorkflowRef, type TeamsInstanceConfig } from "./routing.js";
 import { buildDeepLink } from "./links.js";
 import { createWorkflowsClient, safeDeliver, type FetchLike } from "./delivery.js";
+import { buildDigestCard, createDigestAccumulator } from "./digest.js";
 import {
   adaptAgentError,
   adaptApprovalCreated,
   adaptBudgetThreshold,
   adaptIssueCreated,
   adaptIssueDone,
+  extractCostCents,
   type RawPluginEvent,
 } from "./event-adapters.js";
 
@@ -32,6 +34,9 @@ let context: PluginContext | undefined;
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
 
+/** Plugin-state key: the date (server-local) the digest last posted, for once-a-day throttling. */
+const DIGEST_LAST_RUN_DATE_KEY = "digest:last-run-date";
+
 export default definePlugin({
   async setup(ctx: PluginContext) {
     context = ctx;
@@ -44,52 +49,49 @@ export default definePlugin({
     };
     const client = createWorkflowsClient({ fetchFn: ((url, init) => fetch(url, init)) as FetchLike });
     const dedupe = createBudgetDedupe(state);
+    // PCLIP-21: accumulate the daily-digest rollup from events into plugin state.
+    const digest = createDigestAccumulator(state);
 
-    // Resolve the target URL fresh per event (live config; per-type routing is T2,
-    // so v1 always posts to the default Workflows URL).
-    // Returns true only when a card was actually delivered (2xx). A missing URL or
-    // a failed post returns false — the budget dedupe uses this to avoid marking a
-    // threshold seen when nothing was posted.
-    const deliver = async (n: TeamsNotification): Promise<boolean> => {
-      // Route per event type to its channel's Workflows URL, falling back to the
-      // default (T2). Config is read fresh so routing edits apply without a restart.
-      const channel = channelFor(n);
-      const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
+    /**
+     * Resolve the actual Workflows URL for a channel from live config: pick the ref
+     * (per-type or default, T2), enforce the secret-ref trust boundary (Kody, T2),
+     * and resolve secret-refs at call time (never cached/logged). Returns null when
+     * nothing safe to post to. Shared by notification delivery and the digest job.
+     */
+    const resolveChannelUrl = async (
+      cfg: TeamsInstanceConfig,
+      channel: ChannelKind,
+      logCtx: Record<string, unknown>,
+    ): Promise<string | null> => {
       const ref = resolveWorkflowRef(channel, cfg);
       if (!ref) {
-        log("teams notification skipped: no Workflows URL configured for channel", { kind: n.kind, channel });
-        return false;
+        log("teams delivery skipped: no Workflows URL configured for channel", { ...logCtx, channel });
+        return null;
       }
-      // Secure by default (Kody): only secret-refs are honored. A RAW plaintext URL
-      // is delivered directly ONLY when the operator explicitly opts into the legacy
-      // migration bridge (allowPlaintextWorkflowUrl) — otherwise it is refused, so a
-      // config-writer can't defeat the secret-ref trust boundary and POST notification
-      // content to an arbitrary host.
-      let url: string;
       const decision = classifyWorkflowRef(ref, cfg.allowPlaintextWorkflowUrl === true);
       if (decision === "raw-blocked") {
-        log("teams notification skipped: Workflows URL is a plaintext URL but allowPlaintextWorkflowUrl is off — store it as a secret reference (recommended), or enable the legacy flag to migrate", { kind: n.kind, channel });
-        return false;
+        log("teams delivery skipped: Workflows URL is plaintext but allowPlaintextWorkflowUrl is off — store it as a secret reference, or enable the legacy flag to migrate", { ...logCtx, channel });
+        return null;
       }
-      if (decision === "raw-allowed") {
-        url = ref; // legacy plaintext mode, explicitly enabled by the operator
-      } else {
-        // Resolve the capability URL from its secret-ref at CALL TIME — never cached
-        // or logged (AC #3). A resolution failure most likely means plugin secret-refs
-        // are kill-switched (not the pinned build) — skip, never block (PAP-2394).
-        try {
-          url = await ctx.secrets.resolve(ref);
-        } catch {
-          log("teams notification skipped: could not resolve Workflows URL secret-ref (requires the pinned build, PAP-2394)", { kind: n.kind, channel });
-          return false;
-        }
+      if (decision === "raw-allowed") return ref; // legacy plaintext mode, explicitly enabled
+      try {
+        const url = await ctx.secrets.resolve(ref);
+        return url || null;
+      } catch {
+        log("teams delivery skipped: could not resolve Workflows URL secret-ref (requires the pinned build, PAP-2394)", { ...logCtx, channel });
+        return null;
       }
-      if (!url) {
-        log("teams notification skipped: empty Workflows URL from secret-ref", { kind: n.kind, channel });
-        return false;
-      }
-      // PCLIP-20: attach a deep link to the exact entity (built from the public
-      // base URL + company prefix, derived from the card's issue id when present).
+    };
+
+    // Deliver a notification card. Returns true only when a card was actually
+    // delivered (2xx) — the budget dedupe uses this to avoid marking a threshold
+    // seen when nothing was posted. Config is read fresh (routing edits need no restart).
+    const deliver = async (n: TeamsNotification): Promise<boolean> => {
+      const channel = channelFor(n);
+      const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
+      const url = await resolveChannelUrl(cfg, channel, { kind: n.kind });
+      if (!url) return false;
+      // PCLIP-20: attach a deep link to the exact entity (public base URL + prefix).
       const link = buildDeepLink(n, { baseUrl: cfg.paperclipBaseUrl, companyPrefix: cfg.paperclipCompanyPrefix });
       const message = toWorkflowsMessage(buildNotificationCard({ ...n, link }));
       const outcome = await safeDeliver(client, url, message, log, { kind: n.kind, channel });
@@ -109,10 +111,40 @@ export default definePlugin({
       });
     };
 
-    on("issue.created", adaptIssueCreated);
-    on("agent.task_completed", adaptIssueDone);
     on("approval.created", adaptApprovalCreated);
     on("agent.run.failed", adaptAgentError);
+
+    // issue.created and agent.task_completed also feed the daily-digest rollup
+    // (PCLIP-21). Accumulation happens regardless of whether a card was built, and
+    // is wrapped so it never throws into the core flow.
+    ctx.events.on("issue.created", async (ev) => {
+      try {
+        const n = adaptIssueCreated(ev);
+        if (n) await deliver(n);
+        await digest.onIssueCreated();
+      } catch (e) {
+        log("teams issue.created handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+      }
+    });
+    ctx.events.on("agent.task_completed", async (ev) => {
+      try {
+        const n = adaptIssueDone(ev);
+        if (n) await deliver(n);
+        await digest.onTaskCompleted(n && n.kind === "issue-done" ? n.agentName : undefined);
+      } catch (e) {
+        log("teams agent.task_completed handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+      }
+    });
+    // cost_event.created feeds only the digest cost total (no card). AC #3: the
+    // digest total is the sum of these events' cost.
+    ctx.events.on("cost_event.created", async (ev) => {
+      try {
+        const cents = extractCostCents(ev);
+        if (cents !== undefined) await digest.onCostCents(cents);
+      } catch (e) {
+        log("teams cost_event.created handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+      }
+    });
 
     // Budget thresholds: post at most once per (budget, threshold). The threshold is
     // marked seen only AFTER a successful delivery (postOnce), so a crossing before
@@ -134,10 +166,40 @@ export default definePlugin({
     onBudget("budget.soft_threshold_crossed");
     onBudget("budget.hard_threshold_crossed");
 
+    // PCLIP-21: daily digest. The manifest ticks this HOURLY; we self-throttle to
+    // the configured hour and post once per day, so digestHour is adjustable at
+    // runtime without a restart (a static cron can't read config). Hour is
+    // server-local — set digestHour to your local hour.
     ctx.jobs.register(JOB_KEYS.dailyDigest, async (job) => {
-      ctx.logger.info("daily digest run", { runId: job.runId });
-      // TODO(PCLIP-21/T4): pull stats from the Paperclip API, post a digest card,
-      // and a compact "no activity" card when the last 24h were quiet.
+      try {
+        const cfg = (await ctx.config.get()) as TeamsInstanceConfig & { enableDailyDigest?: boolean; digestHour?: number };
+        if (!cfg.enableDailyDigest) return;
+        const nowDate = new Date();
+        const hour = typeof cfg.digestHour === "number" ? cfg.digestHour : DEFAULT_CONFIG.digestHour;
+        if (nowDate.getHours() !== hour) return;
+        const today = `${nowDate.getFullYear()}-${String(nowDate.getMonth() + 1).padStart(2, "0")}-${String(nowDate.getDate()).padStart(2, "0")}`;
+        if ((await state.get(DIGEST_LAST_RUN_DATE_KEY)) === today) return; // already posted today
+
+        // Resolve the channel BEFORE consuming the window — if we can't post, keep
+        // accumulating rather than dropping the day's stats.
+        const url = await resolveChannelUrl(cfg, "default", { kind: "digest" });
+        if (!url) {
+          log("teams digest skipped: no channel configured", { runId: job.runId });
+          return;
+        }
+        await state.set(DIGEST_LAST_RUN_DATE_KEY, today);
+        const rollup = await digest.readAndReset();
+        const message = toWorkflowsMessage(buildDigestCard(rollup));
+        await safeDeliver(client, url, message, log, { kind: "digest", channel: "default" });
+        ctx.logger.info("teams digest posted", {
+          runId: job.runId,
+          tasksCompleted: rollup.tasksCompleted,
+          tasksCreated: rollup.tasksCreated,
+          totalCostCents: rollup.totalCostCents,
+        });
+      } catch (e) {
+        log("teams digest error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+      }
     });
   },
 

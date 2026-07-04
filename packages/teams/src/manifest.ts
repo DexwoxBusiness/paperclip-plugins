@@ -43,7 +43,10 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: JOB_KEYS.dailyDigest,
       displayName: "Daily digest",
       description: "Posts daily agent-activity stats (done/created/active/cost/top performer). PCLIP-21",
-      schedule: `0 ${DEFAULT_CONFIG.digestHour} * * *`,
+      // Ticks hourly; the worker self-throttles to the configured digestHour and
+      // posts once per day, so the time is adjustable at runtime (a static cron
+      // can't read config).
+      schedule: "0 * * * *",
     },
   ],
   instanceConfigSchema: {

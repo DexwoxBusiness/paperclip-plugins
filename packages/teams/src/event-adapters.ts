@@ -29,6 +29,26 @@ function str(v: unknown): string | undefined {
   if (typeof v === "number" && Number.isFinite(v)) return String(v);
   return undefined;
 }
+function num(v: unknown): number | undefined {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) return Number(v);
+  return undefined;
+}
+
+/**
+ * Cost of a `cost_event.created` event, in CENTS (the host stores
+ * `cost_events.cost_cents`). Read defensively — prefer an explicit cents field,
+ * else convert a dollar `amount`. Returns undefined when no cost is present, so
+ * the digest accumulator ignores it (PCLIP-21 AC #3).
+ */
+export function extractCostCents(ev: RawPluginEvent): number | undefined {
+  const p = obj(ev.payload);
+  const cost = obj(p.cost ?? p.cost_event ?? p);
+  const cents = num(p.costCents) ?? num(p.cost_cents) ?? num(cost.costCents) ?? num(cost.cost_cents);
+  if (cents !== undefined) return cents;
+  const dollars = num(p.amount) ?? num(cost.amount) ?? num(p.cost);
+  return dollars !== undefined ? Math.round(dollars * 100) : undefined;
+}
 
 /**
  * Best-effort readable issue id (PROJ-123) from a variety of payload shapes.

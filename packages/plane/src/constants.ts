@@ -25,6 +25,11 @@ export const DEFAULT_CONFIG = {
   planeWorkspaceSlug: "",
   webhookSecret: "",
   reconcileIntervalMinutes: 15,
-  /** PCLIP-1 event allowlist default: the issue + issue_comment sync surface. */
+  /** PCLIP-1 intake allowlist default. PCLIP-2 sync rules act on issue events; issue_comment is intake-only (comment mirroring is a later item). */
   enabledEvents: ["issue", "issue_comment"] as readonly string[],
+  /** PCLIP-2 sync rules (Plane project -> Paperclip project + optional label filter). Empty until configured. */
+  syncRules: [] as ReadonlyArray<Record<string, unknown>>,
 } as const;
+
+/** originKind stamped on Paperclip issues created by this plugin (PCLIP-2 idempotency). */
+export const ISSUE_ORIGIN_KIND = `plugin:${PLUGIN_ID}` as const;

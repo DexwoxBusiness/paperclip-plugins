@@ -4,3 +4,4 @@ export * from "./signature.js";
 export * from "./plane-events.js";
 export * from "./webhook-handler.js";
 export * from "./id-mapping.js";
+export * from "./sync-rules.js";

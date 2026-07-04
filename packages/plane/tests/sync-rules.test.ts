@@ -102,7 +102,8 @@ describe("normalizeSyncRules", () => {
       { planeProjectId: "P-B" }, // missing fields -> dropped
       42,
     ]);
-    expect(rules).toEqual([{ planeProjectId: "P-A", companyId: "co-1", paperclipProjectId: "pcproj-B", labelFilter: "lbl" }]);
+    // planeProjectId is canonicalized to lowercase (see the dedicated test below).
+    expect(rules).toEqual([{ planeProjectId: "p-a", companyId: "co-1", paperclipProjectId: "pcproj-B", labelFilter: "lbl" }]);
   });
 
   it("lowercases planeProjectId so uppercase config still matches events (Kody)", () => {

@@ -33,10 +33,13 @@ import {
   type PlaneComment,
   type PlaneCommentResult,
   type PlaneCreateInput,
+  type PlaneListWorkItemsInput,
   type PlaneMutationResult,
+  type PlaneReconcilePort,
   type PlaneSearchResult,
   type PlaneStateResult,
   type PlaneWorkItem,
+  type PlaneWorkItemPage,
   type PlaneWorkItemSummary,
 } from "./plane-client.js";
 
@@ -68,7 +71,7 @@ export interface PlaneRestClientDeps {
   now?: () => number;
 }
 
-export interface PlaneRestClient extends PlaneClientPort {
+export interface PlaneRestClient extends PlaneClientPort, PlaneReconcilePort {
   /** Lightweight authenticated ping for the settings "Test Connection" (AC #3). */
   testConnection(): Promise<{ ok: boolean; error?: string }>;
 }
@@ -323,6 +326,41 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
       const ref = await fetchIssueRef(idOrIdentifier);
       await request<Record<string, unknown>>("PATCH", `projects/${ref.projectId}/work-items/${ref.id}`, { body: { state } });
       return { id: ref.id, identifier: ref.identifier, state, url: browseUrl(ref.identifier) };
+    },
+
+    async listProjectWorkItems(input: PlaneListWorkItemsInput): Promise<PlaneWorkItemPage> {
+      // Cursor pagination (doc-verified): GET projects/{id}/work-items/ returns
+      // { results, next_cursor, next_page_results, ... }. per_page max 100.
+      const perPage = Math.min(Math.max(input.perPage ?? 100, 1), 100);
+      const raw = await request<{ results?: unknown[]; next_cursor?: unknown; next_page_results?: unknown }>(
+        "GET",
+        `projects/${input.projectId}/work-items`,
+        { query: { cursor: input.cursor, per_page: String(perPage), order_by: input.orderBy } },
+      );
+      const results = Array.isArray(raw.results) ? raw.results : [];
+      const items = results.map((r) => {
+        const o = (r ?? {}) as Record<string, unknown>;
+        // state may be a UUID string (default) or an expanded object.
+        const state =
+          typeof o.state === "string"
+            ? o.state
+            : o.state && typeof o.state === "object"
+              ? String((o.state as Record<string, unknown>).id ?? "")
+              : "";
+        return {
+          id: String(o.id ?? ""),
+          name: String(o.name ?? ""),
+          descriptionHtml: String(o.description_html ?? o.description ?? ""),
+          updatedAt: typeof o.updated_at === "string" ? o.updated_at : undefined,
+          labels: Array.isArray(o.labels) ? o.labels.map((l) => String(l)) : [],
+          state,
+        };
+      });
+      // Only advertise another page when the server both flags more results AND
+      // hands back a usable cursor — defends against an unbounded paging loop.
+      const nextCursor = typeof raw.next_cursor === "string" && raw.next_cursor ? raw.next_cursor : undefined;
+      const hasMore = raw.next_page_results === true && nextCursor !== undefined;
+      return { items, nextCursor: hasMore ? nextCursor : undefined, hasMore };
     },
 
     async testConnection(): Promise<{ ok: boolean; error?: string }> {

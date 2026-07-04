@@ -1,9 +1,10 @@
 import { definePlugin, type PluginContext, type PluginEvent, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
-import { ISSUE_ORIGIN_KIND, JOB_KEYS, PLUGIN_ID, TOOL_NAMES, WEBHOOK_KEYS } from "./constants.js";
+import { DEFAULT_CONFIG, ISSUE_ORIGIN_KIND, JOB_KEYS, PLUGIN_ID, TOOL_NAMES, WEBHOOK_KEYS } from "./constants.js";
 import pluginManifest from "./manifest.js";
 import { createAgentTools, registerPlaneTools, type ToolRegistrar } from "./agent-tools.js";
-import { createUnconfiguredPlaneClient, type PlaneClientPort } from "./plane-client.js";
+import { createUnconfiguredPlaneClient, type PlaneClientPort, type PlaneReconcilePort } from "./plane-client.js";
 import { createPlaneRestClient, type FetchLike, type PlaneRestClient } from "./plane-rest-client.js";
+import { createReconciler, type Reconciler, type ReconcileRunSummary } from "./reconcile.js";
 import {
   createOutboundMirrorHandler,
   createOutboundQueue,
@@ -60,6 +61,25 @@ let planeClient: PlaneClientPort = createUnconfiguredPlaneClient();
 let outboundMirror: OutboundMirrorHandler | undefined;
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
+
+// PCLIP-5 reconciliation: plugin-state keys for the interval throttle + the run
+// history that makes job runs observable (AC #4/#5).
+const RECONCILE_LAST_RUN_KEY = "reconcile:last-run-at";
+const RECONCILE_LAST_KEY = "reconcile:last";
+const RECONCILE_HISTORY_KEY = "reconcile:runs";
+const RECONCILE_HISTORY_LIMIT = 20;
+
+type ReconcileStateAccess = { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void> };
+
+/** Persist the last run + a bounded run history to plugin state (AC #4 observability). */
+async function recordReconcileRun(state: ReconcileStateAccess, summary: ReconcileRunSummary): Promise<void> {
+  await state.set(RECONCILE_LAST_KEY, summary);
+  const raw = await state.get(RECONCILE_HISTORY_KEY);
+  const history = Array.isArray(raw) ? (raw as ReconcileRunSummary[]) : [];
+  history.push(summary);
+  while (history.length > RECONCILE_HISTORY_LIMIT) history.shift();
+  await state.set(RECONCILE_HISTORY_KEY, history);
+}
 
 /**
  * Adapt a raw `issue.updated` domain event into the decoupled OutboundEvent.
@@ -118,6 +138,10 @@ export default definePlugin({
     const seenStore = createSeenStore(state);
     // PCLIP-6: entity-backed ID mapping store (Postgres-persisted, survives restart).
     idMapping = createIdMappingStore(ctx.entities);
+    // PCLIP-5: reconciliation Plane data port + reconciler, wired only when the
+    // Plane REST client is configured (below, and after the issues port exists).
+    let planeReconcile: PlaneReconcilePort | undefined;
+    let reconciler: Reconciler | undefined;
 
     // PCLIP-7: when auth + endpoint config is present, replace the unconfigured
     // stub with the authenticated Plane REST client. The API key is resolved
@@ -129,7 +153,7 @@ export default definePlugin({
       planeWorkspaceSlug?: string;
     };
     if (authCfg.planeApiKeyRef && authCfg.planeBaseUrl && authCfg.planeWorkspaceSlug) {
-      planeClient = createPlaneRestClient({
+      const restClient = createPlaneRestClient({
         baseUrl: authCfg.planeBaseUrl,
         workspaceSlug: authCfg.planeWorkspaceSlug,
         getApiKey: async () => {
@@ -139,6 +163,9 @@ export default definePlugin({
         fetchFn: ((url, init) => fetch(url, init)) as FetchLike,
         timeoutMs: 5000,
       });
+      planeClient = restClient;
+      // PCLIP-5 pages Plane through the same authenticated client.
+      planeReconcile = restClient;
       ctx.logger.info("Plane REST client configured (PCLIP-7)");
 
       // PCLIP-4: outbound mirror. Only wired when the Plane client is live.
@@ -203,6 +230,25 @@ export default definePlugin({
       log: (message, fields) => ctx.logger.info(message, fields),
     });
 
+    // PCLIP-5: reconciliation backstop. Built only when Plane is configured; it
+    // reuses the SAME idempotent upsert as the webhook path (upsertMappedIssue —
+    // no drift, no duplicates) and pages Plane through the authenticated client.
+    if (planeReconcile) {
+      reconciler = createReconciler({
+        getRules: async () => normalizeSyncRules(((await ctx.config.get()) as { syncRules?: unknown }).syncRules),
+        plane: planeReconcile,
+        upsert: {
+          idMapping: idMapping!,
+          issues: issuesPort,
+          originKind: ISSUE_ORIGIN_KIND,
+          log: (message, fields) => ctx.logger.info(message, fields),
+        },
+        idMapping: idMapping!,
+        state,
+        log: (message, fields) => ctx.logger.info(message, fields),
+      });
+    }
+
     webhookHandler = createPlaneWebhookHandler({
       getSecret: async () => {
         const config = (await ctx.config.get()) as { webhookSecret?: string };
@@ -250,14 +296,27 @@ export default definePlugin({
     });
 
     ctx.jobs.register(JOB_KEYS.reconcile, async (job) => {
-      // PCLIP-6: the sync cursor persists across restarts in plugin_entities.
-      // PCLIP-5 will page the Plane API from this watermark, diff against the ID
-      // mapping, mark orphans stale (never delete), and advance the cursor.
-      const cursor = await idMapping!.getCursor();
-      ctx.logger.info("reconcile run", { runId: job.runId, cursor: cursor ?? "(unset)" });
-      // TODO(PCLIP-5): page Plane API from cursor, diff against mapping via
-      // resolveByPlaneId/resolveByPaperclipId, markStaleByPlaneId on orphans,
-      // then idMapping.setCursor(newWatermark) once the page is fully processed.
+      if (!reconciler) return; // Plane not configured -> nothing to reconcile.
+      // Configurable interval (AC #5): the manifest fires this on a 1-minute base
+      // cadence; self-throttle to reconcileIntervalMinutes (default 15) since the
+      // last run, so the effective interval follows live config without a restart.
+      const cfg = (await ctx.config.get()) as { reconcileIntervalMinutes?: number };
+      const intervalMin =
+        typeof cfg.reconcileIntervalMinutes === "number" && cfg.reconcileIntervalMinutes > 0
+          ? cfg.reconcileIntervalMinutes
+          : DEFAULT_CONFIG.reconcileIntervalMinutes;
+      const lastRunAt = Number((await state.get(RECONCILE_LAST_RUN_KEY)) ?? 0);
+      const nowMs = Date.now();
+      // 30s tolerance so cron jitter at the boundary doesn't defer a whole tick.
+      if (lastRunAt && nowMs - lastRunAt < intervalMin * 60_000 - 30_000) return;
+      // Stamp the attempt time BEFORE running so a slow run doesn't overlap the
+      // next tick (the reconcile is idempotent, but we avoid concurrent scans).
+      await state.set(RECONCILE_LAST_RUN_KEY, nowMs);
+
+      // The reconciler logs a structured completion line; persist the full summary
+      // (incl. any per-project error messages) to plugin state for observability.
+      const summary = await reconciler.reconcile(job.runId);
+      await recordReconcileRun(state, summary);
     });
 
     // PCLIP-4: drain the outbound-mirror retry queue (transient Plane outages).

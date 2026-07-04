@@ -3,11 +3,17 @@
  * window's agent activity: tasks completed, tasks created, active agents, total
  * cost, and top performer.
  *
- * Stats are ACCUMULATED from domain events during the window (not queried): the
- * plugin ctx exposes no cost read API, and AC #3 requires the total to match the
- * accumulated `cost_event.created` values — so cost (and, for consistency, the
- * other counters) are summed as events arrive and persisted in plugin state. Cost
- * is stored in CENTS (the host's `cost_events.cost_cents`) and rendered as USD.
+ * Stats are ACCUMULATED from Paperclip's domain-event stream (the plugin event
+ * bus is Paperclip's push API surface) rather than polled — a product-confirmed
+ * design, not an omission. This is required, not just convenient:
+ *   - Cost: the plugin ctx exposes NO cost read API, and AC #3 mandates the total
+ *     match the accumulated `cost_event.created` values. Cost is stored in CENTS
+ *     (the host's `cost_events.cost_cents`) and rendered as USD.
+ *   - Top performer / active agents: there is no host API returning per-agent
+ *     completion counts over a window, so these must be aggregated from events too.
+ *   - Consistency: accumulating all five counters into one window keeps "the last
+ *     24 h" coherent across stats. Mixing a queried window (issues.list) with the
+ *     accumulated cost window would report mismatched periods.
  *
  * Pure + SDK-decoupled: the rollup math and card building are unit-tested; the
  * worker owns the event subscriptions, the schedule, and delivery.

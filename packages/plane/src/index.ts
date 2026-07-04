@@ -5,3 +5,5 @@ export * from "./plane-events.js";
 export * from "./webhook-handler.js";
 export * from "./id-mapping.js";
 export * from "./sync-rules.js";
+export * from "./plane-client.js";
+export * from "./agent-tools.js";

@@ -1,5 +1,8 @@
 import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
-import { ISSUE_ORIGIN_KIND, JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.js";
+import { ISSUE_ORIGIN_KIND, JOB_KEYS, PLUGIN_ID, TOOL_NAMES, WEBHOOK_KEYS } from "./constants.js";
+import pluginManifest from "./manifest.js";
+import { createAgentTools, registerPlaneTools, type ToolRegistrar } from "./agent-tools.js";
+import { createUnconfiguredPlaneClient, type PlaneClientPort } from "./plane-client.js";
 import {
   createDeliveryRecorder,
   createPlaneWebhookHandler,
@@ -38,6 +41,12 @@ let webhookHandler: PlaneWebhookHandler | undefined;
 let idMapping: IdMappingStore | undefined;
 // PCLIP-2 sync-rules handler (project mapping + label filter -> upsert Paperclip issue).
 let syncHandler: SyncRulesHandler | undefined;
+// PCLIP-3 agent tools talk to Plane through this client. Defaults to an
+// "unconfigured" stub that returns a structured error until auth lands.
+// TODO(PCLIP-7): replace with the authenticated Plane REST client (secret-ref
+// API key via ctx.secrets, base URL, workspace slug, <=5s request timeout);
+// wiring it here lights up the registered tools for live agent runs (AC3/AC5).
+let planeClient: PlaneClientPort = createUnconfiguredPlaneClient();
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
 
@@ -145,7 +154,24 @@ export default definePlugin({
       // then idMapping.setCursor(newWatermark) once the page is fully processed.
     });
 
-    // TODO(PCLIP-3): ctx.tools.register(TOOL_NAMES.getWorkItem, async (input) => { ... });
+    // PCLIP-3: register the five agent tools. Handlers delegate to `planeClient`
+    // via a getter so PCLIP-7 can swap in the authenticated client without
+    // re-registering. Declarations (schema/description) come from the manifest.
+    // registerPlaneTools does the register→invoke wiring (unit-tested with a fake
+    // registrar). The adapter bridges our SDK-decoupled ToolRegistrar to
+    // ctx.tools; the declaration cast is safe because the schema comes from the
+    // manifest (a real JsonSchema).
+    const registrar: ToolRegistrar = {
+      register: (name, declaration, fn) =>
+        ctx.tools.register(name, declaration as Parameters<typeof ctx.tools.register>[1], fn),
+    };
+    registerPlaneTools(
+      registrar,
+      createAgentTools(() => planeClient),
+      pluginManifest.tools ?? [],
+      TOOL_NAMES,
+      (name) => ctx.logger.error("tool declaration missing from manifest", { name }),
+    );
   },
 
   /**

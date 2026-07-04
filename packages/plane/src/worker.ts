@@ -1,5 +1,8 @@
 import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
-import { ISSUE_ORIGIN_KIND, JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.js";
+import { ISSUE_ORIGIN_KIND, JOB_KEYS, PLUGIN_ID, TOOL_NAMES, WEBHOOK_KEYS } from "./constants.js";
+import pluginManifest from "./manifest.js";
+import { createAgentTools } from "./agent-tools.js";
+import { createUnconfiguredPlaneClient, type PlaneClientPort } from "./plane-client.js";
 import {
   createDeliveryRecorder,
   createPlaneWebhookHandler,
@@ -38,6 +41,10 @@ let webhookHandler: PlaneWebhookHandler | undefined;
 let idMapping: IdMappingStore | undefined;
 // PCLIP-2 sync-rules handler (project mapping + label filter -> upsert Paperclip issue).
 let syncHandler: SyncRulesHandler | undefined;
+// PCLIP-3 agent tools talk to Plane through this client. Defaults to an
+// "unconfigured" stub that returns a structured error; PCLIP-7 injects the
+// authenticated REST client (secret-ref API key) here.
+let planeClient: PlaneClientPort = createUnconfiguredPlaneClient();
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
 
@@ -145,7 +152,28 @@ export default definePlugin({
       // then idMapping.setCursor(newWatermark) once the page is fully processed.
     });
 
-    // TODO(PCLIP-3): ctx.tools.register(TOOL_NAMES.getWorkItem, async (input) => { ... });
+    // PCLIP-3: register the five agent tools. Handlers delegate to `planeClient`
+    // via a getter so PCLIP-7 can swap in the authenticated client without
+    // re-registering. Declarations (schema/description) come from the manifest.
+    const agentTools = createAgentTools(() => planeClient);
+    const toolDecls = new Map((pluginManifest.tools ?? []).map((t) => [t.name, t]));
+    const registerTool = (name: string, handler: (params: unknown) => Promise<{ content?: string; data?: unknown; error?: string }>) => {
+      const decl = toolDecls.get(name);
+      if (!decl) {
+        ctx.logger.error("tool declaration missing from manifest", { name });
+        return;
+      }
+      ctx.tools.register(
+        name,
+        { displayName: decl.displayName, description: decl.description, parametersSchema: decl.parametersSchema },
+        (params) => handler(params),
+      );
+    };
+    registerTool(TOOL_NAMES.getWorkItem, agentTools.getWorkItem);
+    registerTool(TOOL_NAMES.searchWorkItems, agentTools.searchWorkItems);
+    registerTool(TOOL_NAMES.createWorkItem, agentTools.createWorkItem);
+    registerTool(TOOL_NAMES.addComment, agentTools.addComment);
+    registerTool(TOOL_NAMES.updateState, agentTools.updateState);
   },
 
   /**

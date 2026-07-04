@@ -1,0 +1,58 @@
+import { describe, expect, it } from "vitest";
+import { channelFor, type TeamsNotification } from "../src/notifications.js";
+import { CHANNEL_CONFIG_KEY, resolveWorkflowRef, type TeamsUrlConfig } from "../src/routing.js";
+
+const approval: TeamsNotification = { kind: "approval", approvalId: "a1", title: "t", requester: "r" };
+const error: TeamsNotification = { kind: "agent-error", error: "e" };
+const issueCreated: TeamsNotification = { kind: "issue-created", title: "t" };
+const issueDone: TeamsNotification = { kind: "issue-done", title: "t" };
+const budget: TeamsNotification = { kind: "budget-threshold", budgetId: "b1", threshold: 90 };
+
+describe("channel routing (PCLIP-19)", () => {
+  it("maps each notification kind to its channel", () => {
+    expect(channelFor(approval)).toBe("approvals");
+    expect(channelFor(error)).toBe("errors");
+    expect(channelFor(issueCreated)).toBe("pipeline");
+    expect(channelFor(issueDone)).toBe("pipeline");
+    expect(channelFor(budget)).toBe("default");
+  });
+
+  it("routes an event to its per-type ref, not the default (AC #1)", () => {
+    const cfg: TeamsUrlConfig = {
+      defaultWorkflowUrl: "ref-default",
+      approvalsWorkflowUrl: "ref-approvals",
+      errorsWorkflowUrl: "ref-errors",
+      pipelineWorkflowUrl: "ref-pipeline",
+    };
+    expect(resolveWorkflowRef(channelFor(approval), cfg)).toBe("ref-approvals");
+    expect(resolveWorkflowRef(channelFor(error), cfg)).toBe("ref-errors");
+    expect(resolveWorkflowRef(channelFor(issueCreated), cfg)).toBe("ref-pipeline");
+    expect(resolveWorkflowRef(channelFor(budget), cfg)).toBe("ref-default");
+  });
+
+  it("falls back to the default ref when no per-type ref is set (AC #2)", () => {
+    const cfg: TeamsUrlConfig = { defaultWorkflowUrl: "ref-default" };
+    expect(resolveWorkflowRef(channelFor(approval), cfg)).toBe("ref-default");
+    expect(resolveWorkflowRef(channelFor(error), cfg)).toBe("ref-default");
+    expect(resolveWorkflowRef(channelFor(issueCreated), cfg)).toBe("ref-default");
+  });
+
+  it("treats a whitespace-only per-type ref as unset and falls back", () => {
+    const cfg: TeamsUrlConfig = { defaultWorkflowUrl: "ref-default", approvalsWorkflowUrl: "   " };
+    expect(resolveWorkflowRef("approvals", cfg)).toBe("ref-default");
+  });
+
+  it("returns '' when nothing is configured (caller skips)", () => {
+    expect(resolveWorkflowRef("approvals", {})).toBe("");
+    expect(resolveWorkflowRef("default", { defaultWorkflowUrl: "" })).toBe("");
+  });
+
+  it("maps every channel to a real config key", () => {
+    expect(CHANNEL_CONFIG_KEY).toEqual({
+      approvals: "approvalsWorkflowUrl",
+      errors: "errorsWorkflowUrl",
+      pipeline: "pipelineWorkflowUrl",
+      default: "defaultWorkflowUrl",
+    });
+  });
+});

@@ -57,8 +57,8 @@ export default definePlugin({
     // PCLIP-2: sync-rules handler. IssuesPort wraps ctx.issues; origin
     // (kind+id) gives idempotent create so a link failure never duplicates.
     const issuesPort: IssuesPort = {
-      findByOrigin: async ({ companyId, originKind, originId }) => {
-        const found = await ctx.issues.list({ companyId, originKind, originId, limit: 1 });
+      findByOrigin: async ({ companyId, projectId, originKind, originId }) => {
+        const found = await ctx.issues.list({ companyId, projectId, originKind, originId, limit: 1 });
         return found[0] ? { id: found[0].id } : null;
       },
       create: async (input) => {

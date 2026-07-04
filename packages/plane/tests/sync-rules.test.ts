@@ -35,9 +35,9 @@ function makeIssues() {
   let seq = 0;
   const created: string[] = [];
   const port: IssuesPort = {
-    async findByOrigin({ companyId, originKind, originId }) {
+    async findByOrigin({ companyId, projectId, originKind, originId }) {
       for (const i of byId.values()) {
-        if (i.companyId === companyId && i.originKind === originKind && i.originId === originId) return { id: i.id };
+        if (i.companyId === companyId && i.projectId === projectId && i.originKind === originKind && i.originId === originId) return { id: i.id };
       }
       return null;
     },
@@ -163,7 +163,7 @@ describe("createSyncRulesHandler (PCLIP-2)", () => {
     const { handler, issues, idMapping } = makeHandler([RULE]);
     await idMapping.link({ planeId: "plane-1", paperclipIssueId: "pc-existing" });
     // P2-created issues carry origin metadata; the update path finds them by origin.
-    issues.byId.set("pc-existing", { id: "pc-existing", companyId: "co-1", originKind: ORIGIN, originId: "plane-1" });
+    issues.byId.set("pc-existing", { id: "pc-existing", companyId: "co-1", projectId: "pcproj-B", originKind: ORIGIN, originId: "plane-1" });
     const out = await handler.handle(issueEvent({ action: "updated" }, { name: "New title" }));
     expect(out).toMatchObject({ kind: "updated", paperclipIssueId: "pc-existing" });
     expect(issues.created).toHaveLength(0);
@@ -260,6 +260,30 @@ describe("createSyncRulesHandler (PCLIP-2)", () => {
     const newId = issues.created[1];
     expect(issues.byId.get(newId)?.companyId).toBe("co-2");
     expect(idMapping.fwd.get("plane-1")?.paperclipIssueId).toBe(newId);
+  });
+
+  it("re-homes a move to a different project in the SAME company (Kody: not stranded in old project)", async () => {
+    const rules: SyncRule[] = [
+      { planeProjectId: "P-A", companyId: "co-1", paperclipProjectId: "projX" },
+      { planeProjectId: "P-B", companyId: "co-1", paperclipProjectId: "projY" }, // same company, different project
+    ];
+    const { handler, issues, idMapping } = makeHandler(rules);
+    await handler.handle(issueEvent({ projectId: "P-A" }, { project: "P-A", labels: [] }));
+    const oldId = issues.created[0];
+    expect(issues.byId.get(oldId)?.projectId).toBe("projX");
+
+    // Move A -> B within co-1: must create in projY, not update the projX issue.
+    const moved = await handler.handle(issueEvent({ projectId: "P-B", action: "updated" }, { project: "P-B", labels: [] }));
+    expect(moved).toMatchObject({ kind: "created" });
+    expect(issues.created).toHaveLength(2);
+    const newId = issues.created[1];
+    expect(issues.byId.get(newId)?.projectId).toBe("projY");
+    expect(idMapping.fwd.get("plane-1")?.paperclipIssueId).toBe(newId);
+
+    // A subsequent update in projY updates the SAME issue — no further duplicates.
+    const again = await handler.handle(issueEvent({ projectId: "P-B", action: "updated" }, { project: "P-B", name: "Renamed", labels: [] }));
+    expect(again).toMatchObject({ kind: "updated", paperclipIssueId: newId });
+    expect(issues.created).toHaveLength(2);
   });
 });
 

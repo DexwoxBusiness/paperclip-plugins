@@ -207,8 +207,18 @@ export type IssueOriginKind = `plugin:${string}`;
 
 /** Host issue operations this handler needs (wraps ctx.issues). */
 export interface IssuesPort {
-  /** Idempotency lookup: an issue previously created for this Plane origin, or null. */
-  findByOrigin(input: { companyId: string; originKind: IssueOriginKind; originId: string }): Promise<{ id: string } | null>;
+  /**
+   * Find the issue created for this Plane origin IN THE GIVEN PROJECT, or null.
+   * Scoping by projectId (not just company) is what makes a same-company move to
+   * a different Paperclip project create a fresh issue in the new project rather
+   * than stranding the moved issue in the old one (Kody).
+   */
+  findByOrigin(input: {
+    companyId: string;
+    projectId: string;
+    originKind: IssueOriginKind;
+    originId: string;
+  }): Promise<{ id: string } | null>;
   create(input: {
     companyId: string;
     projectId: string;
@@ -292,16 +302,19 @@ export function createSyncRulesHandler(deps: SyncRulesHandlerDeps): SyncRulesHan
       const description = extractDescription(event.payload);
 
       // The Paperclip issue for this Plane origin IN THE CURRENT RULE'S TARGET
-      // company is the source of truth. Keying on origin (not just the P6
-      // mapping) makes the upsert both:
+      // (company AND project) is the source of truth. Scoping the lookup by
+      // project makes the upsert both:
       //  - IDEMPOTENT: a create whose mapping link failed is found here and
       //    re-linked on the Plane retry, never duplicated (standard #1); and
-      //  - MOVE-AWARE: if the Plane issue moved to a DIFFERENT mapped project,
-      //    no issue exists for this origin in the new target company, so we
-      //    create one there and re-home the mapping (link() stales the old row)
-      //    instead of updating the issue in the old project.
+      //  - MOVE-AWARE across BOTH company and project changes: if the Plane
+      //    issue moved to a different mapped project (even within the SAME
+      //    company), no issue for this origin exists in the new project, so we
+      //    create one there and link() re-homes the mapping (staling the old
+      //    row). A plain update() cannot move an issue between projects, so
+      //    company-only scoping would strand a same-company move (Kody).
       const existing = await deps.issues.findByOrigin({
         companyId: rule.companyId,
+        projectId: rule.paperclipProjectId,
         originKind: deps.originKind,
         originId: planeId,
       });
@@ -316,9 +329,7 @@ export function createSyncRulesHandler(deps: SyncRulesHandlerDeps): SyncRulesHan
         return { kind: "updated", paperclipIssueId: existing.id };
       }
 
-      // Nothing for this origin in the target company: create there and link.
-      // If the issue was previously synced under a different project, link()'s
-      // 1:1 logic stales the old mapping row as it re-homes to the new issue.
+      // Nothing for this origin in the target project: create there and link.
       const created = await deps.issues.create({
         companyId: rule.companyId,
         projectId: rule.paperclipProjectId,

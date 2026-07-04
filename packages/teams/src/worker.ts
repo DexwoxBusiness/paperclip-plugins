@@ -53,11 +53,21 @@ export default definePlugin({
     // PCLIP-21: accumulate the daily-digest rollup from events into plugin state.
     const digest = createDigestAccumulator(state);
     // Accumulate ONLY while the digest is enabled, so a disabled digest is fully
-    // quiescent (no state growth). The accumulator's 24h window auto-reset is a
-    // further backstop against stale data on re-enable.
+    // quiescent (no state growth). The `enableDailyDigest` flag is CACHED with a
+    // short TTL (Kody perf): high-volume events (agent.run.finished,
+    // cost_event.created) must not each hit ctx.config.get(). A ≤60s lag on an
+    // enable/disable toggle is fine for a daily digest; no timer is used (lazy TTL).
+    let digestEnabledCache = { value: false, at: 0 };
+    const isDigestEnabled = async (): Promise<boolean> => {
+      const nowMs = Date.now();
+      if (nowMs - digestEnabledCache.at > 60_000) {
+        const cfg = (await ctx.config.get()) as { enableDailyDigest?: boolean };
+        digestEnabledCache = { value: cfg.enableDailyDigest === true, at: nowMs };
+      }
+      return digestEnabledCache.value;
+    };
     const accumulateIfEnabled = async (fn: () => Promise<void>): Promise<void> => {
-      const cfg = (await ctx.config.get()) as { enableDailyDigest?: boolean };
-      if (cfg.enableDailyDigest) await fn();
+      if (await isDigestEnabled()) await fn();
     };
 
     /**
@@ -126,17 +136,28 @@ export default definePlugin({
     on("issue.updated", adaptIssueDone);
 
     // issue.created also feeds the daily-digest "tasks created" counter (PCLIP-21).
+    // Delivery and digest accumulation are in SEPARATE try/catch scopes (Kody), so a
+    // failure in one path never skips the other (e.g. a delivery error must not drop
+    // the event from the digest count, and vice versa).
     ctx.events.on("issue.created", async (ev) => {
       try {
         const n = adaptIssueCreated(ev);
         if (n) await deliver(n);
+      } catch (e) {
+        log("teams issue.created delivery error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+      }
+      try {
         await accumulateIfEnabled(() => digest.onIssueCreated());
       } catch (e) {
-        log("teams issue.created handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+        log("teams issue.created digest accumulation error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
       }
     });
-    // agent.run.finished = a task/run completed → digest tally only (no card; the
-    // "issue done" card comes from issue.updated above). Payload carries agentId.
+    // DIGEST "tasks completed" SOURCE (per the task definition): agent.run.finished
+    // is the SOLE source of the digest completion count. digest.onTaskCompleted
+    // increments BOTH r.tasksCompleted AND the per-agent tally (active agents + top
+    // performer) — see digest.ts. Reviewer note: issue.updated→done (above) is a
+    // NOTIFICATION card only and deliberately does NOT feed the digest, because
+    // counting both events would double-count completions. No card here (digest only).
     ctx.events.on("agent.run.finished", async (ev) => {
       try {
         await accumulateIfEnabled(() => digest.onTaskCompleted(extractCompletedAgent(ev)));
@@ -184,6 +205,11 @@ export default definePlugin({
         const nowDate = new Date();
         const hour = typeof cfg.digestHour === "number" ? cfg.digestHour : DEFAULT_CONFIG.digestHour;
         const tz = cfg.digestTimezone || undefined;
+        // Reviewer note: `>= hour` (not `=== hour`) is INTENTIONAL. Posting is gated
+        // to once/day by DIGEST_LAST_RUN_DATE_KEY, and firing "from digestHour
+        // onward" is what lets the hourly tick RETRY later the same day if the exact
+        // hour was missed or delivery failed (worker busy/down). `=== hour` would give
+        // a single shot that can't recover. "09:00" therefore means "at/after 09:00".
         if (digestHourInZone(nowDate, tz) < hour) return; // not the digest hour yet today
         const today = digestDateKey(nowDate, tz);
         if ((await state.get(DIGEST_LAST_RUN_DATE_KEY)) === today) return; // already posted today
@@ -211,6 +237,11 @@ export default definePlugin({
           tasksCreated: rollup.tasksCreated,
           totalCostCents: rollup.totalCostCents,
         });
+        // Operator reminder: cost stays $0 until the host emits cost_event.created
+        // (it currently logs cost.reported, unmapped — see PCLIP-21 description).
+        if (rollup.totalCostCents === 0) {
+          log("teams digest total cost is $0 — host does not yet emit cost_event.created (cost.reported unmapped)", { runId: job.runId });
+        }
       } catch (e) {
         log("teams digest error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
       }

@@ -221,6 +221,9 @@ export function createDigestAccumulator(store: DigestStore, opts: { now?: () => 
       });
     },
     onTaskCompleted(agent) {
+      // One agent.run.finished increments BOTH the overall "tasks completed" count
+      // AND the per-agent tally (which drives "active agents" = distinct keys, and
+      // "top performer" = max). Reviewer note: tasksCompleted IS incremented here.
       return mutate((r) => {
         r.tasksCompleted += 1;
         const key = (agent ?? "").trim() || "unknown";

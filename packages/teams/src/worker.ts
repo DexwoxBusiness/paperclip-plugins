@@ -2,7 +2,7 @@ import { definePlugin, type PluginContext, type PluginWebhookInput } from "@pape
 import { JOB_KEYS, PLUGIN_ID } from "./constants.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
 import { buildNotificationCard, channelFor, createBudgetDedupe, type TeamsNotification } from "./notifications.js";
-import { isRawWorkflowUrl, resolveWorkflowRef, type TeamsUrlConfig } from "./routing.js";
+import { classifyWorkflowRef, resolveWorkflowRef, type TeamsUrlConfig } from "./routing.js";
 import { createWorkflowsClient, safeDeliver, type FetchLike } from "./delivery.js";
 import {
   adaptAgentError,
@@ -53,22 +53,29 @@ export default definePlugin({
       // Route per event type to its channel's Workflows URL, falling back to the
       // default (T2). Config is read fresh so routing edits apply without a restart.
       const channel = channelFor(n);
-      const cfg = (await ctx.config.get()) as TeamsUrlConfig;
+      const cfg = (await ctx.config.get()) as TeamsUrlConfig & { allowPlaintextWorkflowUrl?: boolean };
       const ref = resolveWorkflowRef(channel, cfg);
       if (!ref) {
         log("teams notification skipped: no Workflows URL configured for channel", { kind: n.kind, channel });
         return false;
       }
-      // Back-compat migration (Codex): an instance upgraded from T1 may still hold a
-      // RAW https URL in this field (it was plaintext before the secret-ref change).
-      // Deliver those directly so notifications don't silently stop; NEW configs are
-      // secret-refs (a UUID, never an http URL), resolved at CALL TIME — never cached
-      // or logged (AC #3). A resolution failure most likely means plugin secret-refs
-      // are kill-switched (not the pinned build) — skip, never block (PAP-2394).
+      // Secure by default (Kody): only secret-refs are honored. A RAW plaintext URL
+      // is delivered directly ONLY when the operator explicitly opts into the legacy
+      // migration bridge (allowPlaintextWorkflowUrl) — otherwise it is refused, so a
+      // config-writer can't defeat the secret-ref trust boundary and POST notification
+      // content to an arbitrary host.
       let url: string;
-      if (isRawWorkflowUrl(ref)) {
-        url = ref;
+      const decision = classifyWorkflowRef(ref, cfg.allowPlaintextWorkflowUrl === true);
+      if (decision === "raw-blocked") {
+        log("teams notification skipped: Workflows URL is a plaintext URL but allowPlaintextWorkflowUrl is off — store it as a secret reference (recommended), or enable the legacy flag to migrate", { kind: n.kind, channel });
+        return false;
+      }
+      if (decision === "raw-allowed") {
+        url = ref; // legacy plaintext mode, explicitly enabled by the operator
       } else {
+        // Resolve the capability URL from its secret-ref at CALL TIME — never cached
+        // or logged (AC #3). A resolution failure most likely means plugin secret-refs
+        // are kill-switched (not the pinned build) — skip, never block (PAP-2394).
         try {
           url = await ctx.secrets.resolve(ref);
         } catch {

@@ -94,6 +94,18 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Enable daily digest",
         default: DEFAULT_CONFIG.enableDailyDigest,
       },
+      allowPlaintextWorkflowUrl: {
+        type: "boolean",
+        title: "Allow plaintext Workflows URLs (legacy)",
+        // Security (Kody): OFF by default so only secret-refs are honored — a raw
+        // plaintext URL would defeat the secret-ref trust boundary and could POST
+        // notification content to an arbitrary host. Enable ONLY as a temporary
+        // migration bridge for instances that still store a raw URL, then move the
+        // URL into a secret-ref and turn this back off.
+        description:
+          "Legacy escape hatch. When OFF (recommended), Workflows URLs must be secret-refs. Enable only to keep an un-migrated plaintext URL working while you move it into a secret reference. PCLIP-19",
+        default: DEFAULT_CONFIG.allowPlaintextWorkflowUrl,
+      },
       botAppCredentialsRef: {
         type: "string",
         format: "secret-ref",

@@ -44,9 +44,25 @@ export function resolveWorkflowRef(channel: ChannelKind, config: TeamsUrlConfig)
 /**
  * Whether a stored config value is already a raw http(s) Workflows URL rather than
  * a secret-ref. Instances configured before the secret-ref migration (T1) saved
- * the URL in plain text; the worker delivers those directly for back-compat, while
- * new configs store a secret-ref (a UUID, never an http URL) resolved at call time.
+ * the URL in plain text; a secret-ref is a UUID and never an http URL.
  */
 export function isRawWorkflowUrl(ref: string): boolean {
   return /^https?:\/\//i.test(ref.trim());
+}
+
+/**
+ * How the worker should treat a resolved config value (Kody, security):
+ *  - "secret-ref": resolve via the secret provider (the default, secure path).
+ *  - "raw-allowed": a plaintext URL AND the operator explicitly enabled the legacy
+ *    escape hatch — deliver directly (T1 back-compat).
+ *  - "raw-blocked": a plaintext URL WITHOUT the opt-in — do NOT deliver. Honoring a
+ *    raw URL by default would defeat the `format: "secret-ref"` trust boundary and
+ *    let a config-writer POST notification content to an arbitrary external host.
+ *
+ * Default is secure: raw URLs require `allowPlaintextWorkflowUrl`, so the trust
+ * boundary holds unless an operator deliberately opts into legacy plaintext mode.
+ */
+export function classifyWorkflowRef(ref: string, allowPlaintext: boolean): "secret-ref" | "raw-allowed" | "raw-blocked" {
+  if (!isRawWorkflowUrl(ref)) return "secret-ref";
+  return allowPlaintext ? "raw-allowed" : "raw-blocked";
 }

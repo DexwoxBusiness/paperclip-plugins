@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { channelFor, type ChannelKind, type TeamsNotification } from "../src/notifications.js";
-import { CHANNEL_CONFIG_KEY, isRawWorkflowUrl, resolveWorkflowRef, type TeamsUrlConfig } from "../src/routing.js";
+import { CHANNEL_CONFIG_KEY, classifyWorkflowRef, isRawWorkflowUrl, resolveWorkflowRef, type TeamsUrlConfig } from "../src/routing.js";
 
 const approval: TeamsNotification = { kind: "approval", approvalId: "a1", title: "t", requester: "r" };
 const error: TeamsNotification = { kind: "agent-error", error: "e" };
@@ -70,5 +70,23 @@ describe("secret-ref migration (Codex — preserve raw URLs)", () => {
     // secret-refs (UUIDs) are not raw URLs -> resolved via the secret provider
     expect(isRawWorkflowUrl("550e8400-e29b-41d4-a716-446655440000")).toBe(false);
     expect(isRawWorkflowUrl("")).toBe(false);
+  });
+});
+
+describe("classifyWorkflowRef (Kody — secret-ref trust boundary)", () => {
+  const RAW = "https://prod-1.westus.logic.azure.com/workflows/abc";
+  const REF = "550e8400-e29b-41d4-a716-446655440000";
+
+  it("always resolves a secret-ref via the provider, regardless of the flag", () => {
+    expect(classifyWorkflowRef(REF, false)).toBe("secret-ref");
+    expect(classifyWorkflowRef(REF, true)).toBe("secret-ref");
+  });
+
+  it("BLOCKS a raw plaintext URL by default (secure) — trust boundary holds", () => {
+    expect(classifyWorkflowRef(RAW, false)).toBe("raw-blocked");
+  });
+
+  it("allows a raw plaintext URL only when the operator opts in (legacy bridge)", () => {
+    expect(classifyWorkflowRef(RAW, true)).toBe("raw-allowed");
   });
 });

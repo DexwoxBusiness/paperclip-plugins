@@ -19,6 +19,8 @@ export const DEFAULT_CONFIG = {
   errorsWorkflowUrl: "",
   pipelineWorkflowUrl: "",
   paperclipBaseUrl: "http://localhost:3100",
+  /** Company URL prefix (issuePrefix, e.g. "PCLIP") for deep links; else derived from the readable issue id. PCLIP-20 */
+  paperclipCompanyPrefix: "",
   enableDailyDigest: false,
   digestHour: 9,
   /** Security default: only secret-refs are honored; raw plaintext URLs are a deliberate legacy opt-in. PCLIP-19 */

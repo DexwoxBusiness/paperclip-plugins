@@ -16,8 +16,10 @@
 import { adaptiveCard, factSet, openUrlAction, textBlock, type AdaptiveCard } from "./adaptive-card.js";
 
 export type TeamsNotification =
-  | { kind: "issue-created"; issueIdentifier?: string; title: string; projectName?: string; link?: string }
-  | { kind: "issue-done"; issueIdentifier?: string; title: string; agentName?: string; link?: string }
+  // `issueId` is the issue UUID (deep-link target, PCLIP-20); `issueIdentifier` is
+  // the display id ("PROJ-123", also the source of the company URL prefix).
+  | { kind: "issue-created"; issueId?: string; issueIdentifier?: string; title: string; projectName?: string; link?: string }
+  | { kind: "issue-done"; issueId?: string; issueIdentifier?: string; title: string; agentName?: string; link?: string }
   | {
       kind: "approval";
       approvalId: string;
@@ -28,7 +30,7 @@ export type TeamsNotification =
       issueTitle?: string;
       link?: string;
     }
-  | { kind: "agent-error"; agentName?: string; issueIdentifier?: string; error: string; link?: string }
+  | { kind: "agent-error"; agentName?: string; agentId?: string; issueId?: string; issueIdentifier?: string; error: string; link?: string }
   | {
       kind: "budget-threshold";
       budgetId: string;

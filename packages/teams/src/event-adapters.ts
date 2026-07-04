@@ -58,6 +58,7 @@ export function adaptIssueCreated(ev: RawPluginEvent): TeamsNotification | null 
     kind: "issue-created",
     title,
     // issue.created: ev.entityId IS the issue, so the entityId fallback is safe here.
+    issueId: str(issue.id) ?? str(ev.entityId),
     issueIdentifier: issueIdentifier(issue, ev, true),
     projectName: str(issue.project_name) ?? str(p.projectName) ?? str(p.project_name),
   };
@@ -71,6 +72,9 @@ export function adaptIssueDone(ev: RawPluginEvent): TeamsNotification | null {
   return {
     kind: "issue-done",
     title,
+    // agent.task_completed: ev.entityId is the agent/task, NOT the issue — only the
+    // nested issue.id is a safe deep-link target.
+    issueId: str(issue.id),
     issueIdentifier: issueIdentifier(issue, ev),
     agentName: str(p.agentName) ?? str(p.agent_name) ?? str(obj(p.agent).name) ?? str(ev.actorId),
   };
@@ -102,6 +106,10 @@ export function adaptAgentError(ev: RawPluginEvent): TeamsNotification | null {
     kind: "agent-error",
     error,
     agentName: str(p.agentName) ?? str(p.agent_name) ?? str(obj(p.agent).name) ?? str(ev.actorId),
+    // agent.run.failed: ev.entityId may be the run id, so take the agent id only
+    // from the payload (not entityId). Link falls back to the issue when present.
+    agentId: str(obj(p.agent).id) ?? str(p.agentId) ?? str(p.agent_id),
+    issueId: str(issue.id),
     issueIdentifier: Object.keys(issue).length ? issueIdentifier(issue, ev) : str(p.issueIdentifier),
   };
 }

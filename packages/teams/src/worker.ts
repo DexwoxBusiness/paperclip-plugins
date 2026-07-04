@@ -1,7 +1,8 @@
 import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { JOB_KEYS, PLUGIN_ID } from "./constants.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
-import { buildNotificationCard, createBudgetDedupe, type TeamsNotification } from "./notifications.js";
+import { buildNotificationCard, channelFor, createBudgetDedupe, type TeamsNotification } from "./notifications.js";
+import { resolveWorkflowRef, type TeamsUrlConfig } from "./routing.js";
 import { createWorkflowsClient, safeDeliver, type FetchLike } from "./delivery.js";
 import {
   adaptAgentError,
@@ -49,14 +50,31 @@ export default definePlugin({
     // a failed post returns false — the budget dedupe uses this to avoid marking a
     // threshold seen when nothing was posted.
     const deliver = async (n: TeamsNotification): Promise<boolean> => {
-      const cfg = (await ctx.config.get()) as { defaultWorkflowUrl?: string };
-      const url = cfg.defaultWorkflowUrl ?? "";
+      // Route per event type to its channel's Workflows URL, falling back to the
+      // default (T2). Config is read fresh so routing edits apply without a restart.
+      const channel = channelFor(n);
+      const cfg = (await ctx.config.get()) as TeamsUrlConfig;
+      const ref = resolveWorkflowRef(channel, cfg);
+      if (!ref) {
+        log("teams notification skipped: no Workflows URL configured for channel", { kind: n.kind, channel });
+        return false;
+      }
+      // Resolve the capability URL from its secret-ref at CALL TIME — never cached
+      // or logged (AC #3). A resolution failure most likely means plugin secret-refs
+      // are kill-switched (not the pinned build) — skip, never block (PAP-2394).
+      let url: string;
+      try {
+        url = await ctx.secrets.resolve(ref);
+      } catch {
+        log("teams notification skipped: could not resolve Workflows URL secret-ref (requires the pinned build, PAP-2394)", { kind: n.kind, channel });
+        return false;
+      }
       if (!url) {
-        log("teams notification skipped: no default Workflows URL configured", { kind: n.kind });
+        log("teams notification skipped: empty Workflows URL from secret-ref", { kind: n.kind, channel });
         return false;
       }
       const message = toWorkflowsMessage(buildNotificationCard(n));
-      const outcome = await safeDeliver(client, url, message, log, { kind: n.kind });
+      const outcome = await safeDeliver(client, url, message, log, { kind: n.kind, channel });
       return outcome.ok;
     };
 

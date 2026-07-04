@@ -51,24 +51,36 @@ const manifest: PaperclipPluginManifestV1 = {
     properties: {
       defaultWorkflowUrl: {
         type: "string",
-        title: "Default Workflows webhook URL",
+        // AC #3: a Workflows webhook URL is a CAPABILITY URL (bearer credential in
+        // the URL itself). The settings UI masks only secret-ref fields, so it is
+        // stored as a secret-ref — masked in the UI, resolved at call time, never
+        // logged, and rotatable in the secret provider if leaked. Requires the
+        // pinned Paperclip build while plugin secret-refs are kill-switched (PAP-2394).
+        format: "secret-ref",
+        title: "Default Workflows webhook URL (secret reference)",
         description:
-          "Power Automate Workflows webhook URL for the default channel (legacy O365 connector webhooks were retired May 2026). Capability URL — treat as sensitive, rotate on leak. PCLIP-18/19",
+          "Power Automate Workflows webhook URL for the default channel (legacy O365 connector webhooks were retired May 2026). Stored as a secret-ref (masked; rotate on leak). PCLIP-18/19",
         default: DEFAULT_CONFIG.defaultWorkflowUrl,
       },
       approvalsWorkflowUrl: {
         type: "string",
-        title: "Approvals channel Workflows URL (optional)",
+        format: "secret-ref",
+        title: "Approvals channel Workflows URL (secret reference, optional)",
+        description: "If set, approval cards post here instead of the default channel. Capability URL — stored masked, rotate on leak. PCLIP-19",
         default: DEFAULT_CONFIG.approvalsWorkflowUrl,
       },
       errorsWorkflowUrl: {
         type: "string",
-        title: "Errors channel Workflows URL (optional)",
+        format: "secret-ref",
+        title: "Errors channel Workflows URL (secret reference, optional)",
+        description: "If set, agent-error cards post here instead of the default channel. Capability URL — stored masked, rotate on leak. PCLIP-19",
         default: DEFAULT_CONFIG.errorsWorkflowUrl,
       },
       pipelineWorkflowUrl: {
         type: "string",
-        title: "Pipeline channel Workflows URL (optional)",
+        format: "secret-ref",
+        title: "Pipeline channel Workflows URL (secret reference, optional)",
+        description: "If set, issue created/done cards post here instead of the default channel. Capability URL — stored masked, rotate on leak. PCLIP-19",
         default: DEFAULT_CONFIG.pipelineWorkflowUrl,
       },
       paperclipBaseUrl: {

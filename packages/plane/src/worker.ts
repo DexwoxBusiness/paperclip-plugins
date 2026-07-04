@@ -152,6 +152,9 @@ export default definePlugin({
           return { stateMap: c.outboundStateMap ?? {}, pluginId: PLUGIN_ID };
         },
         log: (message, fields) => ctx.logger.info(message, fields),
+        // Dead-letters (permanent mirror failures) are operationally significant
+        // — surface them at error level so they're not lost in info noise.
+        logError: (message, fields) => ctx.logger.error(message, fields),
       });
       // Subscribe to Paperclip domain events. The adapters map the raw payload
       // shapes (field names confirmed against the host on connect) to the
@@ -260,9 +263,16 @@ export default definePlugin({
     // PCLIP-4: drain the outbound-mirror retry queue (transient Plane outages).
     ctx.jobs.register(JOB_KEYS.outboundDrain, async (job) => {
       if (!outboundMirror) return; // not configured -> nothing queued
+      // Per-dead-letter detail is already error-logged inside drainDue; keep this
+      // summary line to counts only (the deadLetters array is not re-logged here).
       const res = await outboundMirror.drainDue();
       if (res.delivered || res.retried || res.deadLettered) {
-        ctx.logger.info("outbound drain", { runId: job.runId, ...res });
+        ctx.logger.info("outbound drain", {
+          runId: job.runId,
+          delivered: res.delivered,
+          retried: res.retried,
+          deadLettered: res.deadLettered,
+        });
       }
     });
 

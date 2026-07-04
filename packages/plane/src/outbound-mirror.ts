@@ -22,6 +22,14 @@
  *    network call; queue mutations are serialized (in-process lock) so concurrent
  *    enqueues/drains cannot lose an action; transient failures are retried with
  *    exponential backoff by a scheduled drain, so a Plane outage loses nothing.
+ *  - Latency (AC #1, "within 1 minute"): the inline attempt is bounded by a
+ *    delivery deadline (default 10s; the concrete PCLIP-7 client itself aborts at
+ *    5s). A miss stays queued and the drain job (every minute) retries it, so the
+ *    end-to-end mirror lands within one drain cycle — never blocked on a hung call.
+ *  - Observability: dead-lettered actions (permanent failure / retries exhausted)
+ *    are NOT silently dropped — they are persisted to a separate dead-letter key
+ *    and logged at error level with the action detail, so a mis-mapped Plane state
+ *    (bad_request/not_found) is diagnosable rather than a vanished update.
  */
 
 import { PlaneApiError, type PlaneApiErrorKind, type PlaneClientPort } from "./plane-client.js";
@@ -83,6 +91,12 @@ export function attributeComment(body: string, author?: string): string {
  */
 export function evaluateMirror(event: OutboundEvent, config: OutboundConfig): MirrorDecision {
   // AC #3 echo guard: skip changes this plugin authored (inbound sync origin).
+  // Per-change origin IS the event actor: an inbound Plane->Paperclip sync
+  // (PCLIP-2) is applied by THIS plugin through ctx.issues, so the host stamps
+  // those writes actorType="plugin" + actorId=<our pluginId>. The host actor enum
+  // is user | agent | system | plugin; no inbound-sync path produces any other
+  // actor, so matching plugin+pluginId is the complete, intended origin check. A
+  // change from a DIFFERENT plugin's id is NOT our echo and is mirrored normally.
   if (event.actorType === "plugin" && event.actorId === config.pluginId) {
     return { kind: "skip", reason: "echo" };
   }
@@ -128,6 +142,17 @@ export interface QueueStore {
   set(key: string, value: unknown): Promise<void>;
 }
 
+/**
+ * A permanently-failed action, preserved for operational visibility instead of
+ * being silently dropped. `failureKind`/`failureMessage` capture WHY it could not
+ * be delivered (e.g. a bad_request/not_found from a mis-mapped Plane state name).
+ */
+export interface DeadLetter extends MirrorAction {
+  failedAt: number;
+  failureKind: PlaneApiErrorKind | "unknown";
+  failureMessage: string;
+}
+
 /** Transient error kinds are retried; everything else is a permanent failure. */
 export function isTransient(kind: PlaneApiErrorKind): boolean {
   return kind === "unavailable" || kind === "rate_limited";
@@ -135,19 +160,26 @@ export function isTransient(kind: PlaneApiErrorKind): boolean {
 
 const DEFAULTS = {
   key: "outbound-queue",
+  deadLetterKey: "outbound-deadletter",
   baseBackoffMs: 30_000, // 30s
   maxBackoffMs: 15 * 60_000, // 15 min
   maxAttempts: 12,
   capacity: 1000,
+  deadLetterCapacity: 500,
 };
 
 export interface OutboundQueue {
   enqueue(item: Omit<MirrorAction, "id" | "attempts" | "nextAttemptAt" | "enqueuedAt">): Promise<MirrorAction>;
   /** Remove a delivered action by id. */
   remove(id: string): Promise<void>;
-  /** Process all due items via `deliver`; returns counts. Safe to call repeatedly. */
-  drain(deliver: (a: MirrorAction) => Promise<void>, now?: number): Promise<{ delivered: number; retried: number; deadLettered: number }>;
+  /** Process all due items via `deliver`; returns counts + any newly dead-lettered actions. */
+  drain(
+    deliver: (a: MirrorAction) => Promise<void>,
+    now?: number,
+  ): Promise<{ delivered: number; retried: number; deadLettered: number; deadLetters: DeadLetter[] }>;
   list(): Promise<MirrorAction[]>;
+  /** Inspect permanently-failed actions (operational visibility / manual replay). */
+  listDeadLetters(): Promise<DeadLetter[]>;
 }
 
 /** Serialize async sections so read-modify-write on the store can't interleave. */
@@ -182,6 +214,16 @@ export function createOutboundQueue(
     while (items.length > cfg.capacity) items.shift();
     await store.set(cfg.key, items);
   }
+  async function loadDeadLetters(): Promise<DeadLetter[]> {
+    const raw = await store.get(cfg.deadLetterKey);
+    return Array.isArray(raw) ? (raw as DeadLetter[]) : [];
+  }
+  async function appendDeadLetters(newly: DeadLetter[]): Promise<void> {
+    if (newly.length === 0) return;
+    const all = [...(await loadDeadLetters()), ...newly];
+    while (all.length > cfg.deadLetterCapacity) all.shift();
+    await store.set(cfg.deadLetterKey, all);
+  }
   function backoff(attempts: number): number {
     return Math.min(cfg.baseBackoffMs * 2 ** attempts, cfg.maxBackoffMs);
   }
@@ -214,7 +256,11 @@ export function createOutboundQueue(
       return load();
     },
 
-    drain(deliver, tick = now()): Promise<{ delivered: number; retried: number; deadLettered: number }> {
+    listDeadLetters(): Promise<DeadLetter[]> {
+      return loadDeadLetters();
+    },
+
+    drain(deliver, tick = now()): Promise<{ delivered: number; retried: number; deadLettered: number; deadLetters: DeadLetter[] }> {
       // The whole drain (load -> deliver -> save) runs under the lock so an
       // enqueue can't overwrite the drained snapshot. Inline single-action
       // delivery (handle) does its network call OUTSIDE the lock, so the hot
@@ -222,9 +268,9 @@ export function createOutboundQueue(
       return lock(async () => {
         const items = await load();
         const keep: MirrorAction[] = [];
+        const deadLetters: DeadLetter[] = [];
         let delivered = 0;
         let retried = 0;
-        let deadLettered = 0;
         for (const item of items) {
           if (item.nextAttemptAt > tick) {
             keep.push(item);
@@ -234,18 +280,28 @@ export function createOutboundQueue(
             await deliver(item);
             delivered++;
           } catch (e) {
-            const transient = e instanceof PlaneApiError ? isTransient(e.kind) : true;
+            const isPlaneErr = e instanceof PlaneApiError;
+            const transient = isPlaneErr ? isTransient(e.kind) : true;
             const attempts = item.attempts + 1;
             if (transient && attempts < cfg.maxAttempts) {
               keep.push({ ...item, attempts, nextAttemptAt: tick + backoff(attempts) });
               retried++;
             } else {
-              deadLettered++;
+              // Permanent failure or retries exhausted: preserve it (don't drop
+              // work silently) with the reason it failed, for operator triage.
+              deadLetters.push({
+                ...item,
+                attempts,
+                failedAt: tick,
+                failureKind: isPlaneErr ? e.kind : "unknown",
+                failureMessage: e instanceof Error ? e.message : String(e),
+              });
             }
           }
         }
         await save(keep);
-        return { delivered, retried, deadLettered };
+        await appendDeadLetters(deadLetters);
+        return { delivered, retried, deadLettered: deadLetters.length, deadLetters };
       });
     },
   };
@@ -261,6 +317,41 @@ export interface OutboundMirrorDeps {
   queue: OutboundQueue;
   getConfig(): Promise<OutboundConfig>;
   log(message: string, fields?: Record<string, unknown>): void;
+  /** Error-level log for permanent failures (dead-letters). Defaults to `log`. */
+  logError?(message: string, fields?: Record<string, unknown>): void;
+  /**
+   * Upper bound (ms) on a single delivery attempt. The concrete PCLIP-7 client
+   * self-aborts at 5s; this is a defensive net so the SDK-decoupled core can't be
+   * hung by a port that doesn't bound itself. A breach is surfaced as a transient
+   * `unavailable` error, so the action stays queued and the drain retries it.
+   * Default 10s — comfortably inside the 1-minute mirror SLA (AC #1).
+   */
+  deliverDeadlineMs?: number;
+}
+
+/**
+ * Bound a delivery promise. On timeout, reject with a transient PlaneApiError so
+ * the caller treats it like any other outage (queue + retry), never a data loss.
+ * NB: this cannot abort the underlying request; the concrete client's own
+ * AbortController (5s) does that — this only stops the mirror WAITING forever.
+ */
+function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new PlaneApiError("unavailable", undefined, `Outbound delivery exceeded ${ms}ms deadline`)),
+      ms,
+    );
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
 }
 
 export type OutboundOutcome =
@@ -276,18 +367,42 @@ export interface OutboundMirrorHandler {
 }
 
 export function createOutboundMirrorHandler(deps: OutboundMirrorDeps): OutboundMirrorHandler {
-  async function deliver(action: MirrorAction): Promise<void> {
+  const deadlineMs = deps.deliverDeadlineMs ?? 10_000;
+  const logError = deps.logError ?? deps.log;
+
+  async function deliverRaw(action: MirrorAction): Promise<void> {
     if (action.kind === "state" && action.planeState) {
       await deps.plane.updateState(action.planeRef, action.planeState);
     } else if (action.kind === "comment" && action.commentHtml) {
       await deps.plane.addComment(action.planeRef, action.commentHtml);
     }
   }
+  // Every attempt (inline and drain) is deadline-bounded so the mirror never
+  // blocks the hot event path or a drain cycle on a slow/hung port.
+  function deliver(action: MirrorAction): Promise<void> {
+    return withDeadline(deliverRaw(action), deadlineMs);
+  }
 
   async function drainDue(now?: number) {
     const res = await deps.queue.drain(deliver, now);
-    if (res.deadLettered > 0) {
-      deps.log("outbound mirror dead-lettered actions (permanent failure or retries exhausted)", { count: res.deadLettered });
+    // Dead-lettering drops work — make each one observable + actionable, never a
+    // single opaque count. A state update failing bad_request/not_found almost
+    // always means the outboundStateMap points at a Plane state that doesn't
+    // exist (typo / renamed / deleted), so we call that out explicitly.
+    for (const dl of res.deadLetters) {
+      const stateMapHint =
+        dl.kind === "state" && (dl.failureKind === "bad_request" || dl.failureKind === "not_found")
+          ? ` — the Plane state "${dl.planeState}" may not exist; check outboundStateMap`
+          : "";
+      logError(`outbound mirror dead-lettered a ${dl.kind} action (permanent failure or retries exhausted)${stateMapHint}`, {
+        actionId: dl.id,
+        kind: dl.kind,
+        planeRef: dl.planeRef,
+        planeState: dl.planeState,
+        attempts: dl.attempts,
+        failureKind: dl.failureKind,
+        failureMessage: dl.failureMessage,
+      });
     }
     return res;
   }

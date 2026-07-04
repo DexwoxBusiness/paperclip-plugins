@@ -123,6 +123,19 @@ describe("createOutboundQueue (AC #4 durable retry)", () => {
     expect(await q.list()).toHaveLength(0);
   });
 
+  it("persists dead-letters with the failure reason (observability, not silent drop)", async () => {
+    let clock = 1000;
+    const q = makeQueue(() => clock);
+    await q.enqueue({ planeRef: "PROJ-9", kind: "state", planeState: "In Progres" });
+    const res = await q.drain(async () => { throw new PlaneApiError("not_found", 404, "no such state"); }, clock);
+    expect(res.deadLetters).toHaveLength(1);
+    const dl = (await q.listDeadLetters())[0];
+    expect(dl).toMatchObject({ planeRef: "PROJ-9", kind: "state", planeState: "In Progres", failureKind: "not_found" });
+    expect(dl.failedAt).toBe(clock);
+    // and it is gone from the live queue
+    expect(await q.list()).toHaveLength(0);
+  });
+
   it("classifies transient vs permanent kinds", () => {
     expect(isTransient("unavailable")).toBe(true);
     expect(isTransient("rate_limited")).toBe(true);
@@ -153,7 +166,9 @@ describe("createOutboundQueue (AC #4 durable retry)", () => {
 });
 
 describe("createOutboundMirrorHandler (PCLIP-4)", () => {
-  function makeHarness(opts: { unmapped?: boolean; failStateKind?: string; failTimes?: number } = {}) {
+  function makeHarness(
+    opts: { unmapped?: boolean; failStateKind?: string; failTimes?: number; slowMs?: number; deliverDeadlineMs?: number } = {},
+  ) {
     const store = new Map<string, unknown>();
     let clock = 1000;
     const queue = createOutboundQueue(
@@ -165,6 +180,7 @@ describe("createOutboundMirrorHandler (PCLIP-4)", () => {
     const plane = {
       updateState: async (ref: string, state: string) => {
         calls.push({ op: "state", ref, arg: state });
+        if (opts.slowMs) await new Promise((r) => setTimeout(r, opts.slowMs));
         if (failTimes-- > 0) throw new PlaneApiError((opts.failStateKind ?? "unavailable") as never, 503, "down");
         return { id: ref, identifier: ref, state, url: "" };
       },
@@ -178,14 +194,17 @@ describe("createOutboundMirrorHandler (PCLIP-4)", () => {
         opts.unmapped ? null : { planeId: `plane-${id}`, paperclipIssueId: id, planeType: "issue", stale: false },
     };
     const logs: string[] = [];
+    const logErrors: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
     const handler = createOutboundMirrorHandler({
       idMapping,
       plane,
       queue,
       getConfig: async () => CONFIG,
       log: (m) => logs.push(m),
+      logError: (m, f) => logErrors.push({ msg: m, fields: f }),
+      deliverDeadlineMs: opts.deliverDeadlineMs,
     });
-    return { handler, queue, calls, logs, setClock: (n: number) => (clock = n), clock: () => clock };
+    return { handler, queue, calls, logs, logErrors, setClock: (n: number) => (clock = n), clock: () => clock };
   }
 
   it("mirrors a status change to the mapped Plane item (AC #1)", async () => {
@@ -228,5 +247,32 @@ describe("createOutboundMirrorHandler (PCLIP-4)", () => {
     expect(res.delivered).toBe(1);
     expect(await h.queue.list()).toHaveLength(0);
     expect(h.calls.filter((c) => c.op === "state")).toHaveLength(2); // failed once, then succeeded
+  });
+
+  it("bounds a slow/hung delivery by the deadline — queued, not lost (AC #1 SLA)", async () => {
+    // Plane call takes ~40ms but the deadline is 5ms: the inline attempt must
+    // give up and leave the action queued (transient), never hang the event path.
+    const h = makeHarness({ slowMs: 40, deliverDeadlineMs: 5 });
+    const out = await h.handler.handle(statusEvent({ newStatus: "done" }));
+    expect(out).toMatchObject({ kind: "queued", delivered: false });
+    expect(await h.queue.list()).toHaveLength(1); // persisted for the drain to retry
+  });
+
+  it("error-logs a dead-lettered state action with a mis-mapped-state hint", async () => {
+    // A permanent bad_request on a state update means the mapped Plane state name
+    // is wrong; handle() enqueues + the inline attempt fails (stays queued), then
+    // the drain dead-letters it and logs an actionable error.
+    // fail on the inline attempt AND the drain attempt; bad_request is permanent,
+    // so the drain dead-letters it rather than retrying.
+    const h = makeHarness({ failTimes: 2, failStateKind: "bad_request" });
+    await h.handler.handle(statusEvent({ newStatus: "done" }));
+    expect(await h.queue.list()).toHaveLength(1);
+    const res = await h.handler.drainDue(h.clock());
+    expect(res.deadLettered).toBe(1);
+    expect(await h.queue.list()).toHaveLength(0);
+    expect(await h.queue.listDeadLetters()).toHaveLength(1);
+    expect(h.logErrors).toHaveLength(1);
+    expect(h.logErrors[0].msg).toContain("outboundStateMap");
+    expect(h.logErrors[0].fields).toMatchObject({ kind: "state", failureKind: "bad_request" });
   });
 });

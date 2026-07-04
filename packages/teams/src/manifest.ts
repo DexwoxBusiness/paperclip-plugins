@@ -43,7 +43,10 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: JOB_KEYS.dailyDigest,
       displayName: "Daily digest",
       description: "Posts daily agent-activity stats (done/created/active/cost/top performer). PCLIP-21",
-      schedule: `0 ${DEFAULT_CONFIG.digestHour} * * *`,
+      // Ticks hourly; the worker self-throttles to the configured digestHour and
+      // posts once per day, so the time is adjustable at runtime (a static cron
+      // can't read config).
+      schedule: "0 * * * *",
     },
   ],
   instanceConfigSchema: {
@@ -83,6 +86,13 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "If set, issue created/done cards post here instead of the default channel. Capability URL — stored masked, rotate on leak. PCLIP-19",
         default: DEFAULT_CONFIG.pipelineWorkflowUrl,
       },
+      digestWorkflowUrl: {
+        type: "string",
+        format: "secret-ref",
+        title: "Digest channel Workflows URL (secret reference, optional)",
+        description: "If set, the daily digest posts here instead of the default channel. Capability URL — stored masked, rotate on leak. PCLIP-21",
+        default: DEFAULT_CONFIG.digestWorkflowUrl,
+      },
       paperclipBaseUrl: {
         type: "string",
         title: "Paperclip base URL",
@@ -101,6 +111,18 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "boolean",
         title: "Enable daily digest",
         default: DEFAULT_CONFIG.enableDailyDigest,
+      },
+      digestHour: {
+        type: "number",
+        title: "Digest hour (0–23)",
+        description: "Hour of day the daily digest posts. Interpreted in Digest time zone if set, else server-local. PCLIP-21",
+        default: DEFAULT_CONFIG.digestHour,
+      },
+      digestTimezone: {
+        type: "string",
+        title: "Digest time zone (IANA, optional)",
+        description: "IANA time zone for the digest hour, e.g. Asia/Kolkata for 09:00 IST. Empty = server-local time. PCLIP-21",
+        default: DEFAULT_CONFIG.digestTimezone,
       },
       allowPlaintextWorkflowUrl: {
         type: "boolean",

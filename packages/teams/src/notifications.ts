@@ -42,7 +42,9 @@ export type TeamsNotification =
     };
 
 /** Which configured channel a notification routes to (T2/PCLIP-19 refines this). */
-export type ChannelKind = "approvals" | "errors" | "pipeline" | "default";
+// "digest" is a routing target only (the daily digest job), never returned by
+// channelFor for a notification — it maps to its own optional Workflows URL.
+export type ChannelKind = "approvals" | "errors" | "pipeline" | "digest" | "default";
 
 /** Coarse routing hint per notification (T1 always resolves to the default URL). */
 export function channelFor(n: TeamsNotification): ChannelKind {

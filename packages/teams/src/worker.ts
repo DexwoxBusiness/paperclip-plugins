@@ -54,7 +54,11 @@ export default definePlugin({
     const client = createWorkflowsClient({ fetchFn: ((url, init) => fetch(url, init)) as FetchLike });
     const dedupe = createBudgetDedupe(state);
     // PCLIP-22 (T5): per-URL delivery health for degraded-delivery status (AC #3).
-    const health = createDeliveryHealth(state);
+    // The threshold ("repeated failures" = consecutive FINAL failures on one URL,
+    // reset by any success) is operator-configurable; read once at startup (an ops
+    // knob, not a hot path — a restart applies a change, same as a capability list).
+    const startupCfg = (await ctx.config.get()) as TeamsInstanceConfig;
+    const health = createDeliveryHealth(state, { threshold: startupCfg.degradedDeliveryThreshold });
     // Surface degraded-delivery status to the plugin's settings UI (AC #3). No
     // capability required; usePluginData("delivery-health") reads this. The snapshot
     // is sanitized — URLs are fingerprinted, never returned raw (capability-URL safety).

@@ -133,7 +133,12 @@ export async function safeDeliver(
  * backoff schedule is deterministic under test (no real timers, no real random).
  */
 export interface RetryPolicy {
-  /** Retries attempted AFTER the first try. Default 3 → up to 4 total attempts ("retried ×3", AC #1). */
+  /**
+   * Retries attempted AFTER the first try. Default 3, i.e. UP TO 4 TOTAL attempts
+   * (1 initial + 3 retries) — this is what "retried ×3" / "retried up to 3 times"
+   * (AC #1) means. Named for the count of *retries*, not total attempts, to avoid
+   * the off-by-one; the exhausted-case test asserts exactly 4 calls.
+   */
   maxRetries?: number;
   /** First backoff, doubled each retry. Default 500ms. */
   baseDelayMs?: number;
@@ -141,6 +146,14 @@ export interface RetryPolicy {
   maxDelayMs?: number;
   /** Backoff growth factor. Default 2. */
   factor?: number;
+  /**
+   * Whole-loop wall-clock budget (Codex): once cumulative elapsed reaches this, NO
+   * further attempt is scheduled and the last transient failure is returned. Bounds
+   * the total time an event callback can stay busy — without it, 4 attempts each up
+   * to the client timeout (10s) plus backoff could run ~40s, past the 30s SLA.
+   * Default = softDeadlineMs (the 30s notification SLA).
+   */
+  overallDeadlineMs?: number;
   /** Sleep hook (default real setTimeout). Injected in tests to avoid wall-clock waits. */
   sleep?: (ms: number) => Promise<void>;
   /** Jitter source in [0,1) (default Math.random). Injected in tests for determinism. */
@@ -169,10 +182,22 @@ const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => set
  * notification envelope. Backoff runs off the core Paperclip flow (event handlers
  * and the scheduled digest job are already fire-and-forget from the host's emit).
  *
+ * Bounded THREE ways so a callback can't stay busy indefinitely: (1) at most
+ * maxRetries+1 attempts, (2) each attempt bounded by the client's per-request
+ * timeout, and (3) an overall wall-clock deadline — once elapsed reaches
+ * overallDeadlineMs no further attempt is scheduled (Codex: 4×10s + backoff would
+ * otherwise overrun the 30s SLA).
+ *
+ * Every attempt and retry is logged via `log` (ctx.logger), whose output the host
+ * captures into the plugin health dashboard, and final outcomes are counted as
+ * metrics by the caller — together these are the "plugin observability" the task
+ * requires for retries + success/failure rates (AC #4).
+ *
  * Backoff for retry k (1-based) = min(maxDelayMs, baseDelayMs · factor^(k-1)),
  * then multiplied by a [0.5,1.0) jitter factor so many plugins retrying a recovering
  * endpoint don't reconverge into a thundering herd. Jitter never yields 0 (the floor
- * is 0.5×) so a retry always actually waits.
+ * is 0.5×) so a retry always actually waits; the sleep is also clamped to the
+ * remaining deadline budget.
  */
 export async function deliverWithRetry(
   client: WorkflowsClient,
@@ -188,20 +213,37 @@ export async function deliverWithRetry(
   const baseDelayMs = policy.baseDelayMs ?? 500;
   const maxDelayMs = policy.maxDelayMs ?? 8_000;
   const factor = policy.factor ?? 2;
+  const overallDeadlineMs = policy.overallDeadlineMs ?? softDeadlineMs;
   const sleep = policy.sleep ?? defaultSleep;
   const random = policy.random ?? Math.random;
+  const startedAt = now();
 
   let attempt = 0;
-  // Loop is bounded: it can only continue on a TRANSIENT failure with retries left,
-  // so it runs at most maxRetries+1 times — no unbounded retry on a hard-down endpoint.
+  // Loop is bounded: it can only continue on a TRANSIENT failure with retries left
+  // AND within the overall deadline — so it runs at most maxRetries+1 times and never
+  // past the wall-clock budget, no unbounded retry on a hard-down endpoint.
   for (;;) {
     attempt += 1;
     const outcome = await safeDeliver(client, url, message, log, { ...context, attempt }, softDeadlineMs, now);
     if (outcome.ok) return { outcome, attempts: attempt, retried: attempt - 1 };
     if (!outcome.transient) return { outcome, attempts: attempt, retried: attempt - 1 }; // permanent → stop (AC #2)
     if (attempt > maxRetries) return { outcome, attempts: attempt, retried: attempt - 1 }; // retries exhausted
+    // Stop if the wall-clock budget is spent — don't schedule an attempt we can't
+    // afford (keeps total callback-busy time near the SLA, not ~40s).
+    const elapsed = now() - startedAt;
+    if (elapsed >= overallDeadlineMs) {
+      log("teams delivery retry budget exhausted — returning last transient failure", {
+        ...context,
+        attempt,
+        elapsedMs: elapsed,
+        overallDeadlineMs,
+      });
+      return { outcome, attempts: attempt, retried: attempt - 1 };
+    }
     const ceiling = Math.min(maxDelayMs, baseDelayMs * Math.pow(factor, attempt - 1));
-    const delayMs = Math.max(1, Math.round(ceiling * (0.5 + random() * 0.5)));
+    const jittered = Math.max(1, Math.round(ceiling * (0.5 + random() * 0.5)));
+    // Never sleep past the remaining budget.
+    const delayMs = Math.max(1, Math.min(jittered, overallDeadlineMs - elapsed));
     log("teams delivery retrying after transient failure", {
       ...context,
       attempt,

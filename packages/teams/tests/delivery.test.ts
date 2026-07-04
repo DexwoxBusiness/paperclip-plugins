@@ -155,6 +155,29 @@ describe("delivery retries with backoff (PCLIP-22 AC #1/#2)", () => {
     expect(r.outcome.ok).toBe(true);
     expect(calls()).toBe(1);
   });
+
+  it("stops retrying once the overall wall-clock deadline is spent (Codex — bound total time)", async () => {
+    const { fetchFn, calls } = sequencedFetch([503]); // always transient
+    const client = createWorkflowsClient({ fetchFn });
+    let clock = 0;
+    const now = () => clock;
+    const logs: string[] = [];
+    // Backoff sleeps advance the clock; deadline 1500ms is spent before the 4th attempt.
+    const policy = {
+      random: () => 1,
+      baseDelayMs: 1000,
+      factor: 2,
+      overallDeadlineMs: 1500,
+      sleep: async (ms: number) => {
+        clock += ms;
+      },
+    };
+    const r = await deliverWithRetry(client, "https://x.logic.azure.com/y", MSG, (m) => logs.push(m), {}, policy, 30_000, now);
+    expect(r.outcome).toMatchObject({ ok: false, transient: true });
+    expect(calls()).toBe(3); // fewer than the full 4 attempts — budget stopped it early
+    expect(r.attempts).toBe(3);
+    expect(logs.some((l) => l.includes("retry budget exhausted"))).toBe(true);
+  });
 });
 
 describe("delivery metrics (PCLIP-22 AC #4)", () => {

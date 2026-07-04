@@ -37,6 +37,8 @@ export interface TeamsInstanceConfig extends TeamsUrlConfig {
   enableDailyDigest?: boolean;
   digestHour?: number;
   digestTimezone?: string;
+  /** Consecutive failures on one URL before it is flagged degraded (default 5). PCLIP-22 */
+  degradedDeliveryThreshold?: number;
 }
 
 /** Which config field backs each channel. */

@@ -58,6 +58,7 @@ export function adaptIssueCreated(ev: RawPluginEvent): TeamsNotification | null 
     kind: "issue-created",
     title,
     // issue.created: ev.entityId IS the issue, so the entityId fallback is safe here.
+    issueId: str(issue.id) ?? str(ev.entityId),
     issueIdentifier: issueIdentifier(issue, ev, true),
     projectName: str(issue.project_name) ?? str(p.projectName) ?? str(p.project_name),
   };
@@ -71,6 +72,9 @@ export function adaptIssueDone(ev: RawPluginEvent): TeamsNotification | null {
   return {
     kind: "issue-done",
     title,
+    // agent.task_completed: ev.entityId is the agent/task, NOT the issue — only the
+    // nested issue.id is a safe deep-link target.
+    issueId: str(issue.id),
     issueIdentifier: issueIdentifier(issue, ev),
     agentName: str(p.agentName) ?? str(p.agent_name) ?? str(obj(p.agent).name) ?? str(ev.actorId),
   };
@@ -88,6 +92,10 @@ export function adaptApprovalCreated(ev: RawPluginEvent): TeamsNotification | nu
     title: str(approval.title) ?? str(approval.name) ?? str(p.title) ?? "Approval requested",
     requester: str(approval.requester) ?? str(approval.requested_by) ?? str(p.requester) ?? str(ev.actorId) ?? "unknown",
     budget: str(approval.budget) ?? str(p.budget) ?? str(approval.amount),
+    // No `issueId` here on purpose: an approval card deep-links to /approvals/
+    // {approvalId} (its own entity), not to an issue. We DO capture the linked
+    // issue's readable identifier — buildDeepLink derives the company URL prefix
+    // from it (PCLIP-20). issueTitle is display-only.
     issueIdentifier: Object.keys(issue).length ? issueIdentifier(issue, ev) : str(p.issueIdentifier),
     issueTitle: str(issue.name) ?? str(issue.title),
   };
@@ -102,6 +110,10 @@ export function adaptAgentError(ev: RawPluginEvent): TeamsNotification | null {
     kind: "agent-error",
     error,
     agentName: str(p.agentName) ?? str(p.agent_name) ?? str(obj(p.agent).name) ?? str(ev.actorId),
+    // agent.run.failed: ev.entityId may be the run id, so take the agent id only
+    // from the payload (not entityId). Link falls back to the issue when present.
+    agentId: str(obj(p.agent).id) ?? str(p.agentId) ?? str(p.agent_id),
+    issueId: str(issue.id),
     issueIdentifier: Object.keys(issue).length ? issueIdentifier(issue, ev) : str(p.issueIdentifier),
   };
 }

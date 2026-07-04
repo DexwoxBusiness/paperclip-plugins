@@ -86,8 +86,16 @@ const manifest: PaperclipPluginManifestV1 = {
       paperclipBaseUrl: {
         type: "string",
         title: "Paperclip base URL",
-        description: "Public base URL used for deep links on cards (not localhost). PCLIP-20",
+        description:
+          "PUBLIC base URL of your Paperclip instance, used for the 'View in Paperclip' deep link on every card (e.g. https://paperclip.example.com — the reverse-proxied hostname, not localhost, so links work from Teams). PCLIP-20",
         default: DEFAULT_CONFIG.paperclipBaseUrl,
+      },
+      paperclipCompanyPrefix: {
+        type: "string",
+        title: "Company URL prefix (optional)",
+        description:
+          "Your company's issue prefix (e.g. PCLIP) — the segment Paperclip uses in URLs like /PCLIP/issues/…. Optional: it is derived from a card's issue id (PCLIP-123) when available, but is REQUIRED for approval deep links that have no linked issue. PCLIP-20",
+        default: DEFAULT_CONFIG.paperclipCompanyPrefix,
       },
       enableDailyDigest: {
         type: "boolean",

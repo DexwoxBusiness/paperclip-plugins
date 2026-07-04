@@ -52,6 +52,7 @@ describe("channel routing (PCLIP-19)", () => {
       approvals: "approvalsWorkflowUrl",
       errors: "errorsWorkflowUrl",
       pipeline: "pipelineWorkflowUrl",
+      digest: "digestWorkflowUrl",
       default: "defaultWorkflowUrl",
     });
   });

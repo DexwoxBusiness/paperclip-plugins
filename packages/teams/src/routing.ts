@@ -17,6 +17,8 @@ export interface TeamsUrlConfig {
   approvalsWorkflowUrl?: string;
   errorsWorkflowUrl?: string;
   pipelineWorkflowUrl?: string;
+  /** Dedicated channel for the daily digest (PCLIP-21); falls back to default. */
+  digestWorkflowUrl?: string;
 }
 
 /**
@@ -31,6 +33,10 @@ export interface TeamsInstanceConfig extends TeamsUrlConfig {
   paperclipBaseUrl?: string;
   /** Company URL prefix override for deep links. PCLIP-20 */
   paperclipCompanyPrefix?: string;
+  /** Daily digest on/off, hour (0–23), and IANA time zone for the hour. PCLIP-21 */
+  enableDailyDigest?: boolean;
+  digestHour?: number;
+  digestTimezone?: string;
 }
 
 /** Which config field backs each channel. */
@@ -38,6 +44,7 @@ export const CHANNEL_CONFIG_KEY: Record<ChannelKind, keyof TeamsUrlConfig> = {
   approvals: "approvalsWorkflowUrl",
   errors: "errorsWorkflowUrl",
   pipeline: "pipelineWorkflowUrl",
+  digest: "digestWorkflowUrl",
   default: "defaultWorkflowUrl",
 };
 

@@ -22,8 +22,12 @@ export const DEFAULT_CONFIG = {
   paperclipBaseUrl: "",
   /** Company URL prefix (issuePrefix, e.g. "PCLIP") for deep links; else derived from the readable issue id. PCLIP-20 */
   paperclipCompanyPrefix: "",
+  /** Dedicated digest channel (secret-ref); falls back to the default channel. PCLIP-21 */
+  digestWorkflowUrl: "",
   enableDailyDigest: false,
   digestHour: 9,
+  /** IANA time zone for digestHour (e.g. "Asia/Kolkata"); empty = server-local. PCLIP-21 */
+  digestTimezone: "",
   /** Security default: only secret-refs are honored; raw plaintext URLs are a deliberate legacy opt-in. PCLIP-19 */
   allowPlaintextWorkflowUrl: false,
 } as const;

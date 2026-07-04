@@ -57,9 +57,15 @@ export function isEmptyRollup(r: DigestRollup): boolean {
     r.tasksCreated === 0 &&
     r.tasksCompleted === 0 &&
     r.totalCostCents === 0 &&
+    // Count zero-cent cost events as activity too, so they aren't hidden as
+    // "no activity" (Kody).
+    r.costEventCount === 0 &&
     Object.keys(r.agentCompletions).length === 0
   );
 }
+
+/** Digest window length. The accumulator auto-resets when a window ages past this. */
+export const DIGEST_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** Distinct agents that completed work in the window ("active agents"). */
 export function activeAgentCount(r: DigestRollup): number {
@@ -77,6 +83,37 @@ export function topPerformer(r: DigestRollup): { name: string; count: number } |
 
 export function formatCents(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;
+}
+
+// --------------------------------------------------------------------------
+// Schedule helpers (timezone-aware, so "09:00 IST" works — SUGGESTION)
+// --------------------------------------------------------------------------
+
+/** Current hour (0–23) in an IANA time zone; server-local when tz is empty/invalid. */
+export function digestHourInZone(now: Date, tz?: string): number {
+  if (!tz) return now.getHours();
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "2-digit", hour12: false }).formatToParts(now);
+    const h = parts.find((p) => p.type === "hour")?.value;
+    return h !== undefined ? Number(h) % 24 : now.getHours();
+  } catch {
+    return now.getHours();
+  }
+}
+
+/** Calendar date key (YYYY-MM-DD) in an IANA time zone; used for once-per-day throttling. */
+export function digestDateKey(now: Date, tz?: string): string {
+  try {
+    // en-CA renders ISO-style YYYY-MM-DD.
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz || undefined,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(now);
+  } catch {
+    return new Intl.DateTimeFormat("en-CA", { year: "numeric", month: "2-digit", day: "2-digit" }).format(now);
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -135,6 +172,9 @@ export interface DigestAccumulator {
   peek(now?: number): Promise<DigestRollup>;
   /** Return the current window and start a fresh one (called by the digest job). */
   readAndReset(now?: number): Promise<DigestRollup>;
+  /** Merge a previously read-and-reset snapshot back — used when digest delivery
+   *  fails, so the stats are retried on the next run instead of being dropped. */
+  mergeBack(snapshot: DigestRollup): Promise<void>;
 }
 
 /**
@@ -153,7 +193,11 @@ export function createDigestAccumulator(store: DigestStore, opts: { now?: () => 
   function mutate(fn: (r: DigestRollup) => void): Promise<void> {
     return lock(async () => {
       const at = now();
-      const r = await load(at);
+      let r = await load(at);
+      // Bound the window to ~24h: if it aged past that (the digest job didn't run —
+      // worker downtime, or the digest was disabled), start a fresh window so the
+      // next digest reflects the last day, not everything since deploy (Codex/SUGGESTION).
+      if (at - r.windowStart >= DIGEST_WINDOW_MS) r = emptyRollup(at);
       fn(r);
       await store.set(DIGEST_ROLLUP_KEY, r);
     });
@@ -187,6 +231,22 @@ export function createDigestAccumulator(store: DigestStore, opts: { now?: () => 
         const r = await load(at);
         await store.set(DIGEST_ROLLUP_KEY, emptyRollup(at));
         return r;
+      });
+    },
+    mergeBack(snapshot) {
+      return lock(async () => {
+        const at = now();
+        const cur = await load(at);
+        cur.tasksCreated += snapshot.tasksCreated;
+        cur.tasksCompleted += snapshot.tasksCompleted;
+        cur.totalCostCents += snapshot.totalCostCents;
+        cur.costEventCount += snapshot.costEventCount;
+        for (const [k, v] of Object.entries(snapshot.agentCompletions)) {
+          cur.agentCompletions[k] = (cur.agentCompletions[k] ?? 0) + v;
+        }
+        // Keep the earliest window start so a retried snapshot's age is preserved.
+        cur.windowStart = Math.min(cur.windowStart, snapshot.windowStart);
+        await store.set(DIGEST_ROLLUP_KEY, cur);
       });
     },
   };

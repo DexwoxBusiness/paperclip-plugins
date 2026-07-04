@@ -5,7 +5,7 @@ import { buildNotificationCard, channelFor, createBudgetDedupe, type ChannelKind
 import { classifyWorkflowRef, resolveWorkflowRef, type TeamsInstanceConfig } from "./routing.js";
 import { buildDeepLink } from "./links.js";
 import { createWorkflowsClient, safeDeliver, type FetchLike } from "./delivery.js";
-import { buildDigestCard, createDigestAccumulator } from "./digest.js";
+import { buildDigestCard, createDigestAccumulator, digestDateKey, digestHourInZone } from "./digest.js";
 import {
   adaptAgentError,
   adaptApprovalCreated,
@@ -167,30 +167,38 @@ export default definePlugin({
     onBudget("budget.hard_threshold_crossed");
 
     // PCLIP-21: daily digest. The manifest ticks this HOURLY; we self-throttle to
-    // the configured hour and post once per day, so digestHour is adjustable at
-    // runtime without a restart (a static cron can't read config). Hour is
-    // server-local — set digestHour to your local hour.
+    // the configured digestHour (in digestTimezone, else server-local) and post once
+    // per day — so the time is adjustable at runtime (a static cron can't read
+    // config). It fires from digestHour onward and retries hourly on failure until
+    // it succeeds that day, so a transient outage doesn't drop the day's stats.
     ctx.jobs.register(JOB_KEYS.dailyDigest, async (job) => {
       try {
-        const cfg = (await ctx.config.get()) as TeamsInstanceConfig & { enableDailyDigest?: boolean; digestHour?: number };
+        const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
         if (!cfg.enableDailyDigest) return;
         const nowDate = new Date();
         const hour = typeof cfg.digestHour === "number" ? cfg.digestHour : DEFAULT_CONFIG.digestHour;
-        if (nowDate.getHours() !== hour) return;
-        const today = `${nowDate.getFullYear()}-${String(nowDate.getMonth() + 1).padStart(2, "0")}-${String(nowDate.getDate()).padStart(2, "0")}`;
+        const tz = cfg.digestTimezone || undefined;
+        if (digestHourInZone(nowDate, tz) < hour) return; // not the digest hour yet today
+        const today = digestDateKey(nowDate, tz);
         if ((await state.get(DIGEST_LAST_RUN_DATE_KEY)) === today) return; // already posted today
 
-        // Resolve the channel BEFORE consuming the window — if we can't post, keep
-        // accumulating rather than dropping the day's stats.
-        const url = await resolveChannelUrl(cfg, "default", { kind: "digest" });
+        const url = await resolveChannelUrl(cfg, "digest", { kind: "digest" });
         if (!url) {
           log("teams digest skipped: no channel configured", { runId: job.runId });
+          return; // don't consume the window; retry next hour
+        }
+        // Snapshot the window, deliver, and only mark-the-day/keep-the-reset when
+        // delivery SUCCEEDS — otherwise merge the snapshot back so it's retried
+        // next hour rather than silently dropped (Codex/Kody).
+        const rollup = await digest.readAndReset();
+        const message = toWorkflowsMessage(buildDigestCard(rollup));
+        const outcome = await safeDeliver(client, url, message, log, { kind: "digest", channel: "digest" });
+        if (!outcome.ok) {
+          await digest.mergeBack(rollup);
+          log("teams digest delivery failed — will retry next hour", { runId: job.runId, ...outcome });
           return;
         }
         await state.set(DIGEST_LAST_RUN_DATE_KEY, today);
-        const rollup = await digest.readAndReset();
-        const message = toWorkflowsMessage(buildDigestCard(rollup));
-        await safeDeliver(client, url, message, log, { kind: "digest", channel: "default" });
         ctx.logger.info("teams digest posted", {
           runId: job.runId,
           tasksCompleted: rollup.tasksCompleted,

@@ -4,6 +4,9 @@ import {
   buildDigestCard,
   coerceRollup,
   createDigestAccumulator,
+  digestDateKey,
+  digestHourInZone,
+  DIGEST_WINDOW_MS,
   emptyRollup,
   formatCents,
   isEmptyRollup,
@@ -76,6 +79,66 @@ describe("digest rollup (PCLIP-21)", () => {
     expect(formatCents(0)).toBe("$0.00");
     expect(formatCents(249)).toBe("$2.49");
     expect(formatCents(100000)).toBe("$1000.00");
+  });
+
+  it("a zero-cent cost event still counts as activity (Kody)", async () => {
+    const acc = createDigestAccumulator(makeStore());
+    await acc.onCostCents(0);
+    const r = await acc.peek();
+    expect(r.costEventCount).toBe(1);
+    expect(isEmptyRollup(r)).toBe(false);
+  });
+
+  it("auto-resets a window older than 24h so stats don't span >1 day (downtime/disabled)", async () => {
+    let clock = 1_000_000;
+    const acc = createDigestAccumulator(makeStore(), { now: () => clock });
+    await acc.onIssueCreated();
+    expect((await acc.peek()).tasksCreated).toBe(1);
+    // jump past the window; the next accumulation starts a fresh window
+    clock += DIGEST_WINDOW_MS + 1;
+    await acc.onIssueCreated();
+    const r = await acc.peek();
+    expect(r.tasksCreated).toBe(1); // old window dropped, only the new event
+    expect(r.windowStart).toBe(clock);
+  });
+
+  it("mergeBack restores a failed snapshot for retry (Codex/Kody)", async () => {
+    let clock = 2_000;
+    const acc = createDigestAccumulator(makeStore(), { now: () => clock });
+    await acc.onIssueCreated();
+    await acc.onTaskCompleted("Ada");
+    await acc.onCostCents(50);
+    const snap = await acc.readAndReset(); // window consumed
+    expect(isEmptyRollup(await acc.peek())).toBe(true);
+    // an event arrives during the "delivery"
+    await acc.onIssueCreated();
+    // delivery failed -> merge the snapshot back; both the snapshot and the new event survive
+    await acc.mergeBack(snap);
+    const r = await acc.peek();
+    expect(r).toMatchObject({ tasksCreated: 2, tasksCompleted: 1, totalCostCents: 50 });
+    expect(r.agentCompletions).toEqual({ Ada: 1 });
+  });
+});
+
+describe("digest schedule helpers (timezone-aware)", () => {
+  // 2026-07-04T04:30:00Z → 10:00 in IST (UTC+5:30), 04:00 server-UTC.
+  const at = new Date("2026-07-04T04:30:00Z");
+
+  it("computes the hour in an IANA time zone (09:00 IST works)", () => {
+    expect(digestHourInZone(at, "Asia/Kolkata")).toBe(10);
+    expect(digestHourInZone(at, "UTC")).toBe(4);
+    expect(digestHourInZone(new Date("2026-07-04T20:30:00Z"), "Asia/Kolkata")).toBe(2); // next day in IST
+  });
+
+  it("falls back to server-local for an empty/invalid zone", () => {
+    expect(digestHourInZone(at, "")).toBe(at.getHours());
+    expect(digestHourInZone(at, "Not/AZone")).toBe(at.getHours());
+  });
+
+  it("computes a YYYY-MM-DD date key per zone", () => {
+    expect(digestDateKey(at, "UTC")).toBe("2026-07-04");
+    // 2026-07-04T20:30Z is already 2026-07-05 in IST
+    expect(digestDateKey(new Date("2026-07-04T20:30:00Z"), "Asia/Kolkata")).toBe("2026-07-05");
   });
 });
 

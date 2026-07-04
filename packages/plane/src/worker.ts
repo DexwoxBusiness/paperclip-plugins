@@ -68,13 +68,25 @@ const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
 function adaptStatusEvent(ev: PluginEvent): OutboundEvent {
   const p = (ev.payload ?? {}) as Record<string, unknown>;
   const issue = (p.issue ?? {}) as Record<string, unknown>;
-  const newStatus = String(p.status ?? p.newStatus ?? issue.status ?? "");
+  const old = (p.old ?? p.previous ?? {}) as Record<string, unknown>;
+  const nw = (p.new ?? {}) as Record<string, unknown>;
+  const changedRaw = p.changed_fields ?? p.changedFields ?? p.updated_fields;
+  const changedFields = Array.isArray(changedRaw) ? changedRaw.map((f) => String(f)) : undefined;
+  const newStatus = String(p.status ?? p.new_status ?? nw.status ?? issue.status ?? "");
+  const oldStatus =
+    p.old_status !== undefined ? String(p.old_status) : old.status !== undefined ? String(old.status) : undefined;
+  // Only mirror a REAL status transition (Codex P2): if the event lists changed
+  // fields and status/state is not among them, signal no-change (old == new) so
+  // the handler skips. Otherwise compare old vs new when available; with no
+  // change info at all, mirror best-effort (reconciliation PCLIP-5 is the backstop).
+  const statusUnchanged = changedFields ? !changedFields.some((f) => f === "status" || f === "state") : undefined;
   return {
     kind: "status",
     paperclipIssueId: String(ev.entityId ?? issue.id ?? p.issueId ?? ""),
     actorType: ev.actorType,
     actorId: ev.actorId,
     newStatus: newStatus || undefined,
+    oldStatus: statusUnchanged === true ? newStatus : oldStatus,
   };
 }
 

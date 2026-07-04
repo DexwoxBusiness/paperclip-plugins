@@ -12,11 +12,16 @@
  *  - Echo-loop guard (AC #3): a change authored by THIS plugin is an inbound
  *    sync (PCLIP-2) being applied in Paperclip — never mirror it back. Origin is
  *    tracked via the event actor (plugin writes carry actorType="plugin").
+ *  - Real transitions only: a status is mirrored only when it actually changed,
+ *    so a non-status edit that merely carries the current status never PATCHes
+ *    Plane's state back over a value changed in Plane.
  *  - State mapping (AC #1): Paperclip status -> Plane state name, per config.
- *  - Attribution (AC #2): mirrored comments carry "via Paperclip" + the author.
+ *  - Attribution (AC #2): mirrored comments carry "via Paperclip" + the author,
+ *    with both untrusted strings HTML-escaped (no XSS into Plane).
  *  - Durable retry (AC #4): the resolved action is persisted (outbox) before the
- *    network call; transient failures are retried with exponential backoff by a
- *    scheduled drain, so a Plane outage never loses a change.
+ *    network call; queue mutations are serialized (in-process lock) so concurrent
+ *    enqueues/drains cannot lose an action; transient failures are retried with
+ *    exponential backoff by a scheduled drain, so a Plane outage loses nothing.
  */
 
 import { PlaneApiError, type PlaneApiErrorKind, type PlaneClientPort } from "./plane-client.js";
@@ -32,6 +37,8 @@ export interface OutboundEvent {
   actorId?: string;
   /** New Paperclip status (for kind="status"). */
   newStatus?: string;
+  /** Previous status, when the event provides it — mirror only on a real change. */
+  oldStatus?: string;
   /** Comment body + author (for kind="comment"). */
   commentBody?: string;
   commentAuthor?: string;
@@ -45,20 +52,34 @@ export interface OutboundConfig {
 }
 
 export type MirrorDecision =
-  | { kind: "skip"; reason: "echo" | "unsupported" | "no-state-mapping" | "empty-comment" }
+  | { kind: "skip"; reason: "echo" | "unsupported" | "no-state-mapping" | "no-status-change" | "empty-comment" }
   | { kind: "state"; planeState: string }
   | { kind: "comment"; commentHtml: string };
 
-/** Attribution wrapper so a mirrored Plane comment shows its Paperclip origin (AC #2). */
+/** Escape HTML special chars so untrusted text renders as text, never markup. */
+export function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * Attribution wrapper for a mirrored Plane comment (AC #2). The body and author
+ * are UNTRUSTED (agent/user input) and are HTML-escaped before interpolation, so
+ * a comment can never inject markup/script into Plane (XSS). The body is treated
+ * as plain text; rich-text passthrough with sanitization is a future enhancement.
+ */
 export function attributeComment(body: string, author?: string): string {
   const who = author && author.trim() ? author.trim() : "Paperclip agent";
-  const safeBody = body.trim();
-  return `${safeBody}\n<p><em>— ${who} via Paperclip</em></p>`;
+  return `<p>${escapeHtml(body.trim())}</p>\n<p><em>— ${escapeHtml(who)} via Paperclip</em></p>`;
 }
 
 /**
  * Decide what (if anything) to mirror for a Paperclip change. Pure over config;
- * the echo-loop guard and state mapping live here so they are unit-testable.
+ * echo guard, real-transition check, and state mapping live here (unit-testable).
  */
 export function evaluateMirror(event: OutboundEvent, config: OutboundConfig): MirrorDecision {
   // AC #3 echo guard: skip changes this plugin authored (inbound sync origin).
@@ -67,7 +88,13 @@ export function evaluateMirror(event: OutboundEvent, config: OutboundConfig): Mi
   }
   if (event.kind === "status") {
     const status = (event.newStatus ?? "").trim();
-    const planeState = status ? config.stateMap[status] : undefined;
+    if (!status) return { kind: "skip", reason: "no-status-change" };
+    // Only a REAL transition mirrors: a non-status edit that carries the current
+    // status must not PATCH Plane back over a state changed in Plane (Codex P2).
+    if (event.oldStatus !== undefined && event.oldStatus.trim() === status) {
+      return { kind: "skip", reason: "no-status-change" };
+    }
+    const planeState = config.stateMap[status];
     if (!planeState) return { kind: "skip", reason: "no-state-mapping" };
     return { kind: "state", planeState };
   }
@@ -116,9 +143,24 @@ const DEFAULTS = {
 
 export interface OutboundQueue {
   enqueue(item: Omit<MirrorAction, "id" | "attempts" | "nextAttemptAt" | "enqueuedAt">): Promise<MirrorAction>;
+  /** Remove a delivered action by id. */
+  remove(id: string): Promise<void>;
   /** Process all due items via `deliver`; returns counts. Safe to call repeatedly. */
   drain(deliver: (a: MirrorAction) => Promise<void>, now?: number): Promise<{ delivered: number; retried: number; deadLettered: number }>;
   list(): Promise<MirrorAction[]>;
+}
+
+/** Serialize async sections so read-modify-write on the store can't interleave. */
+function createLock(): <T>(fn: () => Promise<T>) => Promise<T> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return <T>(fn: () => Promise<T>): Promise<T> => {
+    const result = tail.then(fn, fn);
+    tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
 }
 
 export function createOutboundQueue(
@@ -127,6 +169,9 @@ export function createOutboundQueue(
 ): OutboundQueue {
   const cfg = { ...DEFAULTS, ...opts };
   const now = opts.now ?? Date.now;
+  // Single out-of-process worker per plugin (verified deployment model), so an
+  // in-process lock is a sufficient and correct mutex for queue mutations.
+  const lock = createLock();
   let seq = 0;
 
   async function load(): Promise<MirrorAction[]> {
@@ -134,67 +179,80 @@ export function createOutboundQueue(
     return Array.isArray(raw) ? (raw as MirrorAction[]) : [];
   }
   async function save(items: MirrorAction[]): Promise<void> {
-    // Bounded: drop the oldest beyond capacity (defensive; a healthy queue drains).
     while (items.length > cfg.capacity) items.shift();
     await store.set(cfg.key, items);
   }
-
   function backoff(attempts: number): number {
     return Math.min(cfg.baseBackoffMs * 2 ** attempts, cfg.maxBackoffMs);
   }
 
   return {
-    async enqueue(item): Promise<MirrorAction> {
-      const items = await load();
-      const action: MirrorAction = {
-        ...item,
-        id: `${now()}-${++seq}`,
-        attempts: 0,
-        nextAttemptAt: now(),
-        enqueuedAt: now(),
-      };
-      items.push(action);
-      await save(items);
-      return action;
+    enqueue(item): Promise<MirrorAction> {
+      return lock(async () => {
+        const items = await load();
+        const action: MirrorAction = {
+          ...item,
+          id: `${now()}-${++seq}`,
+          attempts: 0,
+          nextAttemptAt: now(),
+          enqueuedAt: now(),
+        };
+        items.push(action);
+        await save(items);
+        return action;
+      });
     },
 
-    async list(): Promise<MirrorAction[]> {
+    remove(id): Promise<void> {
+      return lock(async () => {
+        const items = await load();
+        await save(items.filter((i) => i.id !== id));
+      });
+    },
+
+    list(): Promise<MirrorAction[]> {
       return load();
     },
 
-    async drain(deliver, tick = now()): Promise<{ delivered: number; retried: number; deadLettered: number }> {
-      const items = await load();
-      const keep: MirrorAction[] = [];
-      let delivered = 0;
-      let retried = 0;
-      let deadLettered = 0;
-      for (const item of items) {
-        if (item.nextAttemptAt > tick) {
-          keep.push(item); // not due yet
-          continue;
-        }
-        try {
-          await deliver(item);
-          delivered++; // success -> drop from queue
-        } catch (e) {
-          const transient = e instanceof PlaneApiError ? isTransient(e.kind) : true; // unknown -> treat as transient
-          const attempts = item.attempts + 1;
-          if (transient && attempts < cfg.maxAttempts) {
-            keep.push({ ...item, attempts, nextAttemptAt: tick + backoff(attempts) });
-            retried++;
-          } else {
-            deadLettered++; // permanent, or exhausted retries -> drop (logged by caller)
+    drain(deliver, tick = now()): Promise<{ delivered: number; retried: number; deadLettered: number }> {
+      // The whole drain (load -> deliver -> save) runs under the lock so an
+      // enqueue can't overwrite the drained snapshot. Inline single-action
+      // delivery (handle) does its network call OUTSIDE the lock, so the hot
+      // event path is not blocked by a background drain.
+      return lock(async () => {
+        const items = await load();
+        const keep: MirrorAction[] = [];
+        let delivered = 0;
+        let retried = 0;
+        let deadLettered = 0;
+        for (const item of items) {
+          if (item.nextAttemptAt > tick) {
+            keep.push(item);
+            continue;
+          }
+          try {
+            await deliver(item);
+            delivered++;
+          } catch (e) {
+            const transient = e instanceof PlaneApiError ? isTransient(e.kind) : true;
+            const attempts = item.attempts + 1;
+            if (transient && attempts < cfg.maxAttempts) {
+              keep.push({ ...item, attempts, nextAttemptAt: tick + backoff(attempts) });
+              retried++;
+            } else {
+              deadLettered++;
+            }
           }
         }
-      }
-      await save(keep);
-      return { delivered, retried, deadLettered };
+        await save(keep);
+        return { delivered, retried, deadLettered };
+      });
     },
   };
 }
 
 // --------------------------------------------------------------------------
-// Handler: resolve mapping, enqueue (outbox), attempt inline
+// Handler: resolve mapping, enqueue (outbox), deliver the new action inline
 // --------------------------------------------------------------------------
 
 export interface OutboundMirrorDeps {
@@ -226,8 +284,17 @@ export function createOutboundMirrorHandler(deps: OutboundMirrorDeps): OutboundM
     }
   }
 
+  async function drainDue(now?: number) {
+    const res = await deps.queue.drain(deliver, now);
+    if (res.deadLettered > 0) {
+      deps.log("outbound mirror dead-lettered actions (permanent failure or retries exhausted)", { count: res.deadLettered });
+    }
+    return res;
+  }
+
   return {
     deliver,
+    drainDue,
 
     async handle(event: OutboundEvent): Promise<OutboundOutcome> {
       const config = await deps.getConfig();
@@ -243,23 +310,25 @@ export function createOutboundMirrorHandler(deps: OutboundMirrorDeps): OutboundM
         return { kind: "skipped", reason: "no-mapping" };
       }
 
-      // Outbox: persist the resolved action BEFORE the network call, so a Plane
-      // outage cannot lose it (AC #4). Then attempt an inline drain.
-      await deps.queue.enqueue(
+      // Outbox: persist the resolved action BEFORE the network call (AC #4), then
+      // deliver ONLY this action inline. On success remove it; on failure it
+      // stays queued and the scheduled drain retries it with backoff.
+      const action = await deps.queue.enqueue(
         decision.kind === "state"
           ? { planeRef: mapped.planeId, kind: "state", planeState: decision.planeState }
           : { planeRef: mapped.planeId, kind: "comment", commentHtml: decision.commentHtml },
       );
-      const res = await this.drainDue();
-      return { kind: "queued", delivered: res.delivered > 0 };
-    },
-
-    async drainDue(now?: number) {
-      const res = await deps.queue.drain(deliver, now);
-      if (res.deadLettered > 0) {
-        deps.log("outbound mirror dead-lettered actions (permanent failure or retries exhausted)", { count: res.deadLettered });
+      try {
+        await deliver(action);
+        await deps.queue.remove(action.id);
+        return { kind: "queued", delivered: true };
+      } catch (e) {
+        deps.log("outbound mirror deferred to retry queue", {
+          paperclipIssueId: event.paperclipIssueId,
+          error: e instanceof PlaneApiError ? e.kind : "unknown",
+        });
+        return { kind: "queued", delivered: false };
       }
-      return res;
     },
   };
 }

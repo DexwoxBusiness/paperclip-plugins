@@ -50,6 +50,23 @@ describe("evaluateMirror (PCLIP-4)", () => {
     expect(attributeComment("hi")).toContain("Paperclip agent via Paperclip");
   });
 
+  it("HTML-escapes untrusted body and author (Kody: XSS-safe)", () => {
+    const html = attributeComment('<script>alert(1)</script> & "x"', "<b>Ada</b>");
+    expect(html).not.toContain("<script>");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(html).toContain("&amp;");
+    expect(html).toContain("&lt;b&gt;Ada&lt;/b&gt; via Paperclip");
+  });
+
+  it("skips a status that did not actually change (Codex P2: no overwrite)", () => {
+    expect(evaluateMirror(statusEvent({ newStatus: "in_progress", oldStatus: "in_progress" }), CONFIG)).toMatchObject({
+      kind: "skip",
+      reason: "no-status-change",
+    });
+    // a real transition still mirrors
+    expect(evaluateMirror(statusEvent({ newStatus: "done", oldStatus: "in_progress" }), CONFIG)).toEqual({ kind: "state", planeState: "Done" });
+  });
+
   it("skips an empty comment", () => {
     expect(evaluateMirror(commentEvent({ commentBody: "  " }), CONFIG)).toMatchObject({ kind: "skip", reason: "empty-comment" });
   });
@@ -111,6 +128,27 @@ describe("createOutboundQueue (AC #4 durable retry)", () => {
     expect(isTransient("rate_limited")).toBe(true);
     expect(isTransient("not_found")).toBe(false);
     expect(isTransient("unauthorized")).toBe(false);
+  });
+
+  it("remove drops an action by id", async () => {
+    let clock = 1000;
+    const q = makeQueue(() => clock);
+    const a = await q.enqueue({ planeRef: "p1", kind: "state", planeState: "Done" });
+    await q.enqueue({ planeRef: "p2", kind: "state", planeState: "Done" });
+    await q.remove(a.id);
+    const rest = await q.list();
+    expect(rest).toHaveLength(1);
+    expect(rest[0].planeRef).toBe("p2");
+  });
+
+  it("serializes concurrent enqueues — no lost writes (Codex/Kody race)", async () => {
+    let clock = 1000;
+    const q = makeQueue(() => clock);
+    // fire many enqueues concurrently; the in-process lock must serialize them
+    await Promise.all(
+      Array.from({ length: 20 }, (_, i) => q.enqueue({ planeRef: `p${i}`, kind: "state", planeState: "Done" })),
+    );
+    expect(await q.list()).toHaveLength(20);
   });
 });
 

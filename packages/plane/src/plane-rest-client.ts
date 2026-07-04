@@ -3,21 +3,27 @@
  * of the PlaneClientPort the PCLIP-3 agent tools depend on.
  *
  * Contract verified against the Plane API docs (developers.plane.so):
- *  - Base: `<baseUrl>/api/v1/workspaces/<slug>/...`
- *  - Auth: `X-API-Key: <token>` header.
- *  - Status: 200/201/204 success; 400/401/404/429/5xx errors (classifyStatus).
- *  - Rate limit: 60/min; `X-RateLimit-Reset` (epoch seconds), `Retry-After`.
- *  - Pagination: cursor `value:offset:is_prev`; response `{ next_cursor, results }`.
+ *  - Base: `<baseUrl>/api/v1/workspaces/<slug>/...`; auth header `X-API-Key`.
+ *  - Work items live under the `work-items` resource (NOT `issues`):
+ *      get by identifier: GET  work-items/{PROJ}-{n}/
+ *      search:            GET  work-items/search/?search=&limit=&workspace_search=
+ *                         -> { issues: [{ id, name, sequence_id, project__identifier, project_id }] }
+ *      create:            POST projects/{project_id}/work-items/
+ *      comment:           POST projects/{project_id}/work-items/{id}/comments/
+ *      update:            PATCH projects/{project_id}/work-items/{id}/
+ *  - Status: 200/201/204 ok; 400/401/404/429/5xx (classifyStatus). Rate limit:
+ *    `Retry-After` / `X-RateLimit-Reset` (epoch).
  *
  * Security (AC #2): the API key is resolved from the secret-ref at CALL TIME via
- * `getApiKey()` and used only as the request header. It is never cached, logged,
- * or placed in error messages.
+ * `getApiKey()` and used only as the request header — never cached, logged, or in
+ * error messages.
  *
  * Timeout (AC #3): every request is bounded by `timeoutMs` (default 5s) via an
  * AbortController, so a slow call fails as PlaneApiError("unavailable").
  *
- * Endpoint PATHS are validated against the pinned self-hosted build when the
- * plugin is connected (AC #4); the HTTP mechanics below are transport-verified.
+ * Exact endpoint PATHS are confirmed against the pinned self-hosted build on
+ * connect (AC #4); the HTTP mechanics + payload shapes below are doc-backed and
+ * unit-tested with a fake fetch.
  */
 
 import {
@@ -81,9 +87,9 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
   const timeoutMs = deps.timeoutMs ?? 5000;
   const now = deps.now ?? Date.now;
   const apiBase = `${trimTrailingSlash(deps.baseUrl)}/api/v1/workspaces/${encodeURIComponent(deps.workspaceSlug)}`;
-  // Project identifier ("PCLIP") is not secret and is stable; cache it to build
-  // readable identifiers/URLs without re-fetching per call.
-  const projectIdentifierCache = new Map<string, string>();
+  // Non-secret, stable lookups cached in-memory to avoid repeat HTTP requests.
+  const projectIdentifierById = new Map<string, string>(); // project UUID -> "PCLIP"
+  const projectIdByIdentifier = new Map<string, string>(); // "PCLIP" -> project UUID
 
   function parseRetryAfter(res: FetchResponseLike): number | undefined {
     const ra = res.headers.get("retry-after");
@@ -120,11 +126,7 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
     try {
       res = await deps.fetchFn(url, {
         method,
-        headers: {
-          "X-API-Key": apiKey,
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
+        headers: { "X-API-Key": apiKey, "Content-Type": "application/json", Accept: "application/json" },
         body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
         signal: controller.signal,
       });
@@ -151,29 +153,48 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
     return (text ? JSON.parse(text) : {}) as T;
   }
 
+  /** project UUID -> identifier ("PCLIP"), cached (one request per project). */
   async function projectIdentifier(projectId: string): Promise<string> {
-    const cached = projectIdentifierCache.get(projectId);
+    const cached = projectIdentifierById.get(projectId);
     if (cached) return cached;
     const proj = await request<{ identifier?: string }>("GET", `projects/${projectId}`);
     const ident = typeof proj.identifier === "string" ? proj.identifier : "";
-    if (ident) projectIdentifierCache.set(projectId, ident);
+    if (ident) {
+      projectIdentifierById.set(projectId, ident);
+      projectIdByIdentifier.set(ident.toUpperCase(), projectId);
+    }
     return ident;
   }
 
-  function webUrl(projectId: string, issueId: string): string {
-    return `${trimTrailingSlash(deps.baseUrl)}/${encodeURIComponent(deps.workspaceSlug)}/projects/${projectId}/issues/${issueId}`;
+  /** identifier prefix ("PCLIP") -> project UUID, via a single cached project list. */
+  async function resolveProjectIdByIdentifier(readableIdentifier: string): Promise<string> {
+    const key = readableIdentifier.split("-")[0].toUpperCase();
+    const cached = projectIdByIdentifier.get(key);
+    if (cached) return cached;
+    const raw = await request<{ results?: unknown[] } | unknown[]>("GET", "projects", { query: { per_page: "100" } });
+    const list = Array.isArray(raw) ? raw : Array.isArray(raw.results) ? raw.results : [];
+    for (const p of list) {
+      const o = (p ?? {}) as Record<string, unknown>;
+      if (typeof o.identifier === "string" && typeof o.id === "string") {
+        projectIdByIdentifier.set(o.identifier.toUpperCase(), o.id);
+        projectIdentifierById.set(o.id, o.identifier);
+      }
+    }
+    return projectIdByIdentifier.get(key) ?? "";
   }
 
-  /** Map a raw Plane issue object to the domain PlaneWorkItem (best-effort fields). */
-  async function toWorkItem(raw: Record<string, unknown>): Promise<PlaneWorkItem> {
-    const projectId = String(raw.project ?? raw.project_id ?? "");
-    const id = String(raw.id ?? "");
-    const ident = projectId ? await projectIdentifier(projectId) : "";
-    const seq = raw.sequence_id;
-    const identifier = ident && seq !== undefined ? `${ident}-${seq}` : (typeof raw.identifier === "string" ? raw.identifier : id);
-    const labels = Array.isArray(raw.labels) ? raw.labels.map((l) => String(l)) : [];
-    const commentsRaw = Array.isArray(raw.comments) ? raw.comments : [];
-    const comments: PlaneComment[] = commentsRaw.map((c) => {
+  /** Plane "browse by identifier" web URL — needs only the readable identifier. */
+  function browseUrl(identifier: string): string {
+    return `${trimTrailingSlash(deps.baseUrl)}/${encodeURIComponent(deps.workspaceSlug)}/browse/${identifier}/`;
+  }
+
+  function labelsOf(raw: Record<string, unknown>): string[] {
+    return Array.isArray(raw.labels) ? raw.labels.map((l) => String(l)) : [];
+  }
+
+  function commentsOf(raw: Record<string, unknown>): PlaneComment[] {
+    const arr = Array.isArray(raw.comments) ? raw.comments : [];
+    return arr.map((c) => {
       const o = (c ?? {}) as Record<string, unknown>;
       return {
         id: String(o.id ?? ""),
@@ -182,93 +203,115 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
         createdAt: typeof o.created_at === "string" ? o.created_at : undefined,
       };
     });
+  }
+
+  /**
+   * Resolve a work item's readable identifier. Prefers what we already know — the
+   * input identifier, or `project__identifier` in the response — and only falls
+   * back to a cached project lookup when neither is present, so the common paths
+   * add NO extra HTTP request (Kody perf).
+   */
+  async function resolveIdentifier(raw: Record<string, unknown>, knownIdentifier?: string): Promise<string> {
+    if (knownIdentifier) return knownIdentifier;
+    const seq = raw.sequence_id;
+    const projIdent = typeof raw.project__identifier === "string" ? raw.project__identifier : "";
+    if (projIdent && seq !== undefined) return `${projIdent}-${seq}`;
+    const projectId = String(raw.project ?? raw.project_id ?? "");
+    if (projectId && seq !== undefined) {
+      const ident = await projectIdentifier(projectId);
+      if (ident) return `${ident}-${seq}`;
+    }
+    return typeof raw.identifier === "string" ? raw.identifier : String(raw.id ?? "");
+  }
+
+  async function toWorkItem(raw: Record<string, unknown>, knownIdentifier?: string): Promise<PlaneWorkItem> {
+    const identifier = await resolveIdentifier(raw, knownIdentifier);
     return {
-      id,
+      id: String(raw.id ?? ""),
       identifier,
       name: String(raw.name ?? ""),
       descriptionHtml: String(raw.description_html ?? raw.description ?? ""),
       state: String(raw.state ?? ""),
       priority: typeof raw.priority === "string" ? raw.priority : undefined,
-      labels,
-      comments,
-      url: webUrl(projectId, id),
+      labels: labelsOf(raw),
+      comments: commentsOf(raw),
+      url: browseUrl(identifier),
     };
   }
 
-  function toSummary(raw: Record<string, unknown>, projectIdent: string): PlaneWorkItemSummary {
-    const projectId = String(raw.project ?? raw.project_id ?? "");
+  /** Resolve a work item's UUID + project UUID (needed for project-scoped mutations). */
+  async function fetchIssueRef(idOrIdentifier: string): Promise<{ id: string; projectId: string; identifier: string }> {
+    const known = READABLE_ID_RE.test(idOrIdentifier) ? idOrIdentifier : undefined;
+    const raw = await request<Record<string, unknown>>("GET", `work-items/${idOrIdentifier}`, {
+      query: { expand: "labels,state" },
+    });
     const id = String(raw.id ?? "");
-    const seq = raw.sequence_id;
-    return {
-      id,
-      identifier: projectIdent && seq !== undefined ? `${projectIdent}-${seq}` : id,
-      name: String(raw.name ?? ""),
-      state: String(raw.state ?? ""),
-      url: webUrl(projectId, id),
-    };
+    let projectId = String(raw.project ?? raw.project_id ?? "");
+    if (!projectId && known) projectId = await resolveProjectIdByIdentifier(known);
+    const identifier = await resolveIdentifier(raw, known);
+    return { id, projectId, identifier };
   }
 
   const client: PlaneRestClient = {
     async getWorkItem(idOrIdentifier: string): Promise<PlaneWorkItem> {
-      // Readable identifier (PROJ-123) resolves via the workspace identifier
-      // endpoint; a bare UUID uses the workspace-level detail lookup. Exact paths
-      // are confirmed against the pinned build (AC #4).
-      const path = READABLE_ID_RE.test(idOrIdentifier)
-        ? `issues/${idOrIdentifier}`
-        : `issues/${idOrIdentifier}`;
-      const raw = await request<Record<string, unknown>>("GET", path, { query: { expand: "labels,state,comments" } });
-      return toWorkItem(raw);
+      // Single work-items path — readable identifier (PROJ-123) or UUID. When the
+      // input is a readable identifier we already know it, so no lookup is needed.
+      const known = READABLE_ID_RE.test(idOrIdentifier) ? idOrIdentifier : undefined;
+      const raw = await request<Record<string, unknown>>("GET", `work-items/${idOrIdentifier}`, {
+        query: { expand: "labels,state,comments" },
+      });
+      return toWorkItem(raw, known);
     },
 
     async searchWorkItems(query): Promise<PlaneSearchResult> {
-      const raw = await request<{ results?: unknown[]; next_cursor?: string; next_page_results?: boolean }>(
-        "GET",
-        "issues/search",
-        { query: { search: query.text, labels: query.label, state: query.state, cursor: query.cursor, per_page: "50" } },
-      );
-      const results = Array.isArray(raw.results) ? raw.results : [];
-      // Resolve each hit's project identifier (cached) for readable ids.
-      const items: PlaneWorkItemSummary[] = [];
-      for (const r of results) {
+      // Plane's semantic search endpoint returns `{ issues: [...] }` (each hit
+      // carries project__identifier + sequence_id) and takes `search` + `limit`.
+      if (!query.text) return { items: [] };
+      const raw = await request<{ issues?: unknown[] }>("GET", "work-items/search", {
+        query: { search: query.text, limit: "50", workspace_search: "true" },
+      });
+      const issues = Array.isArray(raw.issues) ? raw.issues : [];
+      const items: PlaneWorkItemSummary[] = issues.map((r) => {
         const o = (r ?? {}) as Record<string, unknown>;
-        const projectId = String(o.project ?? o.project_id ?? "");
-        const ident = projectId ? await projectIdentifier(projectId) : "";
-        items.push(toSummary(o, ident));
-      }
-      const nextCursor = raw.next_page_results ? raw.next_cursor : undefined;
-      return { items, nextCursor: nextCursor || undefined };
+        const projIdent = typeof o.project__identifier === "string" ? o.project__identifier : "";
+        const identifier =
+          projIdent && o.sequence_id !== undefined ? `${projIdent}-${o.sequence_id}` : String(o.id ?? "");
+        return {
+          id: String(o.id ?? ""),
+          identifier,
+          name: String(o.name ?? ""),
+          state: String(o.state ?? ""),
+          url: browseUrl(identifier),
+        };
+      });
+      // The search endpoint returns up to `limit` best matches (no cursor).
+      return { items };
     },
 
     async createWorkItem(input: PlaneCreateInput): Promise<PlaneMutationResult> {
-      const raw = await request<Record<string, unknown>>("POST", `projects/${input.projectId}/issues`, {
+      const raw = await request<Record<string, unknown>>("POST", `projects/${input.projectId}/work-items`, {
         body: {
           name: input.name,
           description_html: input.descriptionHtml,
           ...(input.priority ? { priority: input.priority } : {}),
         },
       });
-      const id = String(raw.id ?? "");
-      const ident = await projectIdentifier(input.projectId);
-      const identifier = ident && raw.sequence_id !== undefined ? `${ident}-${raw.sequence_id}` : id;
-      return { id, identifier, url: webUrl(input.projectId, id) };
+      const identifier = await resolveIdentifier(raw);
+      return { id: String(raw.id ?? ""), identifier, url: browseUrl(identifier) };
     },
 
     async addComment(idOrIdentifier: string, commentHtml: string): Promise<PlaneCommentResult> {
-      const wi = await client.getWorkItem(idOrIdentifier);
-      const projectId = String((wi.url.match(/projects\/([^/]+)\/issues/) ?? [])[1] ?? "");
-      const raw = await request<Record<string, unknown>>("POST", `projects/${projectId}/issues/${wi.id}/comments`, {
+      const ref = await fetchIssueRef(idOrIdentifier);
+      const raw = await request<Record<string, unknown>>("POST", `projects/${ref.projectId}/work-items/${ref.id}/comments`, {
         body: { comment_html: commentHtml },
       });
-      return { id: String(raw.id ?? ""), url: `${wi.url}#comment-${raw.id ?? ""}` };
+      return { id: String(raw.id ?? ""), url: `${browseUrl(ref.identifier)}#comment-${raw.id ?? ""}` };
     },
 
     async updateState(idOrIdentifier: string, state: string): Promise<PlaneStateResult> {
-      const wi = await client.getWorkItem(idOrIdentifier);
-      const projectId = String((wi.url.match(/projects\/([^/]+)\/issues/) ?? [])[1] ?? "");
-      await request<Record<string, unknown>>("PATCH", `projects/${projectId}/issues/${wi.id}`, {
-        body: { state },
-      });
-      return { id: wi.id, identifier: wi.identifier, state, url: wi.url };
+      const ref = await fetchIssueRef(idOrIdentifier);
+      await request<Record<string, unknown>>("PATCH", `projects/${ref.projectId}/work-items/${ref.id}`, { body: { state } });
+      return { id: ref.id, identifier: ref.identifier, state, url: browseUrl(ref.identifier) };
     },
 
     async testConnection(): Promise<{ ok: boolean; error?: string }> {

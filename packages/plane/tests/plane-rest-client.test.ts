@@ -46,22 +46,37 @@ function makeClient(handler: Handler, opts: { getApiKey?: () => Promise<string>;
   return { client, calls, resolveCount: () => resolveCount };
 }
 
+// Verified against the Plane API docs: work-items resource, search returns
+// `{ issues: [{ project__identifier, sequence_id }] }`, browse-form web URLs.
+const router: Handler = (method, url) => {
+  const path = url.split("?")[0];
+  if (method === "GET" && /\/work-items\/search$/.test(path))
+    return { status: 200, body: { issues: [{ id: "u1", name: "A", sequence_id: 1, project__identifier: "PCLIP", project_id: "p1" }] } };
+  if (method === "GET" && /\/work-items\/PCLIP-12$/.test(path))
+    return { status: 200, body: { id: "i12", project: "p1", sequence_id: 12, name: "Title", description_html: "<p>d</p>", state: "Todo", labels: ["l1"], comments: [{ id: "c1", comment_html: "<p>hi</p>" }] } };
+  if (method === "POST" && /\/projects\/p1\/work-items$/.test(path))
+    return { status: 201, body: { id: "new-id", project__identifier: "PCLIP", sequence_id: 99 } };
+  if (method === "POST" && /\/projects\/p1\/work-items\/i12\/comments$/.test(path)) return { status: 201, body: { id: "cm1" } };
+  if (method === "PATCH" && /\/projects\/p1\/work-items\/i12$/.test(path)) return { status: 200, body: {} };
+  return { status: 404, body: {} };
+};
+
 describe("createPlaneRestClient — auth & security (AC #2)", () => {
   it("sends the resolved key as X-API-Key and resolves it per call", async () => {
-    const h = makeClient((_m, url) => (url.includes("/projects/") ? { status: 200, body: { identifier: "PCLIP" } } : { status: 200, body: { id: "i1", project: "p1", sequence_id: 12, name: "N" } }));
+    const h = makeClient(router);
     await h.client.getWorkItem("PCLIP-12");
     expect(h.calls[0].headers["X-API-Key"]).toBe("plane_api_secret-key");
-    await h.client.getWorkItem("PCLIP-13");
+    await h.client.getWorkItem("PCLIP-12");
     expect(h.resolveCount()).toBeGreaterThanOrEqual(2); // resolved again, not cached
   });
 
-  it("fails as unauthorized when no key resolves (never a silent call)", async () => {
-    const h = makeClient(() => ({ status: 200, body: {} }), { getApiKey: async () => "" });
+  it("fails as unauthorized when no key resolves", async () => {
+    const h = makeClient(router, { getApiKey: async () => "" });
     await expect(h.client.getWorkItem("PCLIP-1")).rejects.toMatchObject({ kind: "unauthorized" });
   });
 
   it("never includes the API key in a PlaneApiError message", async () => {
-    const h = makeClient(() => ({ status: 500, body: "server error with secret plane_api_secret-key leaked?" }));
+    const h = makeClient(() => ({ status: 500, body: "server error mentioning plane_api_secret-key?" }));
     await h.client.getWorkItem("PCLIP-1").then(
       () => { throw new Error("should have thrown"); },
       (e: PlaneApiError) => {
@@ -118,28 +133,55 @@ describe("createPlaneRestClient — timeout (AC #3)", () => {
   });
 });
 
-describe("createPlaneRestClient — mappings & URL", () => {
-  const router: Handler = (method, url) => {
-    if (method === "GET" && /\/projects\/p1$/.test(url.split("?")[0])) return { status: 200, body: { identifier: "PCLIP" } };
-    if (method === "POST" && /\/projects\/p1\/issues$/.test(url.split("?")[0])) return { status: 201, body: { id: "new-id", project: "p1", sequence_id: 99 } };
-    if (method === "GET" && /\/issues\/PCLIP-12$/.test(url.split("?")[0])) return { status: 200, body: { id: "i12", project: "p1", sequence_id: 12, name: "Title", description_html: "<p>d</p>", state: "Todo", labels: ["l1"], comments: [{ id: "c1", comment_html: "<p>hi</p>" }] } };
-    return { status: 404, body: {} };
-  };
-
-  it("creates a work item and returns identifier + web URL", async () => {
-    const h = makeClient(router);
-    const res = await h.client.createWorkItem({ projectId: "p1", name: "New" });
-    expect(res).toMatchObject({ id: "new-id", identifier: "PCLIP-99" });
-    expect(res.url).toBe("https://plane.example.com/acme/projects/p1/issues/new-id");
-  });
-
-  it("maps a fetched work item to the domain shape with URL", async () => {
+describe("createPlaneRestClient — work-items mappings & URLs", () => {
+  it("gets a work item via the work-items route and maps the domain shape", async () => {
     const h = makeClient(router);
     const wi = await h.client.getWorkItem("PCLIP-12");
+    expect(h.calls[0].url).toContain("/work-items/PCLIP-12");
     expect(wi).toMatchObject({ id: "i12", identifier: "PCLIP-12", name: "Title", state: "Todo" });
     expect(wi.labels).toEqual(["l1"]);
     expect(wi.comments[0]).toMatchObject({ id: "c1", bodyHtml: "<p>hi</p>" });
-    expect(wi.url).toContain("/acme/projects/p1/issues/i12");
+    expect(wi.url).toBe("https://plane.example.com/acme/browse/PCLIP-12/");
+  });
+
+  it("searches via work-items/search, parses the `issues` array + project__identifier, and does NO per-hit project lookup (Kody perf)", async () => {
+    const h = makeClient(router);
+    const res = await h.client.searchWorkItems({ text: "auth" });
+    expect(h.calls[0].url).toContain("/work-items/search?");
+    expect(h.calls[0].url).toContain("search=auth");
+    // The Plane search endpoint returns id/name/sequence_id/project__identifier
+    // (no state), so the summary's readable id is built without any extra call.
+    expect(res.items[0]).toMatchObject({ id: "u1", identifier: "PCLIP-1", name: "A" });
+    expect(res.items[0].url).toBe("https://plane.example.com/acme/browse/PCLIP-1/");
+    // No extra GET projects/... call was made to build the readable id.
+    expect(h.calls.every((c) => !/\/projects\//.test(c.url))).toBe(true);
+    expect(h.calls).toHaveLength(1);
+  });
+
+  it("returns no results for an empty search (endpoint requires `search`)", async () => {
+    const h = makeClient(router);
+    expect(await h.client.searchWorkItems({})).toEqual({ items: [] });
+  });
+
+  it("creates via projects/{id}/work-items and returns identifier + browse URL", async () => {
+    const h = makeClient(router);
+    const res = await h.client.createWorkItem({ projectId: "p1", name: "New" });
+    expect(res).toMatchObject({ id: "new-id", identifier: "PCLIP-99" });
+    expect(res.url).toBe("https://plane.example.com/acme/browse/PCLIP-99/");
+  });
+
+  it("comments via projects/{id}/work-items/{id}/comments", async () => {
+    const h = makeClient(router);
+    const res = await h.client.addComment("PCLIP-12", "<p>done</p>");
+    expect(h.calls.some((c) => c.method === "POST" && /\/projects\/p1\/work-items\/i12\/comments$/.test(c.url.split("?")[0]))).toBe(true);
+    expect(res.url).toContain("/browse/PCLIP-12/#comment-cm1");
+  });
+
+  it("updates state via PATCH projects/{id}/work-items/{id}", async () => {
+    const h = makeClient(router);
+    const res = await h.client.updateState("PCLIP-12", "Done");
+    expect(h.calls.some((c) => c.method === "PATCH" && /\/projects\/p1\/work-items\/i12$/.test(c.url.split("?")[0]))).toBe(true);
+    expect(res).toMatchObject({ id: "i12", identifier: "PCLIP-12", state: "Done" });
   });
 });
 

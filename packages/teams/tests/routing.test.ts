@@ -42,6 +42,11 @@ describe("channel routing (PCLIP-19)", () => {
     expect(resolveWorkflowRef("approvals", cfg)).toBe("ref-default");
   });
 
+  it("routes the digest to its own channel when set, else falls back to default (PCLIP-21 AC #4)", () => {
+    expect(resolveWorkflowRef("digest", { defaultWorkflowUrl: "ref-default", digestWorkflowUrl: "ref-digest" })).toBe("ref-digest");
+    expect(resolveWorkflowRef("digest", { defaultWorkflowUrl: "ref-default" })).toBe("ref-default");
+  });
+
   it("returns '' when nothing is configured (caller skips)", () => {
     expect(resolveWorkflowRef("approvals", {})).toBe("");
     expect(resolveWorkflowRef("default", { defaultWorkflowUrl: "" })).toBe("");

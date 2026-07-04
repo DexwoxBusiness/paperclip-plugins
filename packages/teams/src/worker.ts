@@ -52,6 +52,13 @@ export default definePlugin({
     const dedupe = createBudgetDedupe(state);
     // PCLIP-21: accumulate the daily-digest rollup from events into plugin state.
     const digest = createDigestAccumulator(state);
+    // Accumulate ONLY while the digest is enabled, so a disabled digest is fully
+    // quiescent (no state growth). The accumulator's 24h window auto-reset is a
+    // further backstop against stale data on re-enable.
+    const accumulateIfEnabled = async (fn: () => Promise<void>): Promise<void> => {
+      const cfg = (await ctx.config.get()) as { enableDailyDigest?: boolean };
+      if (cfg.enableDailyDigest) await fn();
+    };
 
     /**
      * Resolve the actual Workflows URL for a channel from live config: pick the ref
@@ -123,7 +130,7 @@ export default definePlugin({
       try {
         const n = adaptIssueCreated(ev);
         if (n) await deliver(n);
-        await digest.onIssueCreated();
+        await accumulateIfEnabled(() => digest.onIssueCreated());
       } catch (e) {
         log("teams issue.created handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
       }
@@ -132,7 +139,7 @@ export default definePlugin({
     // "issue done" card comes from issue.updated above). Payload carries agentId.
     ctx.events.on("agent.run.finished", async (ev) => {
       try {
-        await digest.onTaskCompleted(extractCompletedAgent(ev));
+        await accumulateIfEnabled(() => digest.onTaskCompleted(extractCompletedAgent(ev)));
       } catch (e) {
         log("teams agent.run.finished handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
       }
@@ -143,7 +150,7 @@ export default definePlugin({
     ctx.events.on("cost_event.created", async (ev) => {
       try {
         const cents = extractCostCents(ev);
-        if (cents !== undefined) await digest.onCostCents(cents);
+        if (cents !== undefined) await accumulateIfEnabled(() => digest.onCostCents(cents));
       } catch (e) {
         log("teams cost_event.created handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
       }

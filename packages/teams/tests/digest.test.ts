@@ -165,6 +165,18 @@ describe("digest card (PCLIP-21)", () => {
     // no FactSet on the empty card
     expect(card.body.some((e) => e.type === "FactSet")).toBe(false);
   });
+
+  it("end-to-end cost: extractCostCents -> onCostCents -> card renders USD (AC #3)", async () => {
+    const acc = createDigestAccumulator(makeStore());
+    // two cost_event.created payloads (host detail shape { costCents })
+    for (const ev of [{ payload: { costCents: 250 } }, { payload: { costCents: 1000 } }]) {
+      const cents = extractCostCents(ev);
+      if (cents !== undefined) await acc.onCostCents(cents);
+    }
+    const r = await acc.peek();
+    expect(r.totalCostCents).toBe(1250);
+    expect(JSON.stringify(buildDigestCard(r))).toContain("$12.50");
+  });
 });
 
 describe("extractCostCents (PCLIP-21)", () => {

@@ -176,7 +176,12 @@ export interface DigestAccumulator {
   onCostCents(cents: number): Promise<void>;
   /** Read the current window without mutating (tests / previews). */
   peek(now?: number): Promise<DigestRollup>;
-  /** Return the current window and start a fresh one (called by the digest job). */
+  /**
+   * Return the current window and start a fresh one (called by the digest job).
+   * The window is "since the last digest" — ≈24h in steady state (the job runs
+   * once/day), and shorter on the very first run after enable. It never exceeds
+   * ~24h (the accumulator auto-resets a stale window), matching "the last 24 h".
+   */
   readAndReset(now?: number): Promise<DigestRollup>;
   /** Merge a previously read-and-reset snapshot back — used when digest delivery
    *  fails, so the stats are retried on the next run instead of being dropped. */

@@ -1,7 +1,7 @@
 import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { ISSUE_ORIGIN_KIND, JOB_KEYS, PLUGIN_ID, TOOL_NAMES, WEBHOOK_KEYS } from "./constants.js";
 import pluginManifest from "./manifest.js";
-import { createAgentTools } from "./agent-tools.js";
+import { createAgentTools, registerPlaneTools, type ToolRegistrar } from "./agent-tools.js";
 import { createUnconfiguredPlaneClient, type PlaneClientPort } from "./plane-client.js";
 import {
   createDeliveryRecorder,
@@ -157,25 +157,21 @@ export default definePlugin({
     // PCLIP-3: register the five agent tools. Handlers delegate to `planeClient`
     // via a getter so PCLIP-7 can swap in the authenticated client without
     // re-registering. Declarations (schema/description) come from the manifest.
-    const agentTools = createAgentTools(() => planeClient);
-    const toolDecls = new Map((pluginManifest.tools ?? []).map((t) => [t.name, t]));
-    const registerTool = (name: string, handler: (params: unknown) => Promise<{ content?: string; data?: unknown; error?: string }>) => {
-      const decl = toolDecls.get(name);
-      if (!decl) {
-        ctx.logger.error("tool declaration missing from manifest", { name });
-        return;
-      }
-      ctx.tools.register(
-        name,
-        { displayName: decl.displayName, description: decl.description, parametersSchema: decl.parametersSchema },
-        (params) => handler(params),
-      );
+    // registerPlaneTools does the register→invoke wiring (unit-tested with a fake
+    // registrar). The adapter bridges our SDK-decoupled ToolRegistrar to
+    // ctx.tools; the declaration cast is safe because the schema comes from the
+    // manifest (a real JsonSchema).
+    const registrar: ToolRegistrar = {
+      register: (name, declaration, fn) =>
+        ctx.tools.register(name, declaration as Parameters<typeof ctx.tools.register>[1], fn),
     };
-    registerTool(TOOL_NAMES.getWorkItem, agentTools.getWorkItem);
-    registerTool(TOOL_NAMES.searchWorkItems, agentTools.searchWorkItems);
-    registerTool(TOOL_NAMES.createWorkItem, agentTools.createWorkItem);
-    registerTool(TOOL_NAMES.addComment, agentTools.addComment);
-    registerTool(TOOL_NAMES.updateState, agentTools.updateState);
+    registerPlaneTools(
+      registrar,
+      createAgentTools(() => planeClient),
+      pluginManifest.tools ?? [],
+      TOOL_NAMES,
+      (name) => ctx.logger.error("tool declaration missing from manifest", { name }),
+    );
   },
 
   /**

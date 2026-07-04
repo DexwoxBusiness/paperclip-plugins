@@ -146,6 +146,29 @@ async function runTool(body: () => Promise<ToolResultShape>): Promise<ToolResult
   }
 }
 
+/** Default per-call deadline (AC #3: create/comment/update must land within 5s). */
+export const DEFAULT_TOOL_TIMEOUT_MS = 5000;
+
+/**
+ * Race a client call against a deadline. On timeout the call rejects as a
+ * PlaneApiError("unavailable"), which runTool maps to a structured, retryable
+ * error — so the 5s visibility SLA is ENFORCED at the tool layer, independent of
+ * the concrete client (PCLIP-7). The timer is always cleared to avoid leaks.
+ */
+function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  if (!ms || ms <= 0) return p;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new PlaneApiError("unavailable", undefined, `Plane call exceeded the ${ms}ms SLA`)),
+      ms,
+    );
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 export interface PlaneAgentTools {
   getWorkItem(params: unknown): Promise<ToolResultShape>;
   searchWorkItems(params: unknown): Promise<ToolResultShape>;
@@ -154,26 +177,36 @@ export interface PlaneAgentTools {
   updateState(params: unknown): Promise<ToolResultShape>;
 }
 
+export interface AgentToolsOptions {
+  /** Per-call deadline in ms. Default {@link DEFAULT_TOOL_TIMEOUT_MS}; 0 disables. */
+  timeoutMs?: number;
+}
+
 /**
  * Build the tool handlers. `getClient` is a getter so the worker can swap the
  * concrete authenticated client in later (PCLIP-7) without re-registering tools.
+ * Every client call is bounded by a deadline (AC #3).
  */
-export function createAgentTools(getClient: () => PlaneClientPort): PlaneAgentTools {
+export function createAgentTools(getClient: () => PlaneClientPort, options: AgentToolsOptions = {}): PlaneAgentTools {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+  const call = <T>(p: Promise<T>): Promise<T> => withDeadline(p, timeoutMs);
   return {
     getWorkItem: (params) =>
       runTool(async () => {
-        const wi = await getClient().getWorkItem(requireString(params, "id"));
+        const wi = await call(getClient().getWorkItem(requireString(params, "id")));
         return { content: formatWorkItem(wi), data: wi };
       }),
 
     searchWorkItems: (params) =>
       runTool(async () => {
-        const res = await getClient().searchWorkItems({
-          text: optString(params, "query"),
-          label: optString(params, "label"),
-          state: optString(params, "state"),
-          cursor: optString(params, "cursor"),
-        });
+        const res = await call(
+          getClient().searchWorkItems({
+            text: optString(params, "query"),
+            label: optString(params, "label"),
+            state: optString(params, "state"),
+            cursor: optString(params, "cursor"),
+          }),
+        );
         const lines = res.items.map((i) => `${i.identifier} [${i.state}] ${i.name} — ${i.url}`);
         const header = `${res.items.length} result(s)${res.nextCursor ? " (more available; pass cursor to page)" : ""}`;
         return { content: [header, ...lines].join("\n"), data: res };
@@ -181,25 +214,84 @@ export function createAgentTools(getClient: () => PlaneClientPort): PlaneAgentTo
 
     createWorkItem: (params) =>
       runTool(async () => {
-        const res = await getClient().createWorkItem({
-          projectId: requireString(params, "projectId"),
-          name: requireString(params, "name"),
-          descriptionHtml: optString(params, "descriptionHtml"),
-          priority: optPriority(params),
-        });
+        const res = await call(
+          getClient().createWorkItem({
+            projectId: requireString(params, "projectId"),
+            name: requireString(params, "name"),
+            descriptionHtml: optString(params, "descriptionHtml"),
+            priority: optPriority(params),
+          }),
+        );
         return { content: `Created ${res.identifier}: ${res.url}`, data: res };
       }),
 
     addComment: (params) =>
       runTool(async () => {
-        const res = await getClient().addComment(requireString(params, "id"), requireString(params, "commentHtml"));
+        const res = await call(getClient().addComment(requireString(params, "id"), requireString(params, "commentHtml")));
         return { content: `Comment added: ${res.url}`, data: res };
       }),
 
     updateState: (params) =>
       runTool(async () => {
-        const res = await getClient().updateState(requireString(params, "id"), requireString(params, "state"));
+        const res = await call(getClient().updateState(requireString(params, "id"), requireString(params, "state")));
         return { content: `${res.identifier} moved to "${res.state}": ${res.url}`, data: res };
       }),
   };
+}
+
+/** Minimal registrar port (subset of ctx.tools) so registration is testable. */
+export interface ToolRegistrar {
+  register(
+    name: string,
+    declaration: { displayName: string; description: string; parametersSchema: unknown },
+    fn: (params: unknown) => Promise<ToolResultShape>,
+  ): void;
+}
+
+export interface ToolDeclarationSource {
+  name: string;
+  displayName: string;
+  description: string;
+  parametersSchema: unknown;
+}
+
+export interface ToolNameMap {
+  getWorkItem: string;
+  searchWorkItems: string;
+  createWorkItem: string;
+  addComment: string;
+  updateState: string;
+}
+
+/**
+ * Register all five tools against a {@link ToolRegistrar}, looking each
+ * declaration up from the manifest by name. Extracted from the worker so the
+ * full register→invoke path is unit-testable (AC #5) without the live host.
+ * A missing declaration invokes `onMissing` rather than silently skipping.
+ */
+export function registerPlaneTools(
+  registrar: ToolRegistrar,
+  tools: PlaneAgentTools,
+  declarations: readonly ToolDeclarationSource[],
+  toolNames: ToolNameMap,
+  onMissing?: (name: string) => void,
+): void {
+  const byName = new Map(declarations.map((d) => [d.name, d]));
+  const wire = (name: string, handler: (params: unknown) => Promise<ToolResultShape>): void => {
+    const decl = byName.get(name);
+    if (!decl) {
+      onMissing?.(name);
+      return;
+    }
+    registrar.register(
+      name,
+      { displayName: decl.displayName, description: decl.description, parametersSchema: decl.parametersSchema },
+      handler,
+    );
+  };
+  wire(toolNames.getWorkItem, tools.getWorkItem);
+  wire(toolNames.searchWorkItems, tools.searchWorkItems);
+  wire(toolNames.createWorkItem, tools.createWorkItem);
+  wire(toolNames.addComment, tools.addComment);
+  wire(toolNames.updateState, tools.updateState);
 }

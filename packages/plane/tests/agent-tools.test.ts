@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { createAgentTools } from "../src/agent-tools.js";
+import {
+  createAgentTools,
+  registerPlaneTools,
+  type ToolRegistrar,
+  type ToolResultShape,
+} from "../src/agent-tools.js";
 import { PlaneApiError, classifyStatus, type PlaneClientPort } from "../src/plane-client.js";
+import { TOOL_NAMES } from "../src/constants.js";
 
 function fakeClient(overrides: Partial<PlaneClientPort> = {}): PlaneClientPort {
   return {
@@ -168,5 +174,53 @@ describe("error hygiene (AC #4)", () => {
     expect(res.error).toBe("Unexpected error executing the Plane tool.");
     expect(res.error).not.toContain("line 42");
     expect(res.data).toMatchObject({ kind: "unknown" });
+  });
+});
+
+describe("5s SLA enforcement (AC #3)", () => {
+  it("returns a structured unavailable error when a call exceeds the deadline", async () => {
+    const hang = fakeClient({ updateState: (() => new Promise(() => {})) as PlaneClientPort["updateState"] });
+    const tools = createAgentTools(() => hang, { timeoutMs: 20 });
+    const res = await tools.updateState({ id: "PCLIP-1", state: "Done" });
+    expect(res.data).toMatchObject({ kind: "unavailable" });
+    expect(res.error).toMatch(/unavailable/i);
+  });
+
+  it("returns normally when the call is within the deadline", async () => {
+    const tools = createAgentTools(() => fakeClient(), { timeoutMs: 50 });
+    const res = await tools.updateState({ id: "PCLIP-1", state: "Done" });
+    expect(res.error).toBeUndefined();
+    expect(res.data).toMatchObject({ state: "Done" });
+  });
+});
+
+describe("registerPlaneTools (register→invoke path, AC #5)", () => {
+  const FAKE_DECLS = Object.values(TOOL_NAMES).map((name) => ({
+    name,
+    displayName: name,
+    description: "d",
+    parametersSchema: { type: "object" },
+  }));
+
+  it("registers all five tools and each is invocable through the registrar", async () => {
+    const registered = new Map<string, (p: unknown) => Promise<ToolResultShape>>();
+    const registrar: ToolRegistrar = { register: (name, _decl, fn) => void registered.set(name, fn) };
+    registerPlaneTools(registrar, createAgentTools(() => fakeClient()), FAKE_DECLS, TOOL_NAMES);
+
+    expect([...registered.keys()].sort()).toEqual(Object.values(TOOL_NAMES).slice().sort());
+    const got = await registered.get(TOOL_NAMES.getWorkItem)!({ id: "PCLIP-12" });
+    expect(got.content).toContain("PCLIP-12");
+    const created = await registered.get(TOOL_NAMES.createWorkItem)!({ projectId: "p", name: "x" });
+    expect(created.content).toContain("Created PCLIP-99");
+  });
+
+  it("invokes onMissing when a declaration is absent (fail-loud, not a silent skip)", () => {
+    const registered: string[] = [];
+    const missing: string[] = [];
+    const registrar: ToolRegistrar = { register: (name) => void registered.push(name) };
+    const partial = FAKE_DECLS.filter((d) => d.name !== TOOL_NAMES.addComment);
+    registerPlaneTools(registrar, createAgentTools(() => fakeClient()), partial, TOOL_NAMES, (n) => missing.push(n));
+    expect(registered).not.toContain(TOOL_NAMES.addComment);
+    expect(missing).toEqual([TOOL_NAMES.addComment]);
   });
 });

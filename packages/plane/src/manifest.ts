@@ -79,7 +79,8 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       name: TOOL_NAMES.createWorkItem,
       displayName: "Create Plane work item",
-      description: "Create a work item in a mapped Plane project.",
+      description:
+        "Create a work item in a mapped Plane project. Returns the new item's readable identifier and Plane URL. On failure returns a structured, actionable error (auth/not-found/rate-limit).",
       parametersSchema: {
         type: "object",
         properties: {
@@ -94,7 +95,7 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       name: TOOL_NAMES.addComment,
       displayName: "Comment on Plane work item",
-      description: "Add a comment to a Plane work item (attributed via Paperclip).",
+      description: "Add a comment to a Plane work item (attributed via Paperclip). Returns the comment's Plane URL.",
       parametersSchema: {
         type: "object",
         properties: {
@@ -107,7 +108,7 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       name: TOOL_NAMES.updateState,
       displayName: "Update Plane work item state",
-      description: "Move a Plane work item to a new state (e.g. In Progress, Done).",
+      description: "Move a Plane work item to a new state (e.g. In Progress, Done). Returns the item's Plane URL.",
       parametersSchema: {
         type: "object",
         properties: {

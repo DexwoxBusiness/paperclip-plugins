@@ -47,6 +47,13 @@ const manifest: PaperclipPluginManifestV1 = {
         "Diffs Plane state against the plugin ID-mapping and heals drift from missed/duplicated webhooks. PCLIP-5",
       schedule: `*/${DEFAULT_CONFIG.reconcileIntervalMinutes} * * * *`,
     },
+    {
+      jobKey: JOB_KEYS.outboundDrain,
+      displayName: "Plane outbound retry drain",
+      description:
+        "Retries queued outbound mirror actions (status/comments) after a transient Plane outage, with backoff. PCLIP-4",
+      schedule: "* * * * *",
+    },
   ],
   tools: [
     {
@@ -193,6 +200,14 @@ const manifest: PaperclipPluginManifestV1 = {
           },
           required: ["planeProjectId", "companyId", "paperclipProjectId"],
         },
+      },
+      outboundStateMap: {
+        type: "object",
+        title: "Outbound state map (Paperclip status -> Plane state)",
+        description:
+          "Mirror Paperclip issue status changes to the mapped Plane work item's state. Keys are Paperclip statuses, values are Plane state names (e.g. { \"in_progress\": \"In Progress\", \"done\": \"Done\" }). Statuses not listed are not mirrored. PCLIP-4",
+        additionalProperties: { type: "string" },
+        default: {},
       },
     },
     required: ["planeApiKeyRef", "planeBaseUrl", "planeWorkspaceSlug", "webhookSecret", "defaultCompanyId"],

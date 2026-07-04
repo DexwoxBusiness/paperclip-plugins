@@ -1,9 +1,15 @@
-import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
+import { definePlugin, type PluginContext, type PluginEvent, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { ISSUE_ORIGIN_KIND, JOB_KEYS, PLUGIN_ID, TOOL_NAMES, WEBHOOK_KEYS } from "./constants.js";
 import pluginManifest from "./manifest.js";
 import { createAgentTools, registerPlaneTools, type ToolRegistrar } from "./agent-tools.js";
 import { createUnconfiguredPlaneClient, type PlaneClientPort } from "./plane-client.js";
 import { createPlaneRestClient, type FetchLike, type PlaneRestClient } from "./plane-rest-client.js";
+import {
+  createOutboundMirrorHandler,
+  createOutboundQueue,
+  type OutboundEvent,
+  type OutboundMirrorHandler,
+} from "./outbound-mirror.js";
 import {
   createDeliveryRecorder,
   createPlaneWebhookHandler,
@@ -28,10 +34,11 @@ import {
  * Implemented:
  *  - PCLIP-1  Webhook intake + HMAC verification (constant-time), dedupe, delivery history
  *  - PCLIP-2  Sync rules: Plane project -> Paperclip project + label filter (sync-rules.ts)
+ *  - PCLIP-3  Agent tools (get/search/create/comment/update, agent-tools.ts)
+ *  - PCLIP-4  Outbound mirror: Paperclip status/comments -> Plane, echo guard + durable retry (outbound-mirror.ts)
  *  - PCLIP-6  Bidirectional ID mapping in plugin_entities with sync cursor (id-mapping.ts)
+ *  - PCLIP-7  Authenticated Plane REST client + secret-ref auth (plane-rest-client.ts)
  * Backlog (Plane project PCLIP, module "Plane Plugin"):
- *  - PCLIP-3  Agent tools (get/search/create/comment/update)
- *  - PCLIP-4  Outbound mirror with echo-loop guard (uses idMapping.resolveByPaperclipId)
  *  - PCLIP-5  Reconciliation job (heals #4097/#6848 webhook gaps; uses cursor + markStale)
  */
 let context: PluginContext | undefined;
@@ -48,8 +55,44 @@ let syncHandler: SyncRulesHandler | undefined;
 // API key via ctx.secrets, base URL, workspace slug, <=5s request timeout);
 // wiring it here lights up the registered tools for live agent runs (AC3/AC5).
 let planeClient: PlaneClientPort = createUnconfiguredPlaneClient();
+// PCLIP-4 outbound mirror (Paperclip status/comments -> Plane). Set only when
+// the Plane client is configured; drains a durable retry queue on a schedule.
+let outboundMirror: OutboundMirrorHandler | undefined;
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
+
+/**
+ * Adapt a raw `issue.updated` domain event into the decoupled OutboundEvent.
+ * Payload field names are defensive (confirmed against the host on connect).
+ */
+function adaptStatusEvent(ev: PluginEvent): OutboundEvent {
+  const p = (ev.payload ?? {}) as Record<string, unknown>;
+  const issue = (p.issue ?? {}) as Record<string, unknown>;
+  const newStatus = String(p.status ?? p.newStatus ?? issue.status ?? "");
+  return {
+    kind: "status",
+    paperclipIssueId: String(ev.entityId ?? issue.id ?? p.issueId ?? ""),
+    actorType: ev.actorType,
+    actorId: ev.actorId,
+    newStatus: newStatus || undefined,
+  };
+}
+
+/** Adapt a raw `issue.comment.created` domain event into an OutboundEvent. */
+function adaptCommentEvent(ev: PluginEvent): OutboundEvent {
+  const p = (ev.payload ?? {}) as Record<string, unknown>;
+  const comment = (p.comment ?? {}) as Record<string, unknown>;
+  const issue = (p.issue ?? {}) as Record<string, unknown>;
+  return {
+    kind: "comment",
+    // The event entityId may be the comment id, so prefer the payload's issue id.
+    paperclipIssueId: String(p.issueId ?? p.issue_id ?? issue.id ?? ev.entityId ?? ""),
+    actorType: ev.actorType,
+    actorId: ev.actorId,
+    commentBody: String(p.body ?? comment.body ?? p.comment_html ?? comment.comment_html ?? p.content ?? ""),
+    commentAuthor: typeof p.author === "string" ? p.author : ev.actorId,
+  };
+}
 
 export default definePlugin({
   async setup(ctx: PluginContext) {
@@ -85,6 +128,28 @@ export default definePlugin({
         timeoutMs: 5000,
       });
       ctx.logger.info("Plane REST client configured (PCLIP-7)");
+
+      // PCLIP-4: outbound mirror. Only wired when the Plane client is live.
+      const outboundQueue = createOutboundQueue(state);
+      outboundMirror = createOutboundMirrorHandler({
+        idMapping,
+        plane: planeClient,
+        queue: outboundQueue,
+        getConfig: async () => {
+          const c = (await ctx.config.get()) as { outboundStateMap?: Record<string, string> };
+          return { stateMap: c.outboundStateMap ?? {}, pluginId: PLUGIN_ID };
+        },
+        log: (message, fields) => ctx.logger.info(message, fields),
+      });
+      // Subscribe to Paperclip domain events. The adapters map the raw payload
+      // shapes (field names confirmed against the host on connect) to the
+      // decoupled OutboundEvent the handler consumes.
+      ctx.events.on("issue.updated", async (ev) => {
+        await outboundMirror!.handle(adaptStatusEvent(ev));
+      });
+      ctx.events.on("issue.comment.created", async (ev) => {
+        await outboundMirror!.handle(adaptCommentEvent(ev));
+      });
     } else {
       ctx.logger.info("Plane API not configured — agent tools return a 'not configured' error until the API key secret-ref is set");
     }
@@ -178,6 +243,15 @@ export default definePlugin({
       // TODO(PCLIP-5): page Plane API from cursor, diff against mapping via
       // resolveByPlaneId/resolveByPaperclipId, markStaleByPlaneId on orphans,
       // then idMapping.setCursor(newWatermark) once the page is fully processed.
+    });
+
+    // PCLIP-4: drain the outbound-mirror retry queue (transient Plane outages).
+    ctx.jobs.register(JOB_KEYS.outboundDrain, async (job) => {
+      if (!outboundMirror) return; // not configured -> nothing queued
+      const res = await outboundMirror.drainDue();
+      if (res.delivered || res.retried || res.deadLettered) {
+        ctx.logger.info("outbound drain", { runId: job.runId, ...res });
+      }
     });
 
     // PCLIP-3: register the five agent tools. Handlers delegate to `planeClient`

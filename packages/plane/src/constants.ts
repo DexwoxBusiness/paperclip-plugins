@@ -9,6 +9,8 @@ export const WEBHOOK_KEYS = {
 export const JOB_KEYS = {
   /** Reconciliation backstop for missed/duplicated webhooks. PCLIP-5 */
   reconcile: "reconcile",
+  /** Drains the outbound-mirror retry queue (transient Plane outages). PCLIP-4 */
+  outboundDrain: "outbound-drain",
 } as const;
 
 export const TOOL_NAMES = {
@@ -29,6 +31,8 @@ export const DEFAULT_CONFIG = {
   enabledEvents: ["issue", "issue_comment"] as readonly string[],
   /** PCLIP-2 sync rules (Plane project -> Paperclip project + optional label filter). Empty until configured. */
   syncRules: [] as ReadonlyArray<Record<string, unknown>>,
+  /** PCLIP-4 outbound state map (Paperclip status -> Plane state name). Empty = status mirroring off. */
+  outboundStateMap: {} as Record<string, string>,
 } as const;
 
 /** originKind stamped on Paperclip issues created by this plugin (PCLIP-2 idempotency). */

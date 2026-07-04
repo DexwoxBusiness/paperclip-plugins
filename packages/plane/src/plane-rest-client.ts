@@ -108,7 +108,18 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
     opts: { query?: Record<string, string | undefined>; body?: unknown } = {},
   ): Promise<T> {
     // Resolve the secret per call; keep it in a local only.
-    const apiKey = await deps.getApiKey();
+    let apiKey: string;
+    try {
+      apiKey = await deps.getApiKey();
+    } catch {
+      // A secrets-resolution failure most commonly means plugin secret-refs are
+      // unavailable — i.e. Paperclip is not on the pinned build (kill-switch guard).
+      throw new PlaneApiError(
+        "unavailable",
+        undefined,
+        "Could not resolve the Plane API key secret-ref — requires the pinned Paperclip build (canary/v2026.509.0-canary.1; plugin secret-refs are kill-switched on master, PAP-2394).",
+      );
+    }
     if (!apiKey) {
       throw new PlaneApiError("unauthorized", undefined, "No Plane API key resolved from the configured secret-ref");
     }
@@ -324,7 +335,8 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
           const hint =
             e.kind === "unauthorized"
               ? "Plane rejected the API key — re-authenticate: update the API key secret-ref in settings."
-              : `Plane connection check failed (${e.kind}${e.status ? ` HTTP ${e.status}` : ""}).`;
+              : // Surface the message (e.g. the secret-ref kill-switch / pin hint).
+                `Plane connection check failed (${e.kind}${e.status ? ` HTTP ${e.status}` : ""}): ${e.message}`;
           return { ok: false, error: hint };
         }
         return { ok: false, error: "Plane connection check failed unexpectedly." };

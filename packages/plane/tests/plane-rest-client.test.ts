@@ -198,3 +198,23 @@ describe("createPlaneRestClient — testConnection (AC #3)", () => {
     expect(res.error).toMatch(/re-authenticate|API key/i);
   });
 });
+
+describe("secret-ref kill-switch guard (PAP-2394 / pinned build)", () => {
+  it("turns a secret-resolution failure into an unavailable error with a pin hint", async () => {
+    const h = makeClient(router, { getApiKey: async () => { throw new Error("plugin secret-refs disabled"); } });
+    await h.client.getWorkItem("PCLIP-1").then(
+      () => { throw new Error("should have thrown"); },
+      (e: PlaneApiError) => {
+        expect(e.kind).toBe("unavailable");
+        expect(e.message).toMatch(/pinned Paperclip build|PAP-2394|secret-ref/i);
+      },
+    );
+  });
+
+  it("testConnection surfaces the pin hint when the secret-ref cannot resolve", async () => {
+    const h = makeClient(() => ({ status: 200, body: {} }), { getApiKey: async () => { throw new Error("no secrets"); } });
+    const res = await h.client.testConnection();
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/pinned Paperclip build|PAP-2394/i);
+  });
+});

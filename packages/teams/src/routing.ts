@@ -33,7 +33,20 @@ export const CHANNEL_CONFIG_KEY: Record<ChannelKind, keyof TeamsUrlConfig> = {
  * nothing is configured, so the caller skips delivery rather than posting nowhere.
  */
 export function resolveWorkflowRef(channel: ChannelKind, config: TeamsUrlConfig): string {
+  // CHANNEL_CONFIG_KEY is Record<ChannelKind, ...> so every channel maps; the
+  // `?? ""` is a belt-and-suspenders default should a caller pass an off-union
+  // value (falls back to the default ref rather than misrouting or throwing).
   const perType = (config[CHANNEL_CONFIG_KEY[channel]] ?? "").trim();
   if (perType) return perType;
   return (config.defaultWorkflowUrl ?? "").trim();
+}
+
+/**
+ * Whether a stored config value is already a raw http(s) Workflows URL rather than
+ * a secret-ref. Instances configured before the secret-ref migration (T1) saved
+ * the URL in plain text; the worker delivers those directly for back-compat, while
+ * new configs store a secret-ref (a UUID, never an http URL) resolved at call time.
+ */
+export function isRawWorkflowUrl(ref: string): boolean {
+  return /^https?:\/\//i.test(ref.trim());
 }

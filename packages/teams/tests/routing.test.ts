@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { channelFor, type TeamsNotification } from "../src/notifications.js";
-import { CHANNEL_CONFIG_KEY, resolveWorkflowRef, type TeamsUrlConfig } from "../src/routing.js";
+import { channelFor, type ChannelKind, type TeamsNotification } from "../src/notifications.js";
+import { CHANNEL_CONFIG_KEY, isRawWorkflowUrl, resolveWorkflowRef, type TeamsUrlConfig } from "../src/routing.js";
 
 const approval: TeamsNotification = { kind: "approval", approvalId: "a1", title: "t", requester: "r" };
 const error: TeamsNotification = { kind: "agent-error", error: "e" };
@@ -54,5 +54,21 @@ describe("channel routing (PCLIP-19)", () => {
       pipeline: "pipelineWorkflowUrl",
       default: "defaultWorkflowUrl",
     });
+  });
+
+  it("falls back to the default ref for an off-union channel rather than misrouting (defensive)", () => {
+    const cfg: TeamsUrlConfig = { defaultWorkflowUrl: "ref-default" };
+    expect(resolveWorkflowRef("nonsense" as ChannelKind, cfg)).toBe("ref-default");
+  });
+});
+
+describe("secret-ref migration (Codex — preserve raw URLs)", () => {
+  it("recognizes a pre-migration raw https URL vs a secret-ref", () => {
+    expect(isRawWorkflowUrl("https://prod-1.westus.logic.azure.com/workflows/abc")).toBe(true);
+    expect(isRawWorkflowUrl("http://example.com/hook")).toBe(true);
+    expect(isRawWorkflowUrl("  https://x/y  ")).toBe(true); // trimmed
+    // secret-refs (UUIDs) are not raw URLs -> resolved via the secret provider
+    expect(isRawWorkflowUrl("550e8400-e29b-41d4-a716-446655440000")).toBe(false);
+    expect(isRawWorkflowUrl("")).toBe(false);
   });
 });

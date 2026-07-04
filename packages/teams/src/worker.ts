@@ -2,7 +2,7 @@ import { definePlugin, type PluginContext, type PluginWebhookInput } from "@pape
 import { JOB_KEYS, PLUGIN_ID } from "./constants.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
 import { buildNotificationCard, channelFor, createBudgetDedupe, type TeamsNotification } from "./notifications.js";
-import { resolveWorkflowRef, type TeamsUrlConfig } from "./routing.js";
+import { isRawWorkflowUrl, resolveWorkflowRef, type TeamsUrlConfig } from "./routing.js";
 import { createWorkflowsClient, safeDeliver, type FetchLike } from "./delivery.js";
 import {
   adaptAgentError,
@@ -59,15 +59,22 @@ export default definePlugin({
         log("teams notification skipped: no Workflows URL configured for channel", { kind: n.kind, channel });
         return false;
       }
-      // Resolve the capability URL from its secret-ref at CALL TIME — never cached
+      // Back-compat migration (Codex): an instance upgraded from T1 may still hold a
+      // RAW https URL in this field (it was plaintext before the secret-ref change).
+      // Deliver those directly so notifications don't silently stop; NEW configs are
+      // secret-refs (a UUID, never an http URL), resolved at CALL TIME — never cached
       // or logged (AC #3). A resolution failure most likely means plugin secret-refs
       // are kill-switched (not the pinned build) — skip, never block (PAP-2394).
       let url: string;
-      try {
-        url = await ctx.secrets.resolve(ref);
-      } catch {
-        log("teams notification skipped: could not resolve Workflows URL secret-ref (requires the pinned build, PAP-2394)", { kind: n.kind, channel });
-        return false;
+      if (isRawWorkflowUrl(ref)) {
+        url = ref;
+      } else {
+        try {
+          url = await ctx.secrets.resolve(ref);
+        } catch {
+          log("teams notification skipped: could not resolve Workflows URL secret-ref (requires the pinned build, PAP-2394)", { kind: n.kind, channel });
+          return false;
+        }
       }
       if (!url) {
         log("teams notification skipped: empty Workflows URL from secret-ref", { kind: n.kind, channel });

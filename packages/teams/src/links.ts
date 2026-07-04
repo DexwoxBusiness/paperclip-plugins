@@ -34,13 +34,24 @@ export function normalizeBaseUrl(base?: string): string {
   if (!/^https?:\/\//i.test(b)) return "";
   let host: string;
   try {
-    host = new URL(b).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    // Strip IPv6 brackets and a trailing FQDN dot ("localhost." / "app.localhost.").
+    host = new URL(b).hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
   } catch {
     return "";
   }
-  if (host === "localhost" || host.endsWith(".localhost") || host === "0.0.0.0" || host === "::1" || /^127\./.test(host)) {
-    return "";
-  }
+  // Reject every loopback/local form — such links resolve to the RECIPIENT's own
+  // machine in Teams (Kody). Covers: localhost + subdomains, 127.0.0.0/8, 0.0.0.0,
+  // IPv6 ::1, and IPv4-mapped IPv6 loopback in both dotted (::ffff:127.x) and hex
+  // (::ffff:7f00:1 … ::ffff:7fff:ffff) notations.
+  const isLoopback =
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host === "0.0.0.0" ||
+    host === "::1" ||
+    /^127\./.test(host) ||
+    /^::ffff:127\./i.test(host) ||
+    /^::ffff:7f[0-9a-f]{2}:/i.test(host);
+  if (isLoopback) return "";
   return b;
 }
 

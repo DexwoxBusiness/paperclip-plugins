@@ -58,7 +58,19 @@ describe("deep links (PCLIP-20)", () => {
   });
 
   it("rejects loopback/localhost base URLs — no broken button on Teams recipients' machines (Codex)", () => {
-    for (const bad of ["http://localhost:3100", "https://localhost", "http://127.0.0.1:8080", "http://[::1]:3000", "http://0.0.0.0", "https://app.localhost"]) {
+    for (const bad of [
+      "http://localhost:3100",
+      "https://localhost",
+      "http://127.0.0.1:8080",
+      "http://[::1]:3000",
+      "http://0.0.0.0",
+      "https://app.localhost",
+      "http://localhost.", // trailing-dot FQDN
+      "https://app.localhost.", // trailing-dot subdomain
+      "http://127.0.0.1.", // trailing-dot IPv4 loopback
+      "http://[::ffff:127.0.0.1]", // IPv4-mapped IPv6 loopback (dotted)
+      "http://[::ffff:7f00:1]", // IPv4-mapped IPv6 loopback (hex)
+    ]) {
       expect(normalizeBaseUrl(bad)).toBe("");
     }
     expect(normalizeBaseUrl("https://paperclip.example.com")).toBe("https://paperclip.example.com");

@@ -152,6 +152,48 @@ export interface PlaneClientPort {
   updateState(idOrIdentifier: string, state: string): Promise<PlaneStateResult>;
 }
 
+/** A work item as returned by the paginated project list (PCLIP-5 reconciliation). */
+export interface PlaneListWorkItem {
+  /** Work item UUID. */
+  id: string;
+  name: string;
+  descriptionHtml: string;
+  /** ISO8601 last-modified time; used as the reconciliation drift watermark. */
+  updatedAt?: string;
+  /** Label UUIDs on the item (matched against a rule's labelFilter). */
+  labels: string[];
+  /** State UUID (or name); informational for reconciliation. */
+  state: string;
+}
+
+export interface PlaneWorkItemPage {
+  items: PlaneListWorkItem[];
+  /** Opaque cursor for the next page, when {@link PlaneWorkItemPage.hasMore}. */
+  nextCursor?: string;
+  hasMore: boolean;
+}
+
+export interface PlaneListWorkItemsInput {
+  /** Plane project UUID to page through. */
+  projectId: string;
+  /** Pagination cursor from a previous page (Plane format `per_page:page:is_prev`). */
+  cursor?: string;
+  /** Page size (Plane max 100; default 100). */
+  perPage?: number;
+  /** Plane order_by, e.g. `-updated_at` (newest first). */
+  orderBy?: string;
+}
+
+/**
+ * The Plane data-access reconciliation (PCLIP-5) needs, kept SEPARATE from
+ * {@link PlaneClientPort} so the agent-tool consumers and their fakes are
+ * unaffected. The concrete REST client (PCLIP-7) implements both.
+ */
+export interface PlaneReconcilePort {
+  /** Page a project's work items (cursor pagination). Rejects with {@link PlaneApiError}. */
+  listProjectWorkItems(input: PlaneListWorkItemsInput): Promise<PlaneWorkItemPage>;
+}
+
 /**
  * A placeholder client used until PCLIP-7 injects the authenticated REST client.
  * Every call fails loudly with a structured, actionable error rather than a

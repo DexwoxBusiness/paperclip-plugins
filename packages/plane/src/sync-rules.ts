@@ -240,6 +240,58 @@ export interface SyncRulesHandlerDeps {
   log(message: string, fields?: Record<string, unknown>): void;
 }
 
+/** Deps for the shared idempotent upsert (webhook sync AND reconciliation). */
+export interface IssueUpsertDeps {
+  idMapping: Pick<IdMappingStore, "resolveByPlaneId" | "link">;
+  issues: IssuesPort;
+  originKind: IssueOriginKind;
+  log(message: string, fields?: Record<string, unknown>): void;
+}
+
+/**
+ * Idempotently create-or-update the Paperclip issue for a Plane origin, and keep
+ * the PCLIP-6 mapping consistent. This is the SINGLE write path shared by the
+ * webhook handler (PCLIP-2) and the reconciliation job (PCLIP-5), so the two can
+ * never diverge on idempotency: both resolve by ORIGIN (company+project+
+ * originKind+originId) first — a create whose mapping link previously failed is
+ * found here and re-linked on retry rather than duplicated (engineering standard
+ * #1; AC "no duplicate Paperclip issue"). Scoping the lookup by project also
+ * re-homes a same-company project move (Kody).
+ */
+export async function upsertMappedIssue(
+  deps: IssueUpsertDeps,
+  input: { rule: SyncRule; planeId: string; title: string; description?: string },
+): Promise<{ kind: "created" | "updated"; paperclipIssueId: string }> {
+  const { rule, planeId, title, description } = input;
+  const existing = await deps.issues.findByOrigin({
+    companyId: rule.companyId,
+    projectId: rule.paperclipProjectId,
+    originKind: deps.originKind,
+    originId: planeId,
+  });
+  if (existing) {
+    // Heal the mapping if it is missing or points elsewhere, then update.
+    const mapped = await deps.idMapping.resolveByPlaneId(planeId);
+    if (!mapped || mapped.paperclipIssueId !== existing.id) {
+      await deps.idMapping.link({ planeId, paperclipIssueId: existing.id, title });
+    }
+    await deps.issues.update({ issueId: existing.id, companyId: rule.companyId, title, description });
+    deps.log("plane sync updated", { planeId, paperclipIssueId: existing.id });
+    return { kind: "updated", paperclipIssueId: existing.id };
+  }
+  const created = await deps.issues.create({
+    companyId: rule.companyId,
+    projectId: rule.paperclipProjectId,
+    title,
+    description,
+    originKind: deps.originKind,
+    originId: planeId,
+  });
+  await deps.idMapping.link({ planeId, paperclipIssueId: created.id, title });
+  deps.log("plane sync created", { planeId, paperclipIssueId: created.id, projectId: rule.paperclipProjectId });
+  return { kind: "created", paperclipIssueId: created.id };
+}
+
 export type SyncOutcome =
   | { kind: "skipped"; reason: string }
   | { kind: "created"; paperclipIssueId: string }
@@ -301,46 +353,14 @@ export function createSyncRulesHandler(deps: SyncRulesHandlerDeps): SyncRulesHan
       const title = extractTitle(event.payload) ?? `Plane issue ${planeId}`;
       const description = extractDescription(event.payload);
 
-      // The Paperclip issue for this Plane origin IN THE CURRENT RULE'S TARGET
-      // (company AND project) is the source of truth. Scoping the lookup by
-      // project makes the upsert both:
-      //  - IDEMPOTENT: a create whose mapping link failed is found here and
-      //    re-linked on the Plane retry, never duplicated (standard #1); and
-      //  - MOVE-AWARE across BOTH company and project changes: if the Plane
-      //    issue moved to a different mapped project (even within the SAME
-      //    company), no issue for this origin exists in the new project, so we
-      //    create one there and link() re-homes the mapping (staling the old
-      //    row). A plain update() cannot move an issue between projects, so
-      //    company-only scoping would strand a same-company move (Kody).
-      const existing = await deps.issues.findByOrigin({
-        companyId: rule.companyId,
-        projectId: rule.paperclipProjectId,
-        originKind: deps.originKind,
-        originId: planeId,
-      });
-      if (existing) {
-        // Heal the mapping if it is missing or points elsewhere, then update.
-        const mapped = await deps.idMapping.resolveByPlaneId(planeId);
-        if (!mapped || mapped.paperclipIssueId !== existing.id) {
-          await deps.idMapping.link({ planeId, paperclipIssueId: existing.id, title });
-        }
-        await deps.issues.update({ issueId: existing.id, companyId: rule.companyId, title, description });
-        deps.log("plane sync updated", { planeId, paperclipIssueId: existing.id });
-        return { kind: "updated", paperclipIssueId: existing.id };
-      }
-
-      // Nothing for this origin in the target project: create there and link.
-      const created = await deps.issues.create({
-        companyId: rule.companyId,
-        projectId: rule.paperclipProjectId,
-        title,
-        description,
-        originKind: deps.originKind,
-        originId: planeId,
-      });
-      await deps.idMapping.link({ planeId, paperclipIssueId: created.id, title });
-      deps.log("plane sync created", { planeId, paperclipIssueId: created.id, projectId: rule.paperclipProjectId });
-      return { kind: "created", paperclipIssueId: created.id };
+      // Delegate the create-or-update to the shared idempotent write path, so the
+      // webhook and reconciliation (PCLIP-5) upsert issues identically (origin-
+      // scoped, no duplicates, move-aware). See upsertMappedIssue for the failure
+      // -path and move-handling rationale.
+      return upsertMappedIssue(
+        { idMapping: deps.idMapping, issues: deps.issues, originKind: deps.originKind, log: deps.log },
+        { rule, planeId, title, description },
+      );
     },
   };
 

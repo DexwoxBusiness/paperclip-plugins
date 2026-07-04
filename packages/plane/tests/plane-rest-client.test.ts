@@ -54,12 +54,79 @@ const router: Handler = (method, url) => {
     return { status: 200, body: { issues: [{ id: "u1", name: "A", sequence_id: 1, project__identifier: "PCLIP", project_id: "p1" }] } };
   if (method === "GET" && /\/work-items\/PCLIP-12$/.test(path))
     return { status: 200, body: { id: "i12", project: "p1", sequence_id: 12, name: "Title", description_html: "<p>d</p>", state: "Todo", labels: ["l1"], comments: [{ id: "c1", comment_html: "<p>hi</p>" }] } };
+  if (method === "GET" && /\/projects\/p1\/work-items$/.test(path))
+    return {
+      status: 200,
+      body: {
+        results: [
+          { id: "w1", name: "One", description_html: "<p>1</p>", updated_at: "2026-07-04T10:00:00Z", labels: ["l1"], state: "s1" },
+          { id: "w2", name: "Two", updated_at: "2026-07-04T09:00:00Z", labels: [], state: { id: "s2", name: "Done" } },
+        ],
+        next_cursor: "100:1:0",
+        next_page_results: true,
+      },
+    };
   if (method === "POST" && /\/projects\/p1\/work-items$/.test(path))
     return { status: 201, body: { id: "new-id", project__identifier: "PCLIP", sequence_id: 99 } };
   if (method === "POST" && /\/projects\/p1\/work-items\/i12\/comments$/.test(path)) return { status: 201, body: { id: "cm1" } };
   if (method === "PATCH" && /\/projects\/p1\/work-items\/i12$/.test(path)) return { status: 200, body: {} };
   return { status: 404, body: {} };
 };
+
+describe("listProjectWorkItems (PCLIP-5 reconciliation paging)", () => {
+  it("pages a project newest-first, mapping items + cursor", async () => {
+    const h = makeClient(router);
+    const page = await h.client.listProjectWorkItems({ projectId: "p1", perPage: 100, orderBy: "-updated_at" });
+    expect(page.items).toHaveLength(2);
+    expect(page.items[0]).toMatchObject({
+      id: "w1",
+      name: "One",
+      descriptionHtml: "<p>1</p>",
+      updatedAt: "2026-07-04T10:00:00Z",
+      labels: ["l1"],
+      state: "s1",
+    });
+    // an expanded state object collapses to its id
+    expect(page.items[1].state).toBe("s2");
+    expect(page).toMatchObject({ hasMore: true, nextCursor: "100:1:0" });
+    const url = h.calls[0].url;
+    expect(url).toContain("order_by=-updated_at");
+    expect(url).toContain("per_page=100");
+  });
+
+  it("reports no next page when the server flags none (bounded paging)", async () => {
+    const h = makeClient((method, url) => {
+      const path = url.split("?")[0];
+      if (method === "GET" && /\/projects\/p1\/work-items$/.test(path))
+        return { status: 200, body: { results: [{ id: "w1", name: "x", updated_at: "2026-07-04T10:00:00Z" }], next_page_results: false } };
+      return { status: 404, body: {} };
+    });
+    const page = await h.client.listProjectWorkItems({ projectId: "p1" });
+    expect(page.hasMore).toBe(false);
+    expect(page.nextCursor).toBeUndefined();
+    // defensive parsing of a sparse item
+    expect(page.items[0]).toMatchObject({ id: "w1", labels: [], descriptionHtml: "", state: "" });
+  });
+
+  it("clamps per_page to the Plane maximum of 100", async () => {
+    const h = makeClient(router);
+    await h.client.listProjectWorkItems({ projectId: "p1", perPage: 500 });
+    expect(h.calls[0].url).toContain("per_page=100");
+  });
+
+  it("surfaces a rate-limit as a PlaneApiError (reconciliation backs off)", async () => {
+    const h = makeClient((method, url) => {
+      const path = url.split("?")[0];
+      if (method === "GET" && /\/projects\/p1\/work-items$/.test(path))
+        return { status: 429, headers: { "retry-after": "30" }, body: {} };
+      return { status: 404, body: {} };
+    });
+    await expect(h.client.listProjectWorkItems({ projectId: "p1" })).rejects.toMatchObject({
+      kind: "rate_limited",
+      status: 429,
+    });
+  });
+});
 
 describe("createPlaneRestClient — auth & security (AC #2)", () => {
   it("sends the resolved key as X-API-Key and resolves it per call", async () => {

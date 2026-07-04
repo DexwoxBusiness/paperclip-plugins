@@ -45,7 +45,10 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Plane reconciliation",
       description:
         "Diffs Plane state against the plugin ID-mapping and heals drift from missed/duplicated webhooks. PCLIP-5",
-      schedule: `*/${DEFAULT_CONFIG.reconcileIntervalMinutes} * * * *`,
+      // Base tick every minute; the worker self-throttles to the configured
+      // reconcileIntervalMinutes (default 15), so the interval is adjustable at
+      // runtime without a manifest change (a static cron can't read config).
+      schedule: "* * * * *",
     },
     {
       jobKey: JOB_KEYS.outboundDrain,

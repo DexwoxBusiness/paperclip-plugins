@@ -92,6 +92,10 @@ export function adaptApprovalCreated(ev: RawPluginEvent): TeamsNotification | nu
     title: str(approval.title) ?? str(approval.name) ?? str(p.title) ?? "Approval requested",
     requester: str(approval.requester) ?? str(approval.requested_by) ?? str(p.requester) ?? str(ev.actorId) ?? "unknown",
     budget: str(approval.budget) ?? str(p.budget) ?? str(approval.amount),
+    // No `issueId` here on purpose: an approval card deep-links to /approvals/
+    // {approvalId} (its own entity), not to an issue. We DO capture the linked
+    // issue's readable identifier — buildDeepLink derives the company URL prefix
+    // from it (PCLIP-20). issueTitle is display-only.
     issueIdentifier: Object.keys(issue).length ? issueIdentifier(issue, ev) : str(p.issueIdentifier),
     issueTitle: str(issue.name) ?? str(issue.title),
   };

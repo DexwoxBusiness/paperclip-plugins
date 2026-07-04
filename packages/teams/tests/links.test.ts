@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildDeepLink, normalizeBaseUrl, prefixFromIdentifier } from "../src/links.js";
+import { buildDeepLink, normalizeBaseUrl, normalizeCompanyPrefix, prefixFromIdentifier } from "../src/links.js";
 import { buildNotificationCard, type TeamsNotification } from "../src/notifications.js";
 import { validateAdaptiveCard } from "../src/adaptive-card.js";
 
@@ -55,6 +55,27 @@ describe("deep links (PCLIP-20)", () => {
     const n: TeamsNotification = { kind: "issue-created", title: "t", issueId: "uuid-1", issueIdentifier: "PCLIP-7" };
     expect(buildDeepLink(n, { baseUrl: "" })).toBeUndefined();
     expect(buildDeepLink(n, { baseUrl: "localhost:3100" })).toBeUndefined(); // not http(s)
+  });
+
+  it("rejects loopback/localhost base URLs — no broken button on Teams recipients' machines (Codex)", () => {
+    for (const bad of ["http://localhost:3100", "https://localhost", "http://127.0.0.1:8080", "http://[::1]:3000", "http://0.0.0.0", "https://app.localhost"]) {
+      expect(normalizeBaseUrl(bad)).toBe("");
+    }
+    expect(normalizeBaseUrl("https://paperclip.example.com")).toBe("https://paperclip.example.com");
+    const n: TeamsNotification = { kind: "issue-created", title: "t", issueId: "uuid-1", issueIdentifier: "PCLIP-7" };
+    expect(buildDeepLink(n, { baseUrl: "http://localhost:3100" })).toBeUndefined();
+  });
+
+  it("normalizes an operator-configured prefix, rejecting bad input (Kody)", () => {
+    expect(normalizeCompanyPrefix("PCLIP")).toBe("PCLIP");
+    expect(normalizeCompanyPrefix("  PCLIP  ")).toBe("PCLIP");
+    expect(normalizeCompanyPrefix("foo/bar")).toBeUndefined();
+    expect(normalizeCompanyPrefix("my prefix")).toBeUndefined();
+    expect(normalizeCompanyPrefix("PC LIP")).toBeUndefined();
+    expect(normalizeCompanyPrefix("")).toBeUndefined();
+    // a bad configured prefix falls back to the derived one, never a broken segment
+    const approval: TeamsNotification = { kind: "approval", approvalId: "appr-1", title: "t", requester: "r", issueIdentifier: "PCLIP-2" };
+    expect(buildDeepLink(approval, { baseUrl: BASE, companyPrefix: "bad/prefix" })).toBe(`${BASE}/PCLIP/approvals/appr-1`);
   });
 
   it("prefers an explicit company prefix over the derived one", () => {

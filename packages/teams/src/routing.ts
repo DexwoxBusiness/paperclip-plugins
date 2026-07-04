@@ -19,6 +19,20 @@ export interface TeamsUrlConfig {
   pipelineWorkflowUrl?: string;
 }
 
+/**
+ * The full instance config shape (manifest instanceConfigSchema), so the worker
+ * reads `ctx.config.get()` with one typed cast instead of ad-hoc inline assertions
+ * (Kody). Extends the URL config with the non-URL fields the worker needs.
+ */
+export interface TeamsInstanceConfig extends TeamsUrlConfig {
+  /** Legacy escape hatch: honor raw plaintext Workflows URLs (default off). PCLIP-19 */
+  allowPlaintextWorkflowUrl?: boolean;
+  /** Public base URL for card deep links. PCLIP-20 */
+  paperclipBaseUrl?: string;
+  /** Company URL prefix override for deep links. PCLIP-20 */
+  paperclipCompanyPrefix?: string;
+}
+
 /** Which config field backs each channel. */
 export const CHANNEL_CONFIG_KEY: Record<ChannelKind, keyof TeamsUrlConfig> = {
   approvals: "approvalsWorkflowUrl",

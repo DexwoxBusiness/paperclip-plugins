@@ -2,7 +2,7 @@ import { definePlugin, type PluginContext, type PluginWebhookInput } from "@pape
 import { JOB_KEYS, PLUGIN_ID } from "./constants.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
 import { buildNotificationCard, channelFor, createBudgetDedupe, type TeamsNotification } from "./notifications.js";
-import { classifyWorkflowRef, resolveWorkflowRef, type TeamsUrlConfig } from "./routing.js";
+import { classifyWorkflowRef, resolveWorkflowRef, type TeamsInstanceConfig } from "./routing.js";
 import { buildDeepLink } from "./links.js";
 import { createWorkflowsClient, safeDeliver, type FetchLike } from "./delivery.js";
 import {
@@ -54,7 +54,7 @@ export default definePlugin({
       // Route per event type to its channel's Workflows URL, falling back to the
       // default (T2). Config is read fresh so routing edits apply without a restart.
       const channel = channelFor(n);
-      const cfg = (await ctx.config.get()) as TeamsUrlConfig & { allowPlaintextWorkflowUrl?: boolean };
+      const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
       const ref = resolveWorkflowRef(channel, cfg);
       if (!ref) {
         log("teams notification skipped: no Workflows URL configured for channel", { kind: n.kind, channel });
@@ -90,8 +90,7 @@ export default definePlugin({
       }
       // PCLIP-20: attach a deep link to the exact entity (built from the public
       // base URL + company prefix, derived from the card's issue id when present).
-      const linkCfg = cfg as { paperclipBaseUrl?: string; paperclipCompanyPrefix?: string };
-      const link = buildDeepLink(n, { baseUrl: linkCfg.paperclipBaseUrl, companyPrefix: linkCfg.paperclipCompanyPrefix });
+      const link = buildDeepLink(n, { baseUrl: cfg.paperclipBaseUrl, companyPrefix: cfg.paperclipCompanyPrefix });
       const message = toWorkflowsMessage(buildNotificationCard({ ...n, link }));
       const outcome = await safeDeliver(client, url, message, log, { kind: n.kind, channel });
       return outcome.ok;

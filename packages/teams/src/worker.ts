@@ -67,12 +67,37 @@ export default definePlugin({
     const isDigestEnabled = async (): Promise<boolean> => {
       if (Date.now() - digestEnabledCache.at <= 60_000) return digestEnabledCache.value;
       if (!digestRefresh) {
-        digestRefresh = (async () => {
+        // The real read; updates the cache when it resolves (even if the guard below
+        // already timed out — a late value still refreshes the flag).
+        const started = (async () => {
           const cfg = (await ctx.config.get()) as { enableDailyDigest?: boolean };
           digestEnabledCache = { value: cfg.enableDailyDigest === true, at: Date.now() };
-        })().finally(() => {
-          digestRefresh = null;
-        });
+        })();
+        // DEADLINE the shared refresh (Kody perf, high): all event handlers await
+        // this ONE promise, so an un-deadlined hang in ctx.config.get() would block
+        // digest accumulation across every handler indefinitely. On timeout we swallow
+        // and fall back to the last cached flag so accumulation keeps flowing. The
+        // in-flight ref is cleared in `finally` (unconditionally — a new refresh is
+        // only ever created while it's null, and this worker is single-node/single-
+        // threaded), so the NEXT stale check re-refreshes rather than reusing a
+        // resolved promise forever (the identity-guard in the review snippet never
+        // matched, which would have frozen the flag after the first read).
+        digestRefresh = (async () => {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              started,
+              new Promise<void>((_, reject) => {
+                timer = setTimeout(() => reject(new Error("digest config refresh timed out")), 5_000);
+              }),
+            ]);
+          } catch {
+            /* timeout or config-read error — keep the last cached value */
+          } finally {
+            if (timer) clearTimeout(timer);
+            digestRefresh = null;
+          }
+        })();
       }
       await digestRefresh;
       return digestEnabledCache.value;
@@ -268,7 +293,14 @@ export default definePlugin({
           log("teams digest total cost is $0 — host does not yet emit cost_event.created (cost.reported unmapped)", { runId: job.runId });
         }
       } catch (e) {
-        log("teams digest error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+        // RE-THROW so the host records this job run as FAILED (Kody, critical).
+        // This is essential for the mergeBack path: after readAndReset the window
+        // snapshot lives ONLY in the local `rollup`, so if mergeBack re-throws
+        // (persist failed), swallowing here would let the host mark the run
+        // successful while the day's stats are gone — silent data loss. Failing the
+        // run surfaces it and lets the host's job machinery retry.
+        log("teams digest job failed", { error: e instanceof Error ? e.message : String(e) });
+        throw e;
       }
     });
   },

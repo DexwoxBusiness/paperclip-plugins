@@ -12,6 +12,7 @@ import {
   adaptBudgetThreshold,
   adaptIssueCreated,
   adaptIssueDone,
+  extractCompletedAgent,
   extractCostCents,
   type RawPluginEvent,
 } from "./event-adapters.js";
@@ -112,11 +113,12 @@ export default definePlugin({
     };
 
     on("approval.created", adaptApprovalCreated);
-    on("agent.run.failed", adaptAgentError);
+    on("agent.run.failed", adaptAgentError); // real agent-error event (payload {agentId, issueId, error})
+    // "Issue done" is an issue.updated transition INTO the done state (there is no
+    // agent.task_completed event); adaptIssueDone returns null for non-done updates.
+    on("issue.updated", adaptIssueDone);
 
-    // issue.created and agent.task_completed also feed the daily-digest rollup
-    // (PCLIP-21). Accumulation happens regardless of whether a card was built, and
-    // is wrapped so it never throws into the core flow.
+    // issue.created also feeds the daily-digest "tasks created" counter (PCLIP-21).
     ctx.events.on("issue.created", async (ev) => {
       try {
         const n = adaptIssueCreated(ev);
@@ -126,17 +128,18 @@ export default definePlugin({
         log("teams issue.created handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
       }
     });
-    ctx.events.on("agent.task_completed", async (ev) => {
+    // agent.run.finished = a task/run completed → digest tally only (no card; the
+    // "issue done" card comes from issue.updated above). Payload carries agentId.
+    ctx.events.on("agent.run.finished", async (ev) => {
       try {
-        const n = adaptIssueDone(ev);
-        if (n) await deliver(n);
-        await digest.onTaskCompleted(n && n.kind === "issue-done" ? n.agentName : undefined);
+        await digest.onTaskCompleted(extractCompletedAgent(ev));
       } catch (e) {
-        log("teams agent.task_completed handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+        log("teams agent.run.finished handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
       }
     });
-    // cost_event.created feeds only the digest cost total (no card). AC #3: the
-    // digest total is the sum of these events' cost.
+    // cost_event.created feeds only the digest cost total (AC #3). NOTE: the host
+    // does not currently emit this event (cost logs `cost.reported`, unmapped), so
+    // this is inert until the upstream gap is fixed — the digest cost stays $0 today.
     ctx.events.on("cost_event.created", async (ev) => {
       try {
         const cents = extractCostCents(ev);
@@ -146,25 +149,21 @@ export default definePlugin({
       }
     });
 
-    // Budget thresholds: post at most once per (budget, threshold). The threshold is
-    // marked seen only AFTER a successful delivery (postOnce), so a crossing before
-    // the URL is set or during an outage is not permanently suppressed (AC #3).
-    const onBudget = (eventName: string): void => {
-      ctx.events.on(eventName, async (ev) => {
-        try {
-          const n = adaptBudgetThreshold(ev);
-          if (!n || n.kind !== "budget-threshold") return;
-          const result = await dedupe.postOnce(n.budgetId, n.threshold, () => deliver(n));
-          if (result === "deduped") {
-            log("teams budget card deduped (already posted for this threshold)", { budgetId: n.budgetId, threshold: n.threshold });
-          }
-        } catch (e) {
-          log("teams budget handler error (swallowed)", { eventName, error: e instanceof Error ? e.message : String(e) });
+    // Budget thresholds arrive as a single budget.incident.opened event (soft AND
+    // hard both map to it); dedupe once per (budget, derived threshold). Marked seen
+    // only AFTER a successful delivery so an outage doesn't permanently suppress it.
+    ctx.events.on("budget.incident.opened", async (ev) => {
+      try {
+        const n = adaptBudgetThreshold(ev);
+        if (!n || n.kind !== "budget-threshold") return;
+        const result = await dedupe.postOnce(n.budgetId, n.threshold, () => deliver(n));
+        if (result === "deduped") {
+          log("teams budget card deduped (already posted for this threshold)", { budgetId: n.budgetId, threshold: n.threshold });
         }
-      });
-    };
-    onBudget("budget.soft_threshold_crossed");
-    onBudget("budget.hard_threshold_crossed");
+      } catch (e) {
+        log("teams budget handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+      }
+    });
 
     // PCLIP-21: daily digest. The manifest ticks this HOURLY; we self-throttle to
     // the configured digestHour (in digestTimezone, else server-local) and post once

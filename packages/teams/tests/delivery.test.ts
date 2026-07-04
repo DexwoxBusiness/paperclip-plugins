@@ -40,4 +40,40 @@ describe("workflows delivery (PCLIP-18)", () => {
     expect(out.ok).toBe(false);
     expect(logs.length).toBeGreaterThan(0);
   });
+
+  it("rejects a legacy O365 connector URL (retired May 2026) without posting", async () => {
+    const fetchFn = vi.fn();
+    const out = await createWorkflowsClient({ fetchFn: fetchFn as unknown as FetchLike }).post(
+      "https://acme.webhook.office.com/webhookb2/abc",
+      MSG,
+    );
+    expect(out).toMatchObject({ ok: false, transient: false });
+    expect(String((out as { error?: string }).error)).toMatch(/O365 connector|Workflows/i);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("aborts a hung request at the configured timeout — bounds the SLA (AC #1)", async () => {
+    const fetchFn: FetchLike = (_url, init) =>
+      new Promise((_res, rej) => {
+        init.signal?.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" })));
+      });
+    const out = await createWorkflowsClient({ fetchFn, timeoutMs: 20 }).post("https://x.logic.azure.com/y", MSG);
+    expect(out).toMatchObject({ ok: false, transient: true });
+    expect(String((out as { error?: string }).error)).toMatch(/timed out/i);
+  });
+
+  it("logs an SLA-exceeded warning when a successful delivery is slow (AC #1 observability)", async () => {
+    let t = 1000;
+    const now = () => t;
+    const slowClient = {
+      post: async () => {
+        t += 50; // simulated latency, over the 10ms soft deadline below
+        return { ok: true as const, status: 202 };
+      },
+    };
+    const logs: string[] = [];
+    const out = await safeDeliver(slowClient, "https://x/y", MSG, (m) => logs.push(m), {}, 10, now);
+    expect(out.ok).toBe(true);
+    expect(logs.some((l) => l.includes("exceeded SLA"))).toBe(true);
+  });
 });

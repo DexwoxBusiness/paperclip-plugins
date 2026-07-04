@@ -45,15 +45,19 @@ export default definePlugin({
 
     // Resolve the target URL fresh per event (live config; per-type routing is T2,
     // so v1 always posts to the default Workflows URL).
-    const deliver = async (n: TeamsNotification): Promise<void> => {
+    // Returns true only when a card was actually delivered (2xx). A missing URL or
+    // a failed post returns false — the budget dedupe uses this to avoid marking a
+    // threshold seen when nothing was posted.
+    const deliver = async (n: TeamsNotification): Promise<boolean> => {
       const cfg = (await ctx.config.get()) as { defaultWorkflowUrl?: string };
       const url = cfg.defaultWorkflowUrl ?? "";
       if (!url) {
         log("teams notification skipped: no default Workflows URL configured", { kind: n.kind });
-        return;
+        return false;
       }
       const message = toWorkflowsMessage(buildNotificationCard(n));
-      await safeDeliver(client, url, message, log, { kind: n.kind });
+      const outcome = await safeDeliver(client, url, message, log, { kind: n.kind });
+      return outcome.ok;
     };
 
     // Every handler is wrapped so a notification path NEVER throws into the core
@@ -74,14 +78,18 @@ export default definePlugin({
     on("approval.created", adaptApprovalCreated);
     on("agent.run.failed", adaptAgentError);
 
-    // Budget thresholds: dedupe once per (budget, threshold) before posting (AC #3).
+    // Budget thresholds: post at most once per (budget, threshold). The threshold is
+    // marked seen only AFTER a successful delivery (postOnce), so a crossing before
+    // the URL is set or during an outage is not permanently suppressed (AC #3).
     const onBudget = (eventName: string): void => {
       ctx.events.on(eventName, async (ev) => {
         try {
           const n = adaptBudgetThreshold(ev);
           if (!n || n.kind !== "budget-threshold") return;
-          if (await dedupe.shouldPost(n.budgetId, n.threshold)) await deliver(n);
-          else log("teams budget card deduped (already posted for this threshold)", { budgetId: n.budgetId, threshold: n.threshold });
+          const result = await dedupe.postOnce(n.budgetId, n.threshold, () => deliver(n));
+          if (result === "deduped") {
+            log("teams budget card deduped (already posted for this threshold)", { budgetId: n.budgetId, threshold: n.threshold });
+          }
         } catch (e) {
           log("teams budget handler error (swallowed)", { eventName, error: e instanceof Error ? e.message : String(e) });
         }

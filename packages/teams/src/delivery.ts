@@ -6,9 +6,21 @@
  * one attempt and — critically (AC #4) — NEVER throws into the caller, so a Teams
  * / Power Automate outage can never block the core Paperclip flow that emitted
  * the event. The classified result is returned for logging and for T5 to build on.
+ *
+ * Latency SLA (AC #1, "within 30 s"): the pipeline is event -> adapter (sync) ->
+ * card build (sync) -> this POST. The only unbounded step is the POST, and it is
+ * bounded by `timeoutMs` (default 10s) via an AbortController — comfortably under
+ * 30s. {@link safeDeliver} additionally measures per-delivery latency and logs an
+ * SLA-exceeded warning if a (successful) delivery ever crosses `softDeadlineMs`.
  */
 
 import type { WorkflowsMessage } from "./adaptive-card.js";
+
+/** Host of the RETIRED O365 connector webhooks (disabled May 2026). */
+const O365_CONNECTOR_HOST = /(^|\.)webhook\.office\.com$/i;
+
+/** Soft end-to-end SLA for a notification card (AC #1). Enforcement is the client timeout. */
+export const NOTIFICATION_SLA_MS = 30_000;
 
 export interface FetchResponseLike {
   status: number;
@@ -41,6 +53,21 @@ export function createWorkflowsClient(deps: WorkflowsClientDeps): WorkflowsClien
     async post(url, message): Promise<DeliveryOutcome> {
       if (!url || !/^https?:\/\//.test(url)) {
         return { ok: false, transient: false, error: "no valid Workflows webhook URL configured" };
+      }
+      // Fail loudly on a legacy O365 connector URL: those webhooks were retired in
+      // May 2026 and would silently never deliver — the classic migration mistake.
+      let host = "";
+      try {
+        host = new URL(url).hostname;
+      } catch {
+        return { ok: false, transient: false, error: "malformed Workflows webhook URL" };
+      }
+      if (O365_CONNECTOR_HOST.test(host)) {
+        return {
+          ok: false,
+          transient: false,
+          error: "URL is a legacy O365 connector (webhook.office.com), retired May 2026 — use a Power Automate Workflows URL",
+        };
       }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -75,17 +102,24 @@ export async function safeDeliver(
   message: WorkflowsMessage,
   log: (message: string, fields?: Record<string, unknown>) => void,
   context: Record<string, unknown> = {},
+  softDeadlineMs: number = NOTIFICATION_SLA_MS,
+  now: () => number = Date.now,
 ): Promise<DeliveryOutcome> {
+  const startedAt = now();
   try {
     const outcome = await client.post(url, message);
+    const latencyMs = now() - startedAt;
     if (!outcome.ok) {
-      log("teams notification delivery failed", { ...context, ...outcome });
+      log("teams notification delivery failed", { ...context, ...outcome, latencyMs });
+    } else if (latencyMs > softDeadlineMs) {
+      // Delivered, but slower than the AC #1 SLA — surface it for operators.
+      log("teams notification delivery exceeded SLA", { ...context, latencyMs, softDeadlineMs });
     }
     return outcome;
   } catch (e) {
     // Defensive: post() is designed not to throw, but guarantee non-blocking anyway.
     const error = e instanceof Error ? e.message : String(e);
-    log("teams notification delivery threw (swallowed)", { ...context, error });
+    log("teams notification delivery threw (swallowed)", { ...context, error, latencyMs: now() - startedAt });
     return { ok: false, transient: true, error };
   }
 }

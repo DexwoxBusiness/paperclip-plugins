@@ -30,14 +30,23 @@ function str(v: unknown): string | undefined {
   return undefined;
 }
 
-/** Best-effort readable issue id (PROJ-123) from a variety of payload shapes. */
-function issueIdentifier(issue: Record<string, unknown>, ev: RawPluginEvent): string | undefined {
+/**
+ * Best-effort readable issue id (PROJ-123) from a variety of payload shapes.
+ *
+ * `entityFallback` is only safe for a true issue.* event, where `ev.entityId` IS
+ * the issue. For a NESTED issue object inside another event (approval.created,
+ * agent.run.failed), entityId is the approval/run id — an unrelated entity — so
+ * those callers pass false and get `undefined` rather than a wrong id (Codex).
+ */
+function issueIdentifier(issue: Record<string, unknown>, ev: RawPluginEvent, entityFallback = false): string | undefined {
   const explicit = str(issue.identifier) ?? str(issue.readable_id);
   if (explicit) return explicit;
   const proj = str(issue.project__identifier) ?? str(issue.project_identifier);
   const seq = str(issue.sequence_id);
   if (proj && seq) return `${proj}-${seq}`;
-  return str(issue.id) ?? str(ev.entityId);
+  const id = str(issue.id);
+  if (id) return id;
+  return entityFallback ? str(ev.entityId) : undefined;
 }
 
 export function adaptIssueCreated(ev: RawPluginEvent): TeamsNotification | null {
@@ -48,7 +57,8 @@ export function adaptIssueCreated(ev: RawPluginEvent): TeamsNotification | null 
   return {
     kind: "issue-created",
     title,
-    issueIdentifier: issueIdentifier(issue, ev),
+    // issue.created: ev.entityId IS the issue, so the entityId fallback is safe here.
+    issueIdentifier: issueIdentifier(issue, ev, true),
     projectName: str(issue.project_name) ?? str(p.projectName) ?? str(p.project_name),
   };
 }

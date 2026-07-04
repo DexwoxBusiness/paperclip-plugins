@@ -42,6 +42,27 @@ describe("event adapters (PCLIP-18)", () => {
     expect(adaptBudgetThreshold({ payload: {} })).toBeNull();
   });
 
+  it("never shows the approval/run id as the issue id for a nested issue without its own id (Codex)", () => {
+    // approval.created: entityId is the APPROVAL id, not an issue id
+    const appr = adaptApprovalCreated({
+      entityId: "appr-1",
+      payload: { approval: { id: "appr-1", title: "x", requester: "b", issue: { name: "Issue with no id" } } },
+    });
+    expect(appr?.kind).toBe("approval");
+    if (appr?.kind === "approval") {
+      expect(appr.issueIdentifier).toBeUndefined(); // NOT "appr-1"
+      expect(appr.issueTitle).toBe("Issue with no id");
+    }
+    // agent.run.failed: entityId may be the run id
+    const err = adaptAgentError({ entityId: "run-9", payload: { error: "boom", issue: { name: "no id" } } });
+    if (err?.kind === "agent-error") expect(err.issueIdentifier).toBeUndefined();
+  });
+
+  it("issue.created DOES use entityId as the issue id (entity IS the issue)", () => {
+    const n = adaptIssueCreated({ entityId: "iss-9", payload: { name: "Title only" } });
+    expect(n).toMatchObject({ kind: "issue-created", issueIdentifier: "iss-9" });
+  });
+
   it("uses an explicit budget threshold when present", () => {
     const n = adaptBudgetThreshold({ payload: { budget: { id: "b1", name: "Sprint" }, threshold: 90, spent: "$90", limit: "$100" } });
     expect(n).toMatchObject({ kind: "budget-threshold", budgetId: "b1", threshold: 90, budgetName: "Sprint" });
@@ -59,18 +80,59 @@ describe("budget dedupe (AC #3 — one card per threshold)", () => {
     const map = new Map<string, unknown>();
     return { map, get: async (k) => map.get(k) ?? null, set: async (k, v) => void map.set(k, v) };
   }
+  const okDeliver = () => Promise.resolve(true);
 
-  it("posts once per (budget, threshold) and suppresses repeats", async () => {
+  it("posts once per (budget, threshold) and dedupes repeats", async () => {
     const d = createBudgetDedupe(makeStore());
-    expect(await d.shouldPost("b1", 90)).toBe(true);
-    expect(await d.shouldPost("b1", 90)).toBe(false); // repeat
-    expect(await d.shouldPost("b1", 100)).toBe(true); // different threshold
-    expect(await d.shouldPost("b2", 90)).toBe(true); // different budget
+    let posts = 0;
+    const deliver = () => {
+      posts++;
+      return Promise.resolve(true);
+    };
+    expect(await d.postOnce("b1", 90, deliver)).toBe("posted");
+    expect(await d.postOnce("b1", 90, deliver)).toBe("deduped"); // repeat -> no deliver
+    expect(await d.postOnce("b1", 100, deliver)).toBe("posted"); // different threshold
+    expect(await d.postOnce("b2", 90, deliver)).toBe("posted"); // different budget
+    expect(posts).toBe(3);
   });
 
-  it("serializes concurrent crossings — exactly one posts", async () => {
+  it("does NOT mark a threshold seen when delivery fails — retryable on a later crossing (Codex)", async () => {
     const d = createBudgetDedupe(makeStore());
-    const results = await Promise.all([d.shouldPost("b1", 90), d.shouldPost("b1", 90), d.shouldPost("b1", 90)]);
-    expect(results.filter(Boolean)).toHaveLength(1);
+    // first crossing while the URL is unset / Teams is down -> delivery false -> skipped, not marked
+    expect(await d.postOnce("b1", 90, () => Promise.resolve(false))).toBe("skipped");
+    // after recovery a later crossing still posts (was not suppressed)
+    expect(await d.postOnce("b1", 90, okDeliver)).toBe("posted");
+    // and only now does it dedupe
+    expect(await d.postOnce("b1", 90, okDeliver)).toBe("deduped");
+  });
+
+  it("skips invalid input without delivering", async () => {
+    const d = createBudgetDedupe(makeStore());
+    let posts = 0;
+    const deliver = () => {
+      posts++;
+      return Promise.resolve(true);
+    };
+    expect(await d.postOnce("", 90, deliver)).toBe("skipped");
+    expect(await d.postOnce("b1", Number.NaN, deliver)).toBe("skipped");
+    expect(posts).toBe(0);
+  });
+
+  it("serializes concurrent crossings — exactly one posts, the rest dedupe", async () => {
+    const d = createBudgetDedupe(makeStore());
+    let posts = 0;
+    const deliver = async () => {
+      posts++;
+      await Promise.resolve();
+      return true;
+    };
+    const results = await Promise.all([
+      d.postOnce("b1", 90, deliver),
+      d.postOnce("b1", 90, deliver),
+      d.postOnce("b1", 90, deliver),
+    ]);
+    expect(results.filter((r) => r === "posted")).toHaveLength(1);
+    expect(results.filter((r) => r === "deduped")).toHaveLength(2);
+    expect(posts).toBe(1);
   });
 });

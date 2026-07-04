@@ -156,28 +156,39 @@ function createLock(): <T>(fn: () => Promise<T>) => Promise<T> {
   };
 }
 
+export type BudgetPostResult = "posted" | "deduped" | "skipped";
+
 export interface BudgetDedupe {
-  /** True exactly once per (budget, threshold); records the mark so repeats return false. */
-  shouldPost(budgetId: string, threshold: number, now?: number): Promise<boolean>;
+  /**
+   * Post a budget-threshold card at most once per (budget, threshold). The whole
+   * check -> deliver -> mark sequence is serialized by an in-process lock, and the
+   * threshold is recorded as seen ONLY after `deliver` reports SUCCESS. So a
+   * crossing that happens before the Workflows URL is configured, or during a
+   * transient Teams outage, is NOT suppressed — a later crossing still posts once
+   * delivery succeeds. Returns "posted" (delivered + marked), "deduped" (already
+   * posted before), or "skipped" (invalid input, or delivery did not succeed).
+   */
+  postOnce(budgetId: string, threshold: number, deliver: () => Promise<boolean>, now?: number): Promise<BudgetPostResult>;
 }
 
 /**
  * Dedupe budget-threshold cards per (budgetId, threshold), persisted in plugin
- * state so a restart doesn't re-post. Check-and-set is serialized by an in-process
- * lock (valid for the single out-of-process worker model), so a threshold crossed
- * twice in quick succession still posts only once.
+ * state so a restart doesn't re-post. Marking-after-success (not before) means a
+ * failed/skipped delivery leaves the threshold un-marked and retryable on the next
+ * crossing — the dedupe never swallows the one and only card (Codex).
  */
 export function createBudgetDedupe(store: DedupeStore): BudgetDedupe {
   const lock = createLock();
   return {
-    shouldPost(budgetId, threshold, now = Date.now()): Promise<boolean> {
+    postOnce(budgetId, threshold, deliver, now = Date.now()): Promise<BudgetPostResult> {
       return lock(async () => {
-        if (!budgetId || !Number.isFinite(threshold)) return false;
+        if (!budgetId || !Number.isFinite(threshold)) return "skipped";
         const key = thresholdKey(budgetId, threshold);
-        const seen = await store.get(key);
-        if (seen) return false;
+        if (await store.get(key)) return "deduped";
+        const delivered = await deliver();
+        if (!delivered) return "skipped"; // do NOT mark — allow a retry on a later crossing
         await store.set(key, { postedAt: now });
-        return true;
+        return "posted";
       });
     },
   };

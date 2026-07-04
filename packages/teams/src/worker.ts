@@ -68,11 +68,18 @@ export default definePlugin({
       if (Date.now() - digestEnabledCache.at <= 60_000) return digestEnabledCache.value;
       if (!digestRefresh) {
         // The real read; updates the cache when it resolves (even if the guard below
-        // already timed out — a late value still refreshes the flag).
+        // already timed out — a late value still refreshes the flag). The trailing
+        // .catch is REQUIRED: if ctx.config.get() rejects AFTER the 5s race has
+        // already settled on the timeout, this promise would otherwise reject with no
+        // handler and trip Node's unhandled-rejection policy (Kody critical). The
+        // deadline wrapper below owns the fallback, so here we just swallow the late
+        // error (the stale cached flag is kept).
         const started = (async () => {
           const cfg = (await ctx.config.get()) as { enableDailyDigest?: boolean };
           digestEnabledCache = { value: cfg.enableDailyDigest === true, at: Date.now() };
-        })();
+        })().catch(() => {
+          /* config-read error handled by the deadline wrapper; suppress late rejection */
+        });
         // DEADLINE the shared refresh (Kody perf, high): all event handlers await
         // this ONE promise, so an un-deadlined hang in ctx.config.get() would block
         // digest accumulation across every handler indefinitely. On timeout we swallow

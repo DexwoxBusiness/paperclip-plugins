@@ -104,6 +104,11 @@ describe("normalizeSyncRules", () => {
     ]);
     expect(rules).toEqual([{ planeProjectId: "P-A", companyId: "co-1", paperclipProjectId: "pcproj-B", labelFilter: "lbl" }]);
   });
+
+  it("lowercases planeProjectId so uppercase config still matches events (Kody)", () => {
+    const rules = normalizeSyncRules([{ planeProjectId: "ABC-Def-01", companyId: "co-1", paperclipProjectId: "p" }]);
+    expect(rules[0].planeProjectId).toBe("abc-def-01");
+  });
 });
 
 describe("extractIssueLabels", () => {
@@ -157,7 +162,8 @@ describe("createSyncRulesHandler (PCLIP-2)", () => {
   it("updates in place when the issue is already mapped", async () => {
     const { handler, issues, idMapping } = makeHandler([RULE]);
     await idMapping.link({ planeId: "plane-1", paperclipIssueId: "pc-existing" });
-    issues.byId.set("pc-existing", { id: "pc-existing", companyId: "co-1" });
+    // P2-created issues carry origin metadata; the update path finds them by origin.
+    issues.byId.set("pc-existing", { id: "pc-existing", companyId: "co-1", originKind: ORIGIN, originId: "plane-1" });
     const out = await handler.handle(issueEvent({ action: "updated" }, { name: "New title" }));
     expect(out).toMatchObject({ kind: "updated", paperclipIssueId: "pc-existing" });
     expect(issues.created).toHaveLength(0);
@@ -218,6 +224,42 @@ describe("createSyncRulesHandler (PCLIP-2)", () => {
     const out = await handler.handle(issueEvent({ action: "updated" }, { labels: [] }));
     expect(out).toMatchObject({ kind: "staled", paperclipIssueId: "pc-1" });
     expect(idMapping.fwd.get("plane-1")?.stale).toBe(true);
+  });
+
+  it("skips issue_comment events — comment mirroring is out of PCLIP-2 scope (no error)", async () => {
+    const { handler, issues } = makeHandler([RULE]);
+    const out = await handler.handle(issueEvent({ event: "issue_comment" }));
+    expect(out).toMatchObject({ kind: "skipped", reason: "not-an-issue-event" });
+    expect(issues.created).toHaveLength(0);
+  });
+
+  it("matches the project rule case-insensitively (Kody: uppercase config UUID)", async () => {
+    const upper = "ABCDEF01-1111-4111-8111-111111111111";
+    const rule: SyncRule = { planeProjectId: upper, companyId: "co-1", paperclipProjectId: "pcproj-B" };
+    const { handler, issues } = makeHandler([rule]);
+    const lower = upper.toLowerCase();
+    const out = await handler.handle(issueEvent({ projectId: lower }, { project: lower, labels: [] }));
+    expect(out).toMatchObject({ kind: "created" });
+    expect(issues.created).toHaveLength(1);
+  });
+
+  it("re-homes a Plane issue moved to a different mapped project (creates in the new target)", async () => {
+    const rules: SyncRule[] = [
+      { planeProjectId: "P-A", companyId: "co-1", paperclipProjectId: "projX" },
+      { planeProjectId: "P-B", companyId: "co-2", paperclipProjectId: "projY" },
+    ];
+    const { handler, issues, idMapping } = makeHandler(rules);
+    const first = await handler.handle(issueEvent({ projectId: "P-A" }, { project: "P-A", labels: [] }));
+    expect(first).toMatchObject({ kind: "created" });
+    const oldId = issues.created[0];
+    expect(issues.byId.get(oldId)?.companyId).toBe("co-1");
+
+    const second = await handler.handle(issueEvent({ projectId: "P-B", action: "updated" }, { project: "P-B", labels: [] }));
+    expect(second).toMatchObject({ kind: "created" });
+    expect(issues.created).toHaveLength(2);
+    const newId = issues.created[1];
+    expect(issues.byId.get(newId)?.companyId).toBe("co-2");
+    expect(idMapping.fwd.get("plane-1")?.paperclipIssueId).toBe(newId);
   });
 });
 
@@ -298,6 +340,18 @@ describe("validateSyncRulesConfig (PCLIP-2 AC #5)", () => {
     );
     expect(res.ok).toBe(true);
     expect(res.warnings.join("\n")).toMatch(/name-based label filtering needs the Plane client/);
+  });
+
+  it("detects duplicate Plane project mappings case-insensitively (Kody)", async () => {
+    const res = await validateSyncRulesConfig(
+      [
+        { planeProjectId: PA.toUpperCase(), companyId: "co-1", paperclipProjectId: "pcproj-B" },
+        { planeProjectId: PA, companyId: "co-1", paperclipProjectId: "pcproj-B" },
+      ],
+      lookup(new Set(["co-1/pcproj-B"])),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.errors.join("\n")).toMatch(new RegExp(`duplicate mapping for Plane project ${PA}`));
   });
 
   it("rejects a non-array config", async () => {

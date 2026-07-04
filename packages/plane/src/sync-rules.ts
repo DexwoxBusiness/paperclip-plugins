@@ -45,7 +45,9 @@ export function normalizeSyncRules(raw: unknown): SyncRule[] {
   for (const item of raw) {
     if (!item || typeof item !== "object") continue;
     const r = item as Record<string, unknown>;
-    const planeProjectId = typeof r.planeProjectId === "string" ? r.planeProjectId.trim() : "";
+    // planeProjectId is matched against the event's projectId (a Plane UUID);
+    // canonicalize to lowercase so uppercase config still matches (Kody).
+    const planeProjectId = typeof r.planeProjectId === "string" ? r.planeProjectId.trim().toLowerCase() : "";
     const companyId = typeof r.companyId === "string" ? r.companyId.trim() : "";
     const paperclipProjectId = typeof r.paperclipProjectId === "string" ? r.paperclipProjectId.trim() : "";
     if (!planeProjectId || !companyId || !paperclipProjectId) continue;
@@ -98,7 +100,9 @@ export async function validateSyncRulesConfig(raw: unknown, lookup: ProjectLooku
       continue;
     }
     const r = item as Record<string, unknown>;
-    const planeProjectId = typeof r.planeProjectId === "string" ? r.planeProjectId.trim() : "";
+    // Lowercase planeProjectId so case-variant duplicates are detected and the
+    // stored/validated form matches runtime matching (Kody).
+    const planeProjectId = typeof r.planeProjectId === "string" ? r.planeProjectId.trim().toLowerCase() : "";
     const companyId = typeof r.companyId === "string" ? r.companyId.trim() : "";
     const paperclipProjectId = typeof r.paperclipProjectId === "string" ? r.paperclipProjectId.trim() : "";
 
@@ -161,6 +165,13 @@ export type SyncDecision =
   | { kind: "skip"; reason: "not-an-issue-event" | "no-mapping" | "label-filter" }
   | { kind: "sync"; rule: SyncRule };
 
+/** Case-insensitive Plane project match (project IDs are UUIDs). */
+function findRule(rules: SyncRule[], projectId: string | undefined): SyncRule | undefined {
+  if (!projectId) return undefined;
+  const key = projectId.toLowerCase();
+  return rules.find((r) => r.planeProjectId.toLowerCase() === key);
+}
+
 /**
  * Decide whether a created/updated issue event should sync, and to which
  * project. Skips non-issue events, projects with no mapping (AC #3), and issues
@@ -168,7 +179,7 @@ export type SyncDecision =
  */
 export function evaluateSyncDecision(event: ParsedPlaneEvent, rules: SyncRule[]): SyncDecision {
   if (event.event !== "issue") return { kind: "skip", reason: "not-an-issue-event" };
-  const rule = event.projectId ? rules.find((r) => r.planeProjectId === event.projectId) : undefined;
+  const rule = findRule(rules, event.projectId);
   if (!rule) return { kind: "skip", reason: "no-mapping" };
   if (rule.labelFilter && !labelMatches(rule.labelFilter, event.payload)) {
     return { kind: "skip", reason: "label-filter" };
@@ -232,11 +243,14 @@ export interface SyncRulesHandler {
 export function createSyncRulesHandler(deps: SyncRulesHandlerDeps): SyncRulesHandler {
   return {
     async handle(event: ParsedPlaneEvent): Promise<SyncOutcome> {
+      // Scope: PCLIP-2 syncs ISSUES only. issue_comment (and other) events are
+      // enabled for intake (PCLIP-1) but comment mirroring is a separate,
+      // later item — they are acknowledged here and skipped, never errored.
       if (event.event !== "issue") {
         return skip("not-an-issue-event", event);
       }
       const rules = await deps.getRules();
-      const rule = event.projectId ? rules.find((r) => r.planeProjectId === event.projectId) : undefined;
+      const rule = findRule(rules, event.projectId);
       if (!rule) {
         // AC #3: acknowledged and skipped — no error, no throw, no spam.
         deps.log("plane sync skipped: no mapping", { projectId: event.projectId, planeId: event.entityId });
@@ -277,29 +291,34 @@ export function createSyncRulesHandler(deps: SyncRulesHandlerDeps): SyncRulesHan
       const title = extractTitle(event.payload) ?? `Plane issue ${planeId}`;
       const description = extractDescription(event.payload);
 
-      // 1) Already mapped -> update in place.
-      const mapped = await deps.idMapping.resolveByPlaneId(planeId);
-      if (mapped) {
-        await deps.issues.update({ issueId: mapped.paperclipIssueId, companyId: rule.companyId, title, description });
-        deps.log("plane sync updated", { planeId, paperclipIssueId: mapped.paperclipIssueId });
-        return { kind: "updated", paperclipIssueId: mapped.paperclipIssueId };
-      }
-
-      // 2) Created-but-unlinked orphan (a prior create whose link failed) ->
-      // re-link, don't duplicate (idempotency by origin).
-      const orphan = await deps.issues.findByOrigin({
+      // The Paperclip issue for this Plane origin IN THE CURRENT RULE'S TARGET
+      // company is the source of truth. Keying on origin (not just the P6
+      // mapping) makes the upsert both:
+      //  - IDEMPOTENT: a create whose mapping link failed is found here and
+      //    re-linked on the Plane retry, never duplicated (standard #1); and
+      //  - MOVE-AWARE: if the Plane issue moved to a DIFFERENT mapped project,
+      //    no issue exists for this origin in the new target company, so we
+      //    create one there and re-home the mapping (link() stales the old row)
+      //    instead of updating the issue in the old project.
+      const existing = await deps.issues.findByOrigin({
         companyId: rule.companyId,
         originKind: deps.originKind,
         originId: planeId,
       });
-      if (orphan) {
-        await deps.idMapping.link({ planeId, paperclipIssueId: orphan.id, title });
-        await deps.issues.update({ issueId: orphan.id, companyId: rule.companyId, title, description });
-        deps.log("plane sync re-linked orphan", { planeId, paperclipIssueId: orphan.id });
-        return { kind: "updated", paperclipIssueId: orphan.id };
+      if (existing) {
+        // Heal the mapping if it is missing or points elsewhere, then update.
+        const mapped = await deps.idMapping.resolveByPlaneId(planeId);
+        if (!mapped || mapped.paperclipIssueId !== existing.id) {
+          await deps.idMapping.link({ planeId, paperclipIssueId: existing.id, title });
+        }
+        await deps.issues.update({ issueId: existing.id, companyId: rule.companyId, title, description });
+        deps.log("plane sync updated", { planeId, paperclipIssueId: existing.id });
+        return { kind: "updated", paperclipIssueId: existing.id };
       }
 
-      // 3) Create, then link. A crash between the two heals via step 2 on retry.
+      // Nothing for this origin in the target company: create there and link.
+      // If the issue was previously synced under a different project, link()'s
+      // 1:1 logic stales the old mapping row as it re-homes to the new issue.
       const created = await deps.issues.create({
         companyId: rule.companyId,
         projectId: rule.paperclipProjectId,

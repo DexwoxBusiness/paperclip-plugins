@@ -163,7 +163,7 @@ const manifest: PaperclipPluginManifestV1 = {
         items: { type: "string", enum: ["issue", "issue_comment", "project", "cycle", "module"] },
         title: "Enabled webhook event types",
         description:
-          "Allowlist of Plane event types to process. Defaults to issue + issue_comment (the PCLIP-1 sync surface); other types are recorded 'ignored'. Add project/cycle/module to opt in. An empty list falls back to the default rather than ignoring everything. PCLIP-1",
+          "Allowlist of Plane event types to intake. Defaults to issue + issue_comment; other types are recorded 'ignored'. Note: PCLIP-2 sync rules act on ISSUE events only — issue_comment is intake-only until comment mirroring lands (a later item). Add project/cycle/module to opt in. An empty list falls back to the default rather than ignoring everything. PCLIP-1",
         default: [...DEFAULT_CONFIG.enabledEvents],
       },
       syncRules: {

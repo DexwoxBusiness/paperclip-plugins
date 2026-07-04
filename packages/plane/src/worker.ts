@@ -3,6 +3,7 @@ import { ISSUE_ORIGIN_KIND, JOB_KEYS, PLUGIN_ID, TOOL_NAMES, WEBHOOK_KEYS } from
 import pluginManifest from "./manifest.js";
 import { createAgentTools, registerPlaneTools, type ToolRegistrar } from "./agent-tools.js";
 import { createUnconfiguredPlaneClient, type PlaneClientPort } from "./plane-client.js";
+import { createPlaneRestClient, type FetchLike, type PlaneRestClient } from "./plane-rest-client.js";
 import {
   createDeliveryRecorder,
   createPlaneWebhookHandler,
@@ -62,6 +63,31 @@ export default definePlugin({
     const seenStore = createSeenStore(state);
     // PCLIP-6: entity-backed ID mapping store (Postgres-persisted, survives restart).
     idMapping = createIdMappingStore(ctx.entities);
+
+    // PCLIP-7: when auth + endpoint config is present, replace the unconfigured
+    // stub with the authenticated Plane REST client. The API key is resolved
+    // from its secret-ref at CALL TIME (never cached or logged); a rotated key or
+    // ref is picked up automatically because getApiKey re-reads config each call.
+    const authCfg = (await ctx.config.get()) as {
+      planeApiKeyRef?: string;
+      planeBaseUrl?: string;
+      planeWorkspaceSlug?: string;
+    };
+    if (authCfg.planeApiKeyRef && authCfg.planeBaseUrl && authCfg.planeWorkspaceSlug) {
+      planeClient = createPlaneRestClient({
+        baseUrl: authCfg.planeBaseUrl,
+        workspaceSlug: authCfg.planeWorkspaceSlug,
+        getApiKey: async () => {
+          const c = (await ctx.config.get()) as { planeApiKeyRef?: string };
+          return c.planeApiKeyRef ? ctx.secrets.resolve(c.planeApiKeyRef) : "";
+        },
+        fetchFn: ((url, init) => fetch(url, init)) as FetchLike,
+        timeoutMs: 5000,
+      });
+      ctx.logger.info("Plane REST client configured (PCLIP-7)");
+    } else {
+      ctx.logger.info("Plane API not configured — agent tools return a 'not configured' error until the API key secret-ref is set");
+    }
 
     // PCLIP-2: sync-rules handler. IssuesPort wraps ctx.issues; origin
     // (kind+id) gives idempotent create so a link failure never duplicates.
@@ -195,7 +221,24 @@ export default definePlugin({
       },
     };
     const result = await validateSyncRulesConfig(config.syncRules, lookup);
-    return { ok: result.ok, errors: result.errors, warnings: result.warnings };
+    const warnings = [...result.warnings];
+
+    // PCLIP-7 AC #3: probe the Plane connection so the settings UI shows an
+    // invalid/revoked key with a re-auth hint. Surfaced as a WARNING (visible,
+    // non-blocking) so a transient Plane outage doesn't prevent saving config.
+    const auth = config as { planeApiKeyRef?: string; planeBaseUrl?: string; planeWorkspaceSlug?: string };
+    if (ctx && auth.planeApiKeyRef && auth.planeBaseUrl && auth.planeWorkspaceSlug) {
+      const probe = createPlaneRestClient({
+        baseUrl: auth.planeBaseUrl,
+        workspaceSlug: auth.planeWorkspaceSlug,
+        getApiKey: () => ctx.secrets.resolve(auth.planeApiKeyRef!),
+        fetchFn: ((url, init) => fetch(url, init)) as FetchLike,
+        timeoutMs: 5000,
+      });
+      const conn = await (probe as PlaneRestClient).testConnection();
+      if (!conn.ok && conn.error) warnings.push(conn.error);
+    }
+    return { ok: result.ok, errors: result.errors, warnings };
   },
 
   /**

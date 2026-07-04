@@ -62,6 +62,26 @@ describe("plane_get_work_item (AC #1)", () => {
     expect(res.data).toMatchObject({ kind: "bad_request" });
   });
 
+  it("decodes HTML entities in the rendered description — no raw entities (Kody)", async () => {
+    const t = build(
+      fakeClient({
+        getWorkItem: async () => ({
+          id: "u",
+          identifier: "PCLIP-7",
+          name: "Entities",
+          descriptionHtml: "&lt;script&gt;alert(&quot;hi&quot;)&lt;/script&gt; &amp; &amp;lt; &#39;q&#39; &#x2764;",
+          state: "Todo",
+          labels: [],
+          comments: [],
+          url: "https://plane.example.com/w/PCLIP-7",
+        }),
+      }),
+    );
+    const res = await t.getWorkItem({ id: "PCLIP-7" });
+    expect(res.content).toContain('<script>alert("hi")</script>'); // &lt;/&gt;/&quot; decoded
+    expect(res.content).toContain("& &lt; 'q' ❤"); // &amp;->& ; &amp;lt;->&lt; (no double-decode); numeric dec + hex
+  });
+
   it("maps a 404 to a structured not_found error", async () => {
     const t = build(fakeClient({ getWorkItem: async () => { throw new PlaneApiError("not_found", 404, "nope"); } }));
     const res = await t.getWorkItem({ id: "PCLIP-999" });

@@ -42,8 +42,10 @@ let idMapping: IdMappingStore | undefined;
 // PCLIP-2 sync-rules handler (project mapping + label filter -> upsert Paperclip issue).
 let syncHandler: SyncRulesHandler | undefined;
 // PCLIP-3 agent tools talk to Plane through this client. Defaults to an
-// "unconfigured" stub that returns a structured error; PCLIP-7 injects the
-// authenticated REST client (secret-ref API key) here.
+// "unconfigured" stub that returns a structured error until auth lands.
+// TODO(PCLIP-7): replace with the authenticated Plane REST client (secret-ref
+// API key via ctx.secrets, base URL, workspace slug, <=5s request timeout);
+// wiring it here lights up the registered tools for live agent runs (AC3/AC5).
 let planeClient: PlaneClientPort = createUnconfiguredPlaneClient();
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;

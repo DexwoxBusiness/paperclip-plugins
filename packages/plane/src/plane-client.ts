@@ -136,6 +136,17 @@ export interface PlaneStateResult {
 export interface PlaneClientPort {
   getWorkItem(idOrIdentifier: string): Promise<PlaneWorkItem>;
   searchWorkItems(query: { text?: string; label?: string; state?: string; cursor?: string }): Promise<PlaneSearchResult>;
+
+  /**
+   * Mutation contract (AC #3 — "visible within 5 seconds"). Plane's REST API is
+   * synchronous: a create/comment/state-change resolves ONLY after Plane has
+   * committed the write and returned the affected resource, so a successful
+   * result means the change is already readable via Plane's API — no read-after-
+   * write poll is needed. The concrete client (PCLIP-7) MUST apply a request
+   * timeout of <= 5s so a slow/hung call fails as a `PlaneApiError("unavailable")`
+   * rather than silently exceeding the visibility SLA. Each result carries the
+   * absolute Plane `url`.
+   */
   createWorkItem(input: PlaneCreateInput): Promise<PlaneMutationResult>;
   addComment(idOrIdentifier: string, commentHtml: string): Promise<PlaneCommentResult>;
   updateState(idOrIdentifier: string, state: string): Promise<PlaneStateResult>;

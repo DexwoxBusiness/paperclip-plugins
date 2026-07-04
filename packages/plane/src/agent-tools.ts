@@ -53,11 +53,49 @@ function optPriority(params: unknown): PlaneCreateInput["priority"] {
   return v as PlaneCreateInput["priority"];
 }
 
-/** Strip tags to a compact plain-text rendering for the human `content` string. */
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+};
+
+function fromCodePointSafe(code: number): string | undefined {
+  try {
+    return code > 0 ? String.fromCodePoint(code) : undefined;
+  } catch {
+    return undefined; // out-of-range code point
+  }
+}
+
+/**
+ * Decode common named + numeric HTML entities in a SINGLE pass. A single pass is
+ * deliberate: sequential per-entity replaces would cascade (decoding `&amp;`
+ * first turns the literal text `&amp;lt;` into `<` — a wrong double-decode, the
+ * bug in the naive fix). One regex scan consumes each entity exactly once.
+ * Unknown entities are left untouched.
+ */
+function decodeEntities(s: string): string {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi, (match, body: string) => {
+    if (body[0] === "#") {
+      const code =
+        body[1] === "x" || body[1] === "X" ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+      return Number.isFinite(code) ? fromCodePointSafe(code) ?? match : match;
+    }
+    return NAMED_ENTITIES[body.toLowerCase()] ?? match;
+  });
+}
+
+/**
+ * Strip HTML tags to a compact plain-text rendering for the human `content`
+ * string, decoding entities so the agent sees `<script>` rather than the raw
+ * `&lt;script&gt;` (Kody). Tags are removed BEFORE decoding, so escaped markup in
+ * the source (e.g. `&lt;b&gt;`) surfaces as visible text, not stripped.
+ */
 function stripHtml(html: string): string {
-  return html
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&nbsp;/g, " ")
+  return decodeEntities(html.replace(/<[^>]*>/g, " "))
     .replace(/\s+/g, " ")
     .trim();
 }

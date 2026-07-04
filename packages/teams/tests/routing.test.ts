@@ -42,6 +42,13 @@ describe("channel routing (PCLIP-19)", () => {
     expect(resolveWorkflowRef("approvals", cfg)).toBe("ref-default");
   });
 
+  // Reviewer note (Kody SUGGESTION — "channel configurable"): this proves the digest
+  // resolves to its OWN configured channel (digestWorkflowUrl) and falls back to the
+  // default when unset. The worker's digest job calls the SAME resolveChannelUrl →
+  // safeDeliver path as every notification (worker.ts), so once the ref resolves to
+  // the right URL here, delivery-to-channel is correct by construction; a separate
+  // worker-integration test would need the plugin SDK (not installed in this repo)
+  // and would only re-exercise safeDeliver, already covered in delivery.test.ts.
   it("routes the digest to its own channel when set, else falls back to default (PCLIP-21 AC #4)", () => {
     expect(resolveWorkflowRef("digest", { defaultWorkflowUrl: "ref-default", digestWorkflowUrl: "ref-digest" })).toBe("ref-digest");
     expect(resolveWorkflowRef("digest", { defaultWorkflowUrl: "ref-default" })).toBe("ref-default");

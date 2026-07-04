@@ -57,13 +57,24 @@ export default definePlugin({
     // short TTL (Kody perf): high-volume events (agent.run.finished,
     // cost_event.created) must not each hit ctx.config.get(). A ≤60s lag on an
     // enable/disable toggle is fine for a daily digest; no timer is used (lazy TTL).
+    // Single-flight refresh: while the cache is stale, concurrent events share ONE
+    // in-flight ctx.config.get() rather than each firing their own — otherwise a
+    // burst of agent.run.finished at the TTL boundary would re-introduce the exact
+    // config-store load the cache exists to remove (Kody). The promise is cleared
+    // once it settles so the next stale window refreshes again.
     let digestEnabledCache = { value: false, at: 0 };
+    let digestRefresh: Promise<void> | null = null;
     const isDigestEnabled = async (): Promise<boolean> => {
-      const nowMs = Date.now();
-      if (nowMs - digestEnabledCache.at > 60_000) {
-        const cfg = (await ctx.config.get()) as { enableDailyDigest?: boolean };
-        digestEnabledCache = { value: cfg.enableDailyDigest === true, at: nowMs };
+      if (Date.now() - digestEnabledCache.at <= 60_000) return digestEnabledCache.value;
+      if (!digestRefresh) {
+        digestRefresh = (async () => {
+          const cfg = (await ctx.config.get()) as { enableDailyDigest?: boolean };
+          digestEnabledCache = { value: cfg.enableDailyDigest === true, at: Date.now() };
+        })().finally(() => {
+          digestRefresh = null;
+        });
       }
+      await digestRefresh;
       return digestEnabledCache.value;
     };
     const accumulateIfEnabled = async (fn: () => Promise<void>): Promise<void> => {
@@ -226,8 +237,22 @@ export default definePlugin({
         const message = toWorkflowsMessage(buildDigestCard(rollup));
         const outcome = await safeDeliver(client, url, message, log, { kind: "digest", channel: "digest" });
         if (!outcome.ok) {
-          await digest.mergeBack(rollup);
-          log("teams digest delivery failed — will retry next hour", { runId: job.runId, ...outcome });
+          // The window was already reset by readAndReset, so the snapshot lives ONLY
+          // in `rollup` until mergeBack persists it. If mergeBack itself fails (store
+          // write error) the outer catch would swallow it and the next hourly run
+          // would start from an empty rollup — the day's stats vanish silently.
+          // Give mergeBack its own scope and RE-THROW on failure so the host records
+          // the job as failed (surfacing the data-loss) instead of masking it (Kody).
+          try {
+            await digest.mergeBack(rollup);
+          } catch (mergeErr) {
+            log("teams digest mergeBack FAILED after delivery failure — stats for this window may be lost", {
+              runId: job.runId,
+              error: mergeErr instanceof Error ? mergeErr.message : String(mergeErr),
+            });
+            throw mergeErr;
+          }
+          log("teams digest delivery failed — snapshot merged back, will retry next hour", { runId: job.runId, ...outcome });
           return;
         }
         await state.set(DIGEST_LAST_RUN_DATE_KEY, today);

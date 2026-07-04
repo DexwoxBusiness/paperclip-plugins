@@ -67,6 +67,17 @@ describe("digest rollup (PCLIP-21)", () => {
     expect(topPerformer(r)).toEqual({ name: "Ada", count: 2 }); // tie → lexicographic
   });
 
+  it("breaks an exact 2-agent tie by name, regardless of insertion order (Kody)", () => {
+    // Two agents, equal completions: the lexicographically earlier name must win,
+    // and the result must not depend on which was inserted first.
+    const bobFirst = emptyRollup(0);
+    bobFirst.agentCompletions = { Bob: 3, Ada: 3 };
+    expect(topPerformer(bobFirst)).toEqual({ name: "Ada", count: 3 });
+    const adaFirst = emptyRollup(0);
+    adaFirst.agentCompletions = { Ada: 3, Bob: 3 };
+    expect(topPerformer(adaFirst)).toEqual({ name: "Ada", count: 3 });
+  });
+
   it("coerceRollup repairs malformed persisted state", () => {
     expect(isEmptyRollup(coerceRollup(null, 10))).toBe(true);
     expect(isEmptyRollup(coerceRollup({ nonsense: true }, 10))).toBe(true);

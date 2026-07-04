@@ -123,3 +123,128 @@ export async function safeDeliver(
     return { ok: false, transient: true, error };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Retries with exponential backoff (PCLIP-22 / T5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Retry policy for {@link deliverWithRetry}. All knobs are injectable so the
+ * backoff schedule is deterministic under test (no real timers, no real random).
+ */
+export interface RetryPolicy {
+  /** Retries attempted AFTER the first try. Default 3 → up to 4 total attempts ("retried ×3", AC #1). */
+  maxRetries?: number;
+  /** First backoff, doubled each retry. Default 500ms. */
+  baseDelayMs?: number;
+  /** Per-backoff ceiling before jitter. Default 8000ms. */
+  maxDelayMs?: number;
+  /** Backoff growth factor. Default 2. */
+  factor?: number;
+  /** Sleep hook (default real setTimeout). Injected in tests to avoid wall-clock waits. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Jitter source in [0,1) (default Math.random). Injected in tests for determinism. */
+  random?: () => number;
+}
+
+/** Outcome of a delivery that may have been retried. */
+export interface RetriedDelivery {
+  /** The FINAL attempt's outcome. */
+  outcome: DeliveryOutcome;
+  /** Total attempts made (1 = first try succeeded or failed permanently). */
+  attempts: number;
+  /** Retries performed (attempts - 1). */
+  retried: number;
+}
+
+const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Deliver a card, retrying ONLY transient failures (429/5xx/timeout/network) with
+ * exponential backoff + full jitter (AC #1). A permanent failure (4xx, malformed
+ * URL, retired O365 host) is returned immediately with NO retries (AC #2) — retrying
+ * a 4xx just burns quota and delays the inevitable. Success short-circuits.
+ *
+ * Never throws (built on {@link safeDeliver}), so it stays inside the non-blocking
+ * notification envelope. Backoff runs off the core Paperclip flow (event handlers
+ * and the scheduled digest job are already fire-and-forget from the host's emit).
+ *
+ * Backoff for retry k (1-based) = min(maxDelayMs, baseDelayMs · factor^(k-1)),
+ * then multiplied by a [0.5,1.0) jitter factor so many plugins retrying a recovering
+ * endpoint don't reconverge into a thundering herd. Jitter never yields 0 (the floor
+ * is 0.5×) so a retry always actually waits.
+ */
+export async function deliverWithRetry(
+  client: WorkflowsClient,
+  url: string,
+  message: WorkflowsMessage,
+  log: (message: string, fields?: Record<string, unknown>) => void,
+  context: Record<string, unknown> = {},
+  policy: RetryPolicy = {},
+  softDeadlineMs: number = NOTIFICATION_SLA_MS,
+  now: () => number = Date.now,
+): Promise<RetriedDelivery> {
+  const maxRetries = policy.maxRetries ?? 3;
+  const baseDelayMs = policy.baseDelayMs ?? 500;
+  const maxDelayMs = policy.maxDelayMs ?? 8_000;
+  const factor = policy.factor ?? 2;
+  const sleep = policy.sleep ?? defaultSleep;
+  const random = policy.random ?? Math.random;
+
+  let attempt = 0;
+  // Loop is bounded: it can only continue on a TRANSIENT failure with retries left,
+  // so it runs at most maxRetries+1 times — no unbounded retry on a hard-down endpoint.
+  for (;;) {
+    attempt += 1;
+    const outcome = await safeDeliver(client, url, message, log, { ...context, attempt }, softDeadlineMs, now);
+    if (outcome.ok) return { outcome, attempts: attempt, retried: attempt - 1 };
+    if (!outcome.transient) return { outcome, attempts: attempt, retried: attempt - 1 }; // permanent → stop (AC #2)
+    if (attempt > maxRetries) return { outcome, attempts: attempt, retried: attempt - 1 }; // retries exhausted
+    const ceiling = Math.min(maxDelayMs, baseDelayMs * Math.pow(factor, attempt - 1));
+    const delayMs = Math.max(1, Math.round(ceiling * (0.5 + random() * 0.5)));
+    log("teams delivery retrying after transient failure", {
+      ...context,
+      attempt,
+      nextRetryInMs: delayMs,
+      status: outcome.status,
+    });
+    await sleep(delayMs);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Delivery metrics (PCLIP-22 AC #4 — success/failure rates in plugin observability)
+// ---------------------------------------------------------------------------
+
+/** How a (possibly retried) delivery ended, for metric tagging. */
+export type DeliveryResultKind = "success" | "transient_exhausted" | "permanent";
+
+export function classifyRetried(r: RetriedDelivery): DeliveryResultKind {
+  if (r.outcome.ok) return "success";
+  return r.outcome.transient ? "transient_exhausted" : "permanent";
+}
+
+/** A single metric point to hand to `ctx.metrics.write(name, value, tags)`. */
+export interface MetricPoint {
+  name: string;
+  value: number;
+  tags: Record<string, string>;
+}
+
+/**
+ * Metric points for one delivery, tagged by event type + channel so operators can
+ * chart success/failure RATES per event type and per channel (AC #4). Kept pure so
+ * the exact names/tags are unit-asserted; the worker just forwards each to
+ * `ctx.metrics.write`. Tag values are always strings (host contract).
+ */
+export function deliveryMetricPoints(r: RetriedDelivery, meta: { eventType: string; channel: string }): MetricPoint[] {
+  const base = { event_type: meta.eventType, channel: meta.channel };
+  const result = classifyRetried(r);
+  const points: MetricPoint[] = [
+    // One "total" per delivery tagged with the outcome → success rate = success/total.
+    { name: "teams.delivery.total", value: 1, tags: { ...base, result } },
+    { name: r.outcome.ok ? "teams.delivery.success" : "teams.delivery.failure", value: 1, tags: { ...base } },
+  ];
+  if (r.retried > 0) points.push({ name: "teams.delivery.retries", value: r.retried, tags: { ...base } });
+  return points;
+}

@@ -4,7 +4,8 @@ import { toWorkflowsMessage } from "./adaptive-card.js";
 import { buildNotificationCard, channelFor, createBudgetDedupe, type ChannelKind, type TeamsNotification } from "./notifications.js";
 import { classifyWorkflowRef, resolveWorkflowRef, type TeamsInstanceConfig } from "./routing.js";
 import { buildDeepLink } from "./links.js";
-import { createWorkflowsClient, safeDeliver, type FetchLike } from "./delivery.js";
+import { createWorkflowsClient, deliverWithRetry, deliveryMetricPoints, type FetchLike, type RetriedDelivery } from "./delivery.js";
+import { createDeliveryHealth } from "./delivery-health.js";
 import { buildDigestCard, createDigestAccumulator, digestDateKey, digestHourInZone } from "./digest.js";
 import {
   adaptAgentError,
@@ -20,15 +21,17 @@ import {
 /**
  * Microsoft Teams Chat OS worker.
  *
- * Implemented:
+ * Implemented (v1):
  *  - PCLIP-18 (T1) v1 Adaptive Card notifications via Power Automate Workflows
- *    webhooks: issue.created, agent.task_completed (done), approval.created,
- *    agent.run.failed, budget soft/hard threshold crossings. Cards are v1.5,
- *    delivered in the Workflows message envelope, budget cards deduped per
- *    threshold, and delivery NEVER blocks the core flow.
- * Backlog (Plane project PCLIP, module "Teams Plugin"):
+ *    webhooks (issue.created, issue.updated→done, approval.created,
+ *    agent.run.failed, budget.incident.opened). Cards are v1.5, delivered in the
+ *    Workflows envelope, budget cards deduped per threshold, never block the core flow.
  *  - PCLIP-19 (T2) per-event-type channel routing   - PCLIP-20 (T3) deep links
- *  - PCLIP-21 (T4) daily digest                      - PCLIP-22 (T5) retries + observability
+ *  - PCLIP-21 (T4) daily digest
+ *  - PCLIP-22 (T5) delivery retries (transient ×3 w/ backoff, permanent no-retry) +
+ *    success/failure metrics (ctx.metrics) + per-URL degraded-delivery status
+ *    surfaced to settings via ctx.data("delivery-health").
+ * Backlog (Plane project PCLIP, module "Teams Plugin"):
  *  - PCLIP-23..28 (T6..T11) v2 bot on the Microsoft 365 Agents SDK
  */
 let context: PluginContext | undefined;
@@ -50,6 +53,12 @@ export default definePlugin({
     };
     const client = createWorkflowsClient({ fetchFn: ((url, init) => fetch(url, init)) as FetchLike });
     const dedupe = createBudgetDedupe(state);
+    // PCLIP-22 (T5): per-URL delivery health for degraded-delivery status (AC #3).
+    const health = createDeliveryHealth(state);
+    // Surface degraded-delivery status to the plugin's settings UI (AC #3). No
+    // capability required; usePluginData("delivery-health") reads this. The snapshot
+    // is sanitized — URLs are fingerprinted, never returned raw (capability-URL safety).
+    ctx.data.register("delivery-health", async () => health.snapshot());
     // PCLIP-21: accumulate the daily-digest rollup from events into plugin state.
     const digest = createDigestAccumulator(state);
     // Accumulate ONLY while the digest is enabled, so a disabled digest is fully
@@ -144,6 +153,61 @@ export default definePlugin({
       }
     };
 
+    // PCLIP-22 (T5): deliver with retries, then record observability + health. This is
+    // the single delivery path for BOTH notifications and the digest, so retry/backoff,
+    // success-failure metrics, and degraded-URL tracking apply uniformly.
+    //  - Retries: transient (429/5xx/timeout/network) ×3 with backoff; permanent (4xx)
+    //    is returned immediately and logged with event type + channel (AC #1/#2).
+    //  - Metrics: success/failure/retry points tagged by event type + channel (AC #4).
+    //  - Health: consecutive failures per URL flip it to degraded past a threshold; a
+    //    success recovers it. Surfaced via ctx.data (AC #3).
+    // Observability side effects NEVER throw into the caller (non-blocking, AC #4 of T1).
+    const deliverTracked = async (
+      url: string,
+      message: ReturnType<typeof toWorkflowsMessage>,
+      meta: { eventType: string; channel: ChannelKind },
+    ): Promise<RetriedDelivery> => {
+      const r = await deliverWithRetry(client, url, message, log, { kind: meta.eventType, channel: meta.channel });
+      // AC #4: success/failure rates in plugin observability. Metric writes must not
+      // break delivery — swallow per point.
+      for (const p of deliveryMetricPoints(r, meta)) {
+        try {
+          await ctx.metrics.write(p.name, p.value, p.tags);
+        } catch (e) {
+          log("teams metrics.write failed (swallowed)", { name: p.name, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      // AC #3: update per-URL degraded status (fingerprinted; raw URL never stored).
+      try {
+        const transition = await health.record(url, r.outcome.ok, {
+          channel: meta.channel,
+          eventType: meta.eventType,
+          status: r.outcome.status,
+          error: r.outcome.ok ? undefined : r.outcome.error,
+        });
+        if (transition.justTripped) {
+          log("teams delivery DEGRADED: repeated failures on a channel URL — surfaced in settings (delivery-health)", {
+            channel: meta.channel,
+            urlFingerprint: transition.urlFingerprint,
+          });
+        } else if (transition.justRecovered) {
+          log("teams delivery recovered from degraded", { channel: meta.channel, urlFingerprint: transition.urlFingerprint });
+        }
+      } catch (e) {
+        log("teams delivery-health update failed (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+      }
+      // AC #2: a permanent failure is logged with event type + channel (no retries were spent).
+      if (!r.outcome.ok && !r.outcome.transient) {
+        log("teams delivery permanent failure (not retried)", {
+          eventType: meta.eventType,
+          channel: meta.channel,
+          status: r.outcome.status,
+          error: r.outcome.error,
+        });
+      }
+      return r;
+    };
+
     // Deliver a notification card. Returns true only when a card was actually
     // delivered (2xx) — the budget dedupe uses this to avoid marking a threshold
     // seen when nothing was posted. Config is read fresh (routing edits need no restart).
@@ -155,8 +219,8 @@ export default definePlugin({
       // PCLIP-20: attach a deep link to the exact entity (public base URL + prefix).
       const link = buildDeepLink(n, { baseUrl: cfg.paperclipBaseUrl, companyPrefix: cfg.paperclipCompanyPrefix });
       const message = toWorkflowsMessage(buildNotificationCard({ ...n, link }));
-      const outcome = await safeDeliver(client, url, message, log, { kind: n.kind, channel });
-      return outcome.ok;
+      const r = await deliverTracked(url, message, { eventType: n.kind, channel });
+      return r.outcome.ok;
     };
 
     // Every handler is wrapped so a notification path NEVER throws into the core
@@ -267,7 +331,8 @@ export default definePlugin({
         // next hour rather than silently dropped (Codex/Kody).
         const rollup = await digest.readAndReset();
         const message = toWorkflowsMessage(buildDigestCard(rollup));
-        const outcome = await safeDeliver(client, url, message, log, { kind: "digest", channel: "digest" });
+        // PCLIP-22: same retry + metrics + degraded-health path as notifications.
+        const { outcome } = await deliverTracked(url, message, { eventType: "digest", channel: "digest" });
         if (!outcome.ok) {
           // The window was already reset by readAndReset, so the snapshot lives ONLY
           // in `rollup` until mergeBack persists it. If mergeBack itself fails (store

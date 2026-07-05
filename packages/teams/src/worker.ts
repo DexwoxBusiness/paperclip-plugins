@@ -3,6 +3,8 @@ import { DEFAULT_CONFIG, JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.j
 import { createConversationStore } from "./bot-conversations.js";
 import { createTeamsBot, type TeamsBot } from "./bot.js";
 import { BOT_FRAMEWORK_ISSUERS } from "./bot-auth.js";
+import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
+import { createApprovalStore } from "./approval-store.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
 import { buildNotificationCard, channelFor, createBudgetDedupe, type ChannelKind, type TeamsNotification } from "./notifications.js";
 import { classifyWorkflowRef, resolveWorkflowRef, type TeamsInstanceConfig } from "./routing.js";
@@ -311,6 +313,66 @@ export default definePlugin({
       }
     });
 
+    // PCLIP-24: when an approval is decided (in Paperclip, or via a Teams click that
+    // called the REST API), refresh the interactive card in place via the bot
+    // (updateActivity) — the event-driven path that mirrors Discord's editMessage. Only
+    // acts when the bot is configured and we posted an interactive card for this approval.
+    //
+    // There is exactly ONE plugin event for a decision: `approval.decided`. The activity
+    // ACTIONS `approval.approved` / `approval.rejected` (and `approval.revision_requested`)
+    // all map to it (verified in host activity-log.ts) — they are NOT plugin events and are
+    // NOT in PLUGIN_EVENT_TYPES, so `ctx.events.on("approval.approved", …)` is a compile
+    // error. Do NOT add handlers for them; the outcome is read via getStatus below.
+    // NOTE: the exact approval.decided payload shape is extracted defensively and should be
+    // reconfirmed against the host at integration (see PCLIP-24 description).
+    ctx.events.on("approval.decided", async (ev) => {
+      try {
+        const ref = extractDecidedApprovalRef(ev);
+        if (!ref) {
+          // No approval id on the event → nothing to refresh. Log so payload drift is
+          // visible at integration (the event carries entityId = approval.id today).
+          log("teams approval.decided: no approval id extracted (reconfirm payload)", {
+            entityId: (ev as { entityId?: unknown }).entityId,
+          });
+          return;
+        }
+        const bot = await getBot(ctx);
+        // The event doesn't carry approve-vs-reject; the bot reads it via getStatus.
+        await bot.onApprovalDecided({ approvalId: ref.approvalId, byName: ref.decidedBy });
+      } catch (e) {
+        log("teams approval.decided handler error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+      }
+    });
+
+    // PCLIP-24 "Both" delivery: in ADDITION to the T1 Workflows approval notification
+    // (the on("approval.created", …) above), post the INTERACTIVE bot card so it can be
+    // Approved/Rejected in place. Only when the bot is configured AND an approvals
+    // conversation is set (the bot must already be installed there). Separate try/catch
+    // so a bot-post failure never affects the Workflows notification.
+    // approval.created semantically means a NEW pending approval, so we post the actionable
+    // card without a pre-check; if it was decided in the tiny window before posting, the
+    // approval.decided handler above refreshes it to the decided state (self-healing).
+    ctx.events.on("approval.created", async (ev) => {
+      try {
+        const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
+        const target = (cfg.botApprovalsConversationId ?? "").trim();
+        if (!(cfg.botAppId ?? "").trim() || !target) return; // interactive approvals off
+        const n = adaptApprovalCreated(ev);
+        if (!n || n.kind !== "approval") return;
+        const link = buildDeepLink(n, { baseUrl: cfg.paperclipBaseUrl, companyPrefix: cfg.paperclipCompanyPrefix });
+        const bot = await getBot(ctx);
+        await bot.postApprovalCard(target, {
+          approvalId: n.approvalId,
+          title: n.title,
+          requester: n.requester,
+          issueIdentifier: n.issueIdentifier,
+          link: link ?? undefined,
+        });
+      } catch (e) {
+        log("teams approval bot-post error (swallowed)", { error: e instanceof Error ? e.message : String(e) });
+      }
+    });
+
     // PCLIP-21: daily digest. The manifest ticks this HOURLY; we self-throttle to
     // the configured digestHour (in digestTimezone, else server-local) and post once
     // per day — so the time is adjustable at runtime (a static cron can't read
@@ -478,15 +540,48 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
       const tenantIssuers = tenantId
         ? [`https://login.microsoftonline.com/${tenantId}/v2.0`, `https://sts.windows.net/${tenantId}/`]
         : [];
-      const conversations = createConversationStore({
+      const stateBackend = {
         get: (k: string) => ctx.state.get({ scopeKind: "instance", stateKey: k }),
         set: (k: string, v: unknown) => ctx.state.set({ scopeKind: "instance", stateKey: k }, v),
-      });
+      };
+      const conversations = createConversationStore(stateBackend);
+      // PCLIP-24: interactive approvals. Board API key (optional in local_trusted) auths
+      // the approve/reject REST calls. Uses NATIVE fetch, not ctx.http — the Paperclip API
+      // often runs on localhost and ctx.http rejects private/reserved IPs (same reason the
+      // Discord plugin uses native fetch). The base URL is the same paperclipBaseUrl used
+      // for deep links.
+      //
+      // local_trusted vs production is distinguished by whether the ref is SET, not by a
+      // mode flag the plugin can't see: NO ref → intentionally unauthenticated (local_trusted),
+      // no warning, Authorization header omitted; ref SET but unresolvable → a real
+      // misconfiguration, so we warn. The host decides whether the key is actually required.
+      let boardApiKey: string | undefined;
+      const boardRef = (cfg as { paperclipBoardApiKeyRef?: string }).paperclipBoardApiKeyRef;
+      if (boardRef) {
+        try {
+          boardApiKey = (await ctx.secrets.resolve(boardRef)) || undefined;
+        } catch {
+          ctx.logger.info("teams approvals: could not resolve paperclipBoardApiKeyRef (approve/reject may be unauthenticated)");
+        }
+      }
+      const approvals = {
+        client: createApprovalsClient({
+          baseUrl: cfg.paperclipBaseUrl ?? "",
+          apiKey: boardApiKey,
+          // Native fetch (not ctx.http) — ctx.http rejects private/reserved IPs and the
+          // Paperclip API often runs on localhost. Params typed to avoid implicit any;
+          // the native Response satisfies ApprovalFetchResponse (status + text()).
+          fetchFn: ((url: string, init: { method: string; headers: Record<string, string>; body?: string }) =>
+            fetch(url, init as RequestInit)) as ApprovalFetch,
+        }),
+        store: createApprovalStore(stateBackend),
+      };
       return createTeamsBot({
         authConfig,
         botAppId,
         allowedIssuers: [...BOT_FRAMEWORK_ISSUERS, ...tenantIssuers, ...extraIssuers],
         conversations,
+        approvals,
         log: (m, f) => ctx.logger.info(m, f),
       });
     })().catch((e) => {

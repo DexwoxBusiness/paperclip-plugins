@@ -171,6 +171,21 @@ const manifest: PaperclipPluginManifestV1 = {
           "Entra app client secret (or cert) for the Microsoft 365 Agents SDK bot, used to authenticate OUTBOUND (proactive) calls to Azure Bot Service. Requires the paperclip pin while upstream secret-refs are kill-switched (PAP-2394). PCLIP-23/26",
         default: "",
       },
+      paperclipBoardApiKeyRef: {
+        type: "string",
+        format: "secret-ref",
+        title: "Paperclip board API key (secret reference) — v2 approvals",
+        description:
+          "Board API key used to authenticate interactive Approve/Reject calls to the Paperclip approval REST API (POST /api/approvals/{id}/approve|reject). Optional in local_trusted deployments. PCLIP-24",
+        default: DEFAULT_CONFIG.paperclipBoardApiKeyRef,
+      },
+      botApprovalsConversationId: {
+        type: "string",
+        title: "Interactive approvals conversation (v2, optional)",
+        description:
+          "Teams conversation id the bot posts interactive Approve/Reject approval cards to (the bot must already be installed in that conversation). Posted IN ADDITION to the Workflows approval notification. Empty = interactive approvals off. PCLIP-24",
+        default: DEFAULT_CONFIG.botApprovalsConversationId,
+      },
     },
     required: ["defaultWorkflowUrl", "paperclipBaseUrl"],
   },

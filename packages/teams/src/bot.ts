@@ -32,6 +32,7 @@
 // eslint-disable-next-line import/no-unresolved -- installed at deploy time; not built in this repo (like worker.ts)
 import {
   ActivityHandler,
+  CardFactory,
   CloudAdapter,
   TurnContext,
   authorizeJWT,
@@ -39,12 +40,26 @@ import {
   type AuthConfiguration,
   type Request as AgentsRequest,
 } from "@microsoft/agents-hosting";
+// Derive Activity from the SDK's own method signature so we don't need a direct
+// @microsoft/agents-activity dependency (it's only a transitive dep of agents-hosting).
+type Activity = Parameters<TurnContext["updateActivity"]>[0];
 
 // The SDK does not export a `Response` type (in the Express example it comes from
 // `express`); derive the exact type CloudAdapter.process expects for our shims.
 type AdapterResponse = Parameters<CloudAdapter["process"]>[1];
 import { assertBotClaims, extractBearerToken, type AuthDecision, type BotTokenClaims, type InboundAuthConfig } from "./bot-auth.js";
 import { conversationKey, type ConversationRef, type ConversationStore } from "./bot-conversations.js";
+import {
+  buildApprovalCard,
+  buildApprovalErrorCard,
+  buildDecidedCard,
+  parseApprovalSubmit,
+  teamsActor,
+  type ApprovalCardInput,
+  type ApprovalsClient,
+  type ApprovalVerb,
+} from "./approvals.js";
+import { type ApprovalStore } from "./approval-store.js";
 
 export interface TeamsBotDeps {
   /** Raw settings-derived auth config; normalized via getAuthConfigWithDefaults internally. */
@@ -54,6 +69,8 @@ export interface TeamsBotDeps {
   /** Extra allowed issuers beyond the Bot Framework default. */
   allowedIssuers?: readonly string[];
   conversations: ConversationStore;
+  /** Interactive approvals (PCLIP-24). Omit to disable approve/reject handling. */
+  approvals?: { client: ApprovalsClient; store: ApprovalStore };
   log: (message: string, fields?: Record<string, unknown>) => void;
 }
 
@@ -64,6 +81,10 @@ export interface TeamsBot {
   handleInbound(headers: Record<string, string | string[]>, rawBody: string): Promise<void>;
   /** Post a proactive message to a remembered conversation (AC #1). */
   postProactively(conversationKeyId: string, activityFactory: (ctx: TurnContext) => Promise<void>): Promise<boolean>;
+  /** Post an interactive approval card to a conversation and remember its ref (PCLIP-24). */
+  postApprovalCard(conversationKeyId: string, input: ApprovalCardInput): Promise<boolean>;
+  /** On the approval.decided event, read the outcome and refresh the stored card (PCLIP-24). */
+  onApprovalDecided(input: { approvalId: string; byName?: string }): Promise<boolean>;
 }
 
 /** Build the inbound-auth policy config from deps. */
@@ -167,11 +188,85 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
   });
   handler.onMessage(async (context: TurnContext, next: () => Promise<void>) => {
     await rememberFrom(context);
-    // v1 is notification-only; conversational replies land with T8+. Acknowledge so
-    // the user isn't left hanging when the bot is @mentioned.
+    // PCLIP-24: an Approve/Reject Action.Submit click arrives as a message activity
+    // carrying our data in `activity.value`. Handle it and return — no generic reply.
+    const submit = parseApprovalSubmit(context.activity.value);
+    if (submit && deps.approvals) {
+      await handleApprovalSubmit(context, submit.verb, submit.approvalId);
+      await next();
+      return;
+    }
+    // Otherwise: v1 is notification-only; conversational replies land with T8+.
     await context.sendActivity("Thanks — I post Paperclip notifications and approvals here. Interactive commands are coming soon.");
     await next();
   });
+
+  /** Build a bot message activity carrying an Adaptive Card. */
+  const cardActivity = (card: ReturnType<typeof buildApprovalCard>): Partial<Activity> => ({
+    type: "message",
+    attachments: [CardFactory.adaptiveCard(card)],
+  });
+
+  /**
+   * Handle an Approve/Reject click: relay the decision to the Paperclip API with the
+   * acting Teams user (teams:{aadObjectId}). On failure, refresh the card to an error
+   * state that KEEPS the actions (AC #5). On success we do NOT refresh here — the
+   * definitive "Approved/Rejected by …" refresh comes from the approval.decided event
+   * (updateActivity), so both this clicker and everyone else converge (idempotent).
+   */
+  const handleApprovalSubmit = async (context: TurnContext, verb: ApprovalVerb, approvalId: string): Promise<void> => {
+    if (!deps.approvals) return;
+    const actor = teamsActor(context.activity.from?.aadObjectId);
+    // Sanitize the Teams display name before it goes into a decisionNote the Paperclip
+    // audit UI may render (Kody, security): strip HTML/quote/control chars and cap length.
+    // The actor id is a GUID-based teams:{aadObjectId} and is safe as-is.
+    const safeName = sanitizeDisplayName(context.activity.from?.name);
+    const noteName = safeName || actor;
+    const result = await deps.approvals.client.decide(verb, approvalId, {
+      actor,
+      decisionNote: `Teams approval ${verb} by ${noteName} (${actor})`,
+    });
+    const stored = await deps.approvals.store.get(approvalId);
+    if (!result.ok) {
+      deps.log("teams approval decision failed", { approvalId, verb, status: result.status, error: result.error });
+      const input: ApprovalCardInput = {
+        approvalId,
+        title: stored?.title,
+        requester: stored?.requester,
+        issueIdentifier: stored?.issueIdentifier,
+        link: stored?.link,
+      };
+      const errorCard = buildApprovalErrorCard(input, result.error ?? `HTTP ${result.status}`);
+      if (stored?.activityId) {
+        await context.updateActivity({ ...cardActivity(errorCard), id: stored.activityId } as Activity);
+      } else {
+        await context.sendActivity(cardActivity(errorCard) as Activity);
+      }
+      return;
+    }
+    // Success: refresh the card OPTIMISTICALLY here — we know the verb (the user just
+    // clicked it), so we don't have to wait for / re-read the approval.decided event
+    // (whose payload doesn't carry the outcome). Update in place + forget the ref so the
+    // subsequent approval.decided event is a no-op for this card.
+    if (stored?.activityId) {
+      // Refresh with the ACTUAL decision from the server (idempotency-safe): if the approval
+      // was already decided elsewhere — possibly differently — show the true outcome, not the
+      // verb this user just clicked. Attribute to the clicker only when their action was the
+      // one applied; otherwise show the state without a (misleading) name.
+      const actualVerb = result.verb ?? verb;
+      const decidedByName = actualVerb === verb ? safeName : undefined;
+      const decided = buildDecidedCard(actualVerb, { byName: decidedByName, title: stored.title });
+      await context.updateActivity({ ...cardActivity(decided), id: stored.activityId } as Activity);
+      await deps.approvals.store.forget(approvalId);
+    }
+  };
+
+  /** Strip HTML/quote/control chars from a user-controlled display name; cap length. */
+  const sanitizeDisplayName = (name?: string): string | undefined => {
+    if (!name) return undefined;
+    const cleaned = name.replace(/[<>&"'`\r\n\t]/g, "").trim().slice(0, 120);
+    return cleaned || undefined;
+  };
 
   return {
     adapter,
@@ -211,6 +306,54 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
         return false;
       }
       await adapter.continueConversation(deps.botAppId, stored.reference as never, activityFactory);
+      return true;
+    },
+    // PCLIP-24: post the interactive approval card to a known conversation and remember
+    // where it landed (conversation ref + posted activity id) so approval.decided can
+    // later updateActivity it in place. Must be bot-posted (not via Workflows) to be updatable.
+    async postApprovalCard(conversationKeyId, input) {
+      if (!deps.approvals) return false;
+      const conv = await deps.conversations.get(conversationKeyId);
+      if (!conv) {
+        deps.log("teams approval card skipped: unknown conversation", { conversationKeyId });
+        return false;
+      }
+      let activityId: string | undefined;
+      await adapter.continueConversation(deps.botAppId, conv.reference as never, async (ctx) => {
+        const res = await ctx.sendActivity(cardActivity(buildApprovalCard(input)) as Activity);
+        activityId = res?.id;
+      });
+      if (!activityId) return false;
+      await deps.approvals.store.remember(input.approvalId, {
+        conversationReference: conv.reference,
+        activityId,
+        title: input.title,
+        requester: input.requester,
+        issueIdentifier: input.issueIdentifier,
+        link: input.link,
+      });
+      return true;
+    },
+    // PCLIP-24: event-driven refresh for decisions made ELSEWHERE (Paperclip UI, another
+    // channel). We only have a stored card if WE posted it; if the plugin's own click
+    // already refreshed optimistically it has forgotten the ref, so this is a no-op. The
+    // approval.decided event does NOT carry the outcome, so read it via getStatus, then
+    // updateActivity to the decided state (mirrors Discord editMessage) and forget.
+    async onApprovalDecided(input) {
+      if (!deps.approvals) return false;
+      const stored = await deps.approvals.store.get(input.approvalId);
+      if (!stored) return false;
+      const status = await deps.approvals.client.getStatus(input.approvalId);
+      if (!status.ok || !status.verb) {
+        deps.log("teams approval.decided: could not resolve outcome", { approvalId: input.approvalId, status: status.status, error: status.error });
+        return false;
+      }
+      // Prefer the decider from the event; fall back to the record's decidedBy (getStatus).
+      const decided = buildDecidedCard(status.verb, { byName: input.byName ?? status.decidedBy, title: stored.title });
+      await adapter.continueConversation(deps.botAppId, stored.conversationReference as never, async (ctx) => {
+        await ctx.updateActivity({ type: "message", id: stored.activityId, attachments: [CardFactory.adaptiveCard(decided)] } as Activity);
+      });
+      await deps.approvals.store.forget(input.approvalId);
       return true;
     },
   };

@@ -32,6 +32,10 @@ export const DEFAULT_CONFIG = {
   allowPlaintextWorkflowUrl: false,
   /** Consecutive delivery failures on one URL before it is marked degraded. PCLIP-22 (T5). */
   degradedDeliveryThreshold: 5,
+  /** Board API key (secret-ref) for the interactive approval REST calls. Optional in local_trusted. PCLIP-24 (T7). */
+  paperclipBoardApiKeyRef: "",
+  /** Teams conversation id the bot posts INTERACTIVE approval cards to (the bot must be installed there). Empty = interactive approvals off (Workflows-only). PCLIP-24 (T7). */
+  botApprovalsConversationId: "",
 } as const;
 
 /** Teams supports Adaptive Cards ~v1.5 for bot/webhook cards. Do not use newer schema features. (T1) */

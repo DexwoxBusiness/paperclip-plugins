@@ -80,6 +80,11 @@ export function openUrlAction(title: string, url: string): CardAction {
   return { type: "Action.OpenUrl", title, url };
 }
 
+/** Action.Submit — a click posts a bot activity carrying `data` (no invoke-response contract). */
+export function submitAction(title: string, data: Record<string, unknown>): CardAction {
+  return { type: "Action.Submit", title, data };
+}
+
 /** Stamp the required root fields onto a card body (+ optional actions). */
 export function adaptiveCard(body: CardElement[], actions?: CardAction[]): AdaptiveCard {
   const card: AdaptiveCard = {
@@ -106,9 +111,12 @@ export function toWorkflowsMessage(card: AdaptiveCard): WorkflowsMessage {
 // --------------------------------------------------------------------------
 
 const SUPPORTED_VERSIONS = new Set(["1.0", "1.1", "1.2", "1.3", "1.4", "1.5"]);
-// v1 uses only OpenUrl/ShowCard/ToggleVisibility; Action.Execute is a v2 (Universal
-// Action / PCLIP-24) feature and must NOT appear on a Workflows-webhook card.
-const V1_ACTION_TYPES = new Set(["Action.OpenUrl", "Action.ShowCard", "Action.ToggleVisibility"]);
+// Allowed actions. Action.Submit is a core v1 action (used for the PCLIP-24 approve/
+// reject buttons — a click posts a normal bot activity the plugin handles, with no
+// synchronous invoke-response contract). Action.Execute (Universal Actions) is still
+// disallowed: it requires an inline HTTP invoke response the host webhook can't return
+// (host returns a fixed 200/502 envelope), so we deliberately use Action.Submit instead.
+const V1_ACTION_TYPES = new Set(["Action.OpenUrl", "Action.ShowCard", "Action.ToggleVisibility", "Action.Submit"]);
 
 export interface CardValidation {
   ok: boolean;
@@ -180,6 +188,12 @@ function validateAction(a: unknown, path: string): string[] {
   if (act.type === "Action.OpenUrl") {
     if (typeof act.title !== "string" || !act.title) errors.push(`${path}.title is required for Action.OpenUrl`);
     if (typeof act.url !== "string" || !/^https?:\/\//.test(act.url)) errors.push(`${path}.url must be an http(s) URL`);
+  }
+  if (act.type === "Action.Submit") {
+    if (typeof act.title !== "string" || !act.title) errors.push(`${path}.title is required for Action.Submit`);
+    if (act.data !== undefined && (typeof act.data !== "object" || act.data === null)) {
+      errors.push(`${path}.data must be an object when present`);
+    }
   }
   return errors;
 }

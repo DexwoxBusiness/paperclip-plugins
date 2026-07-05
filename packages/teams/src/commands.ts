@@ -44,7 +44,20 @@ export interface CommandDeps {
   /** Recently completed work (Paperclip "done" issues), for the status card. */
   listRecentCompletions(): Promise<CommandIssue[]>;
   listIssues(filter: IssueFilter): Promise<CommandIssue[]>;
-  approve?(approvalId: string): Promise<CommandApproveResult>;
+  /**
+   * Approve a pending approval. `opts.actor`/`opts.actorName` carry the acting Teams user
+   * so the decision is attributed to the real person (audit parity with the T7 button flow),
+   * not a generic label.
+   */
+  approve?(approvalId: string, opts: CommandActor): Promise<CommandApproveResult>;
+}
+
+/** The acting Teams user, threaded from the bot turn into approval attribution. */
+export interface CommandActor {
+  /** Paperclip actor id, e.g. `teams:{aadObjectId}`. */
+  actor: string;
+  /** The user's sanitized display name, for the decision note. */
+  actorName?: string;
 }
 
 export type IssueFilter = "open" | "done" | "all";
@@ -211,7 +224,7 @@ export interface CommandOutcome {
  * throws for control flow; the worker wraps the call and still replies with help on an
  * unexpected error so the user is never left in silence.
  */
-export async function dispatchCommand(parsed: ParsedCommand, deps: CommandDeps): Promise<CommandOutcome> {
+export async function dispatchCommand(parsed: ParsedCommand, deps: CommandDeps, actor: CommandActor = { actor: "teams:unknown" }): Promise<CommandOutcome> {
   switch (parsed.command) {
     case "status": {
       const agents = await deps.listAgents();
@@ -229,7 +242,7 @@ export async function dispatchCommand(parsed: ParsedCommand, deps: CommandDeps):
       const approvalId = (parsed.args[0] ?? "").trim();
       if (!approvalId) return { card: buildApproveUsageCard(), command: "approve" };
       if (!deps.approve) return { card: buildApprovalsDisabledCard(), command: "approve" };
-      const result = await deps.approve(approvalId);
+      const result = await deps.approve(approvalId, actor);
       return { card: buildApproveResultCard(result, approvalId), command: "approve" };
     }
     case "help":

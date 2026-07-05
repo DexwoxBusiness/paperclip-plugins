@@ -116,6 +116,20 @@ describe("dispatchCommand", () => {
     expect(JSON.stringify(card)).toContain("Approved approval");
   });
 
+  it("approve: threads the acting user's actor/name into deps.approve (audit parity)", async () => {
+    let captured: { actor: string; actorName?: string } | undefined;
+    const d = deps({ approve: async (_id, opts) => { captured = opts; return { ok: true, verb: "approve" }; } });
+    await dispatchCommand(parseCommand("approve ap-9"), d, { actor: "teams:abc-123", actorName: "Ada" });
+    expect(captured).toEqual({ actor: "teams:abc-123", actorName: "Ada" });
+  });
+
+  it("approve: defaults to teams:unknown when no actor context is provided", async () => {
+    let captured: { actor: string } | undefined;
+    const d = deps({ approve: async (_id, opts) => { captured = opts; return { ok: true, verb: "approve" }; } });
+    await dispatchCommand(parseCommand("approve ap-9"), d);
+    expect(captured?.actor).toBe("teams:unknown");
+  });
+
   it("approve: API rejection → polite failure card, never silence", async () => {
     const { card } = await dispatchCommand(parseCommand("approve ap-1"), deps({ approve: async () => ({ ok: false, error: "approval not found (404)" }) }));
     ok(card);

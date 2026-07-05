@@ -234,8 +234,11 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     if (deps.commands) {
       const text = typeof context.activity.text === "string" ? context.activity.text : "";
       const parsed = parseCommand(text);
+      // Thread the acting Teams user so `approve` attributes the decision to the real person
+      // (audit parity with handleApprovalSubmit), not a generic label.
+      const actor = { actor: teamsActor(context.activity.from?.aadObjectId), actorName: sanitizeDisplayName(context.activity.from?.name) };
       try {
-        const outcome = await dispatchCommand(parsed, deps.commands);
+        const outcome = await dispatchCommand(parsed, deps.commands, actor);
         await context.sendActivity(cardActivity(outcome.card) as Activity);
         deps.onCommand?.(outcome.command);
       } catch (e) {

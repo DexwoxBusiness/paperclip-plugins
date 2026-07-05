@@ -662,8 +662,11 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
         // approve is enabled only when a Paperclip base URL is set (approvals reachable);
         // otherwise omit it so the command replies with the polite "not enabled" card.
         approve: (cfg.paperclipBaseUrl ?? "").trim()
-          ? async (approvalId) => {
-              const r = await approvals.client.decide("approve", approvalId, { actor: "teams:command" });
+          ? async (approvalId, opts) => {
+              // Attribute the decision to the acting Teams user (audit parity with the T7
+              // button flow / handleApprovalSubmit), not a generic label.
+              const note = `Teams approval approve by ${opts.actorName || opts.actor} (${opts.actor})`;
+              const r = await approvals.client.decide("approve", approvalId, { actor: opts.actor, decisionNote: note });
               return { ok: r.ok, verb: r.verb, error: r.error };
             }
           : undefined,

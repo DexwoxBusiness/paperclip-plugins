@@ -2,7 +2,8 @@ import { definePlugin, type PluginContext, type PluginWebhookInput } from "@pape
 import { DEFAULT_CONFIG, JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.js";
 import { createConversationStore } from "./bot-conversations.js";
 import { createTeamsBot, type TeamsBot } from "./bot.js";
-import { BOT_FRAMEWORK_ISSUERS } from "./bot-auth.js";
+import { BOT_FRAMEWORK_ISSUERS, BotInboundUnauthorizedError } from "./bot-auth.js";
+import { describeMessagingEndpoint } from "./messaging-endpoint.js";
 import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
 import { createApprovalStore } from "./approval-store.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
@@ -70,6 +71,15 @@ export default definePlugin({
     // capability required; usePluginData("delivery-health") reads this. The snapshot
     // is sanitized — URLs are fingerprinted, never returned raw (capability-URL safety).
     ctx.data.register("delivery-health", async () => health.snapshot());
+    // PCLIP-25 (T8): surface the v2 bot's public messaging endpoint URL to settings so
+    // operators can copy the exact value into the Azure Bot "Messaging endpoint" field and
+    // see immediately if the configured public origin is missing/invalid/non-HTTPS. The URL
+    // is derived (not stored) from the public origin + static route, so it is stable across
+    // restarts (AC #5). No capability required; no secrets in the payload.
+    ctx.data.register("messaging-endpoint", async () => {
+      const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
+      return describeMessagingEndpoint(cfg.paperclipBaseUrl ?? "", PLUGIN_ID, WEBHOOK_KEYS.botMessages);
+    });
     // PCLIP-21: accumulate the daily-digest rollup from events into plugin state.
     const digest = createDigestAccumulator(state);
     // Accumulate ONLY while the digest is enabled, so a disabled digest is fully
@@ -468,18 +478,37 @@ export default definePlugin({
     try {
       await bot.handleInbound(input.headers, input.rawBody);
     } catch (e) {
-      // Emit a distinct metric for AUTH rejections so operators can tell a
-      // 502-from-auth apart from a 502-from-error in monitoring (the status alone
-      // can't, given the host limitation). Never let metrics failure mask the reject.
-      const message = e instanceof Error ? e.message : String(e);
-      if (message.includes("unauthorized")) {
+      if (e instanceof BotInboundUnauthorizedError) {
+        // Unauthenticated / invalid-token probe (AC #2). Log the DETAILED reason
+        // internally (health dashboard), correlated by the host requestId — it is NEVER
+        // surfaced to the caller. Re-throw the SAME error so only its GENERIC
+        // "unauthorized" message reaches the host's 502 body (no stack traces / internals).
+        // The distinct auth metric lets operators separate a 502-from-auth from a
+        // 502-from-error, since the fixed host envelope can't return a 401/403. Metrics
+        // are best-effort and must not mask the rejection.
+        ctx.logger.info("teams bot inbound rejected", { requestId: input.requestId, reason: e.reason });
+        // `ctx.metrics.write` is FREE-FORM: the host contract is {name, value, tags} gated
+        // ONLY by the `metrics.write` capability (declared in the manifest) — there is no
+        // per-metric pre-declaration/allowlist/registry to add a metric name to (verified
+        // against the plugin-sdk protocol + host). This emits the same way as the shipped
+        // T5 `teams.delivery.*` metrics. Auth-path only; JWKS/infra vs bad-token detail is
+        // in the log line above (e.reason). Best-effort: a metrics failure must not mask the reject.
         try {
           await ctx.metrics.write("teams.bot.inbound.rejected", 1, { reason: "auth" });
         } catch {
           /* metrics are best-effort */
         }
+        throw e;
       }
-      throw e; // re-throw so the host records the rejection (502)
+      // Post-auth operational failure (e.g. malformed activity body, adapter error). The
+      // caller is already-authenticated Teams, so the controlled error message is safe to
+      // record and aids delivery-record/log correlation; re-throw so the host records a
+      // 502 and can retry. (parseActivityBody etc. throw curated messages, never a stack.)
+      ctx.logger.info("teams bot inbound processing error", {
+        requestId: input.requestId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      throw e;
     }
   },
 });

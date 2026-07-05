@@ -47,7 +47,7 @@ type Activity = Parameters<TurnContext["updateActivity"]>[0];
 // The SDK does not export a `Response` type (in the Express example it comes from
 // `express`); derive the exact type CloudAdapter.process expects for our shims.
 type AdapterResponse = Parameters<CloudAdapter["process"]>[1];
-import { assertBotClaims, extractBearerToken, type AuthDecision, type BotTokenClaims, type InboundAuthConfig } from "./bot-auth.js";
+import { assertBotClaims, assertServiceUrl, BotInboundUnauthorizedError, extractBearerToken, type AuthDecision, type BotTokenClaims, type InboundAuthConfig } from "./bot-auth.js";
 import { conversationKey, type ConversationRef, type ConversationStore } from "./bot-conversations.js";
 import {
   buildApprovalCard,
@@ -120,19 +120,46 @@ function verifyViaSdk(authConfig: AuthConfiguration, authorization: string | str
         resolve(decision);
       }
     };
-    // Minimal Express-style response shim for the authorizeJWT middleware. Any status
-    // >= 400 or a terminal end/send means the middleware rejected the token. Methods
-    // are self-contained (no `this`) so the shim types cleanly.
+    // Minimal Express-style response shim for the authorizeJWT middleware. The middleware
+    // ONLY touches res on FAILURE — it calls `res.status(4xx).send({ 'jwt-auth-error': msg })`
+    // (success goes through `next()`), so any status >= 400 / terminal send/end is a rejection.
+    // We capture the SDK's error MESSAGE from the `.send()` payload into the reason so the
+    // worker's internal log can distinguish a JWKS/Bot-Framework INFRASTRUCTURE failure (e.g.
+    // "SigningKeyNotFoundError", a JWKS 5xx/timeout) from a plain bad/expired TOKEN — the
+    // reviewer's infra-vs-auth triage point. This reason is logged internally only; the caller
+    // still receives the generic "unauthorized", so no internals leak (AC #2). Methods are
+    // self-contained (no `this`) so the shim types cleanly.
+    let pendingStatus: number | undefined;
+    const rejectReason = (message?: string): string => {
+      const base = pendingStatus !== undefined ? `token verification failed (status ${pendingStatus})` : "token verification failed";
+      return message ? `${base}: ${message}` : base;
+    };
+    const sdkError = (payload: unknown): string | undefined => {
+      if (payload && typeof payload === "object") {
+        const v = (payload as Record<string, unknown>)["jwt-auth-error"];
+        if (typeof v === "string" && v.trim()) return v.trim();
+      }
+      return undefined;
+    };
     const res: Record<string, (...args: unknown[]) => unknown> = {};
     res.status = (code: unknown) => {
-      if (typeof code === "number" && code >= 400) finish({ ok: false, reason: `token verification failed (status ${code})` });
+      if (typeof code === "number" && code >= 400) {
+        pendingStatus = code;
+        // The SDK calls `.send()` synchronously right after `.status()`, carrying the error
+        // message — let it win. This microtask is a defensive guard so a >= 400 status that is
+        // (unexpectedly) never followed by send/end still rejects instead of hanging.
+        queueMicrotask(() => finish({ ok: false, reason: rejectReason() }));
+      }
+      return res;
+    };
+    res.send = (payload?: unknown) => {
+      finish({ ok: false, reason: rejectReason(sdkError(payload)) });
       return res;
     };
     res.end = () => {
-      finish({ ok: false, reason: "token verification failed" });
+      finish({ ok: false, reason: rejectReason() });
       return res;
     };
-    res.send = () => res.end();
     // Express error-first `next(err?)`: an error means verification failed; no error
     // means authenticated (claims on req.user).
     const next = (err?: unknown) => {
@@ -273,24 +300,43 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     handler,
     async handleInbound(headers, rawBody) {
       const authorization = headers["authorization"] ?? headers["Authorization"];
-      // 1) Cryptographic validation via the SDK (signature/JWKS/issuer/audience),
-      // using the SAME normalized authConfig as the adapter.
+      // 1) Cryptographic validation via the SDK (signature/JWKS/issuer/audience). The SDK's
+      // authorizeJWT owns: RS256 signature via JWKS (jwks-rsa's `getSigningKey`, keyed off the
+      // token's own issuer through buildJwksUri), audience === a configured clientId, and a
+      // 5-min clock tolerance (verified in @microsoft/agents-hosting jwt-middleware.js). JWKS
+      // key caching + refresh is therefore owned by jwks-rsa (short default TTL, plus a fresh
+      // fetch on an unknown `kid` for key rotation) — far more frequent than the 24h upper
+      // bound the Bot Connector spec requires, so we do NOT hand-roll a JWKS cache.
       const sdkDecision = await verifyViaSdk(authConfig, authorization);
       if (!sdkDecision.ok) {
         deps.log("teams bot inbound rejected (auth)", { reason: sdkDecision.reason });
-        // No 401 available (host maps a throw → 502); throwing is the only rejection.
-        throw new Error(`bot inbound unauthorized: ${sdkDecision.reason}`);
+        // No 401/403 available (host maps a throw → 502 and echoes the message). Throw a
+        // GENERIC "unauthorized" so no verification internals reach the caller (AC #2); the
+        // detailed reason rides on .reason for the worker to log, never surfaced (T8).
+        throw new BotInboundUnauthorizedError(sdkDecision.reason);
       }
       // 2) Defense-in-depth claims policy (audience === our app id, allowed issuer, exp/nbf).
       const policy = assertBotClaims(sdkDecision.claims, authPolicy(deps), Date.now());
       if (!policy.ok) {
         deps.log("teams bot inbound rejected (claims policy)", { reason: policy.reason });
-        throw new Error(`bot inbound unauthorized: ${policy.reason}`);
+        throw new BotInboundUnauthorizedError(policy.reason);
       }
-      // 3) Dispatch to the adapter with a captured (no-op) response — replies go via
-      // the Connector, not this inline response (host can't return a body). A malformed
-      // body throws (→ host 502) rather than dispatching an empty activity under a 200.
+      // 3) Parse the activity. A malformed body throws (→ host 502) rather than dispatching
+      // an empty activity under a 200.
       const activity = parseActivityBody(rawBody);
+      // 3b) serviceUrl binding (Bot Connector spec req #7) — the SDK does NOT check this, so
+      // bind the token to the activity's channel endpoint here (defense-in-depth). Only
+      // enforced when the token carries the claim (Emulator/Entra omit it).
+      const serviceUrlCheck = assertServiceUrl(
+        sdkDecision.claims,
+        activity && typeof activity === "object" ? (activity as Record<string, unknown>).serviceUrl : undefined,
+      );
+      if (!serviceUrlCheck.ok) {
+        deps.log("teams bot inbound rejected (serviceUrl)", { reason: serviceUrlCheck.reason });
+        throw new BotInboundUnauthorizedError(serviceUrlCheck.reason);
+      }
+      // 4) Dispatch to the adapter with a captured (no-op) response — replies go via the
+      // Connector, not this inline response (host can't return a body).
       const req = { method: "POST", headers, body: activity, user: sdkDecision.claims } as unknown as AgentsRequest;
       const res = { status: () => res, send: () => res, end: () => res, header: () => res } as unknown as AdapterResponse;
       await adapter.process(req, res, async (context) => handler.run(context));

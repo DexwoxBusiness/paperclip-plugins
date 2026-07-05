@@ -48,9 +48,29 @@ Set `botAppId`, `botTenantId` (if single-tenant), `botAppCredentialsRef`, and op
 
 ### Inbound authentication (AC #3)
 
-Every inbound Teams request carries an Entra/Bot-Framework bearer token. The plugin validates it **before** dispatching to the SDK adapter — signature/JWKS/issuer/audience via the Agents SDK, plus a defense-in-depth claims policy (`bot-auth.ts`: audience must equal `botAppId`, issuer must be allowed, token unexpired within a 5-min skew). Unauthenticated or invalid calls are **rejected** (the request is not processed).
+Every inbound Teams request carries an Entra/Bot-Framework bearer token. The plugin validates it **before** dispatching to the SDK adapter — RS256 signature / JWKS / issuer / audience / 5-min skew via the Agents SDK's `authorizeJWT` (JWKS keys are cached and refreshed by the SDK's `jwks-rsa` client, well within the Bot Connector spec's 24h bound, plus a fresh fetch on key rotation — so we don't hand-roll a JWKS cache). On top of that the plugin adds a defense-in-depth layer in `bot-auth.ts`: a claims policy (audience must equal `botAppId`, issuer must be allowed, token unexpired within a 5-min skew) **and** a `serviceUrl` binding (`assertServiceUrl` — the token's `serviceurl` claim, when present, must match the activity's `serviceUrl`, per Bot Connector spec req #7, so a leaked token can't redirect the bot's replies). Unauthenticated or invalid calls are **rejected** (the request is not processed).
 
-> **Host limitation.** The Paperclip plugin `onWebhook` returns `void` and cannot set the HTTP status or response body (the host returns 200 on success, 502 on a thrown error). Consequences: (a) auth rejection surfaces as **HTTP 502, not 401** — functionally still a rejection; (b) message replies are sent via the **Bot Connector** (proactive/`updateActivity`), not the inline HTTP response. Because of (b), interactive approvals (T7) use `Action.Submit` (which posts a normal activity) rather than `Action.Execute` Universal Actions (which would need an inline invoke response the webhook can't return), and refresh the card via the Connector — see below. No host change is required.
+> **Host limitation.** The Paperclip plugin `onWebhook` returns `void` and cannot set the HTTP status or response body (the host returns 200 on success, 502 on a thrown error). Consequences: (a) auth rejection surfaces as **HTTP 502, not 403** — functionally still a rejection (correct status pending PCLIP-41); the rejection message is a **generic `"unauthorized"`** so no verification internals leak in the 502 body, while the detailed reason is logged internally; (b) message replies are sent via the **Bot Connector** (proactive/`updateActivity`), not the inline HTTP response. Because of (b), interactive approvals (T7) use `Action.Submit` (which posts a normal activity) rather than `Action.Execute` Universal Actions (which would need an inline invoke response the webhook can't return), and refresh the card via the Connector — see below. No host change is required.
+
+## Public messaging endpoint (T8 / PCLIP-25)
+
+The Bot Connector reaches the bot at a **public HTTPS URL**, which is the plugin webhook route:
+
+```
+https://<public-host>/api/plugins/dexwox.teams-chatos/webhooks/bot-messages
+```
+
+Front the Paperclip host with a reverse proxy (Caddy or nginx) that terminates public HTTPS
+with a valid CA certificate (no self-signed) and forwards this one route to the Paperclip
+process. Full VPS setup — Caddy/nginx blocks, DNS, certificate issuance, header/body
+preservation, and verification via `paperclipai plugin target` + `curl` — is in
+[`docs/vps-messaging-endpoint.md`](docs/vps-messaging-endpoint.md).
+
+The exact URL is derived from `paperclipBaseUrl` + the static plugin id/endpoint key and is
+shown on the plugin settings page (the `messaging-endpoint` data surface), which also flags a
+missing / non-HTTPS / non-publicly-routable origin. Because the URL is static, it survives
+Paperclip restarts with **no re-provisioning** — set it once in the Azure Bot **Messaging
+endpoint** field.
 
 ## Interactive approvals (T7 / PCLIP-24)
 

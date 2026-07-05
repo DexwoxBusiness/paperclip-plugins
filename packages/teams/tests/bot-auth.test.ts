@@ -1,11 +1,50 @@
 import { describe, expect, it } from "vitest";
 import {
   assertBotClaims,
+  assertServiceUrl,
   authorizeInbound,
+  BotInboundUnauthorizedError,
   extractBearerToken,
   type BotTokenClaims,
   type InboundAuthConfig,
 } from "../src/bot-auth.js";
+
+describe("assertServiceUrl (Bot Connector spec req #7)", () => {
+  const SVC = "https://smba.trafficmanager.net/amer/";
+  it("allows when the token carries no serviceUrl claim (Emulator/Entra)", () => {
+    expect(assertServiceUrl({}, SVC)).toEqual({ ok: true });
+    expect(assertServiceUrl({ serviceurl: "  " }, SVC)).toEqual({ ok: true });
+  });
+  it("binds the lowercase `serviceurl` claim to the activity serviceUrl (trailing-slash/case-insensitive)", () => {
+    expect(assertServiceUrl({ serviceurl: SVC }, SVC)).toEqual({ ok: true });
+    expect(assertServiceUrl({ serviceurl: "https://SMBA.trafficmanager.net/amer" }, SVC)).toEqual({ ok: true });
+  });
+  it("accepts the camelCase `serviceUrl` fallback", () => {
+    expect(assertServiceUrl({ serviceUrl: SVC }, SVC)).toEqual({ ok: true });
+  });
+  it("rejects a mismatch or a missing activity serviceUrl when the claim is present", () => {
+    expect(assertServiceUrl({ serviceurl: SVC }, "https://evil.example.com/").ok).toBe(false);
+    expect(assertServiceUrl({ serviceurl: SVC }, undefined).ok).toBe(false);
+    expect(assertServiceUrl({ serviceurl: SVC }, "").ok).toBe(false);
+  });
+});
+
+describe("BotInboundUnauthorizedError", () => {
+  it("keeps a GENERIC host-facing message but carries the detailed reason (AC #2)", () => {
+    const err = new BotInboundUnauthorizedError("token verification failed: jwks 500 from https://login.botframework.com/...");
+    // The message is what the host echoes in its 502 body — must NOT leak internals.
+    expect(err.message).toBe("unauthorized");
+    // The detailed reason is available for internal logging only.
+    expect(err.reason).toContain("jwks");
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("BotInboundUnauthorizedError");
+  });
+  it("is distinguishable via instanceof (robust vs string matching)", () => {
+    const thrown: unknown = new BotInboundUnauthorizedError("issuer not allowed");
+    expect(thrown instanceof BotInboundUnauthorizedError).toBe(true);
+    expect(new Error("unauthorized") instanceof BotInboundUnauthorizedError).toBe(false);
+  });
+});
 
 const APP_ID = "11111111-2222-3333-4444-555555555555";
 const CFG: InboundAuthConfig = { audience: APP_ID };

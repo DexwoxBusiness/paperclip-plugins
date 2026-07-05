@@ -50,5 +50,9 @@ jobs:
       - name: Typecheck (all packages)
         run: pnpm -r typecheck
 
+      # Runs every package's vitest suite. This ALSO executes the no-botbuilder guard:
+      # vitest globs all packages/teams/tests/*.test.ts (including no-botbuilder.test.ts,
+      # which itself scans the whole workspace), so the ban is enforced here too — the
+      # dedicated step above is just an earlier, faster fail.
       - name: Test (all packages)
         run: pnpm -r test

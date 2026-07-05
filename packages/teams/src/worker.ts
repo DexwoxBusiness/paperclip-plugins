@@ -448,11 +448,24 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
           ctx.logger.info("teams bot: could not resolve botAppCredentialsRef (proactive send will be unauthenticated until fixed)");
         }
       }
-      // Raw auth config (clientId/tenantId/clientSecret) — bot.ts normalizes it via the
-      // SDK's getAuthConfigWithDefaults (populates the audience/connections map used by
-      // authorizeJWT, and carries clientSecret into the adapter's OUTBOUND auth). No
-      // `as never` cast: the shape matches the SDK env-loader config.
-      const authConfig = { clientId: botAppId, tenantId: (cfg.botTenantId ?? "").trim() || undefined, clientSecret };
+      // Raw auth config mapped onto the SDK's AuthConfiguration fields (verified against
+      // @microsoft/agents-hosting auth/settings.d.ts). bot.ts normalizes it via
+      // getAuthConfigWithDefaults. Every field IS used in the auth path:
+      //   - clientId   → inbound token AUDIENCE (jwt-middleware validates aud against it)
+      //   - tenantId   → inbound: builds the Entra JWKS discovery URL
+      //       (resolveAuthority(authority, tenantId)/discovery/v2.0/keys) that validates a
+      //       single-tenant token's SIGNATURE; also scopes OUTBOUND MSAL token requests.
+      //   - clientSecret → OUTBOUND (proactive) auth via the adapter's connection manager.
+      //   - issuers    → additional valid issuers accepted by the SDK validator itself, so
+      //       operator-configured extra issuers actually take effect at the crypto layer
+      //       (not just our defense-in-depth policy). Left unset when none are configured,
+      //       so the SDK keeps its defaults (Bot Framework + tenant-derived Entra issuer).
+      const authConfig = {
+        clientId: botAppId,
+        tenantId: (cfg.botTenantId ?? "").trim() || undefined,
+        clientSecret,
+        issuers: extraIssuers.length ? [...BOT_FRAMEWORK_ISSUERS, ...extraIssuers] : undefined,
+      };
       const conversations = createConversationStore({
         get: (k: string) => ctx.state.get({ scopeKind: "instance", stateKey: k }),
         set: (k: string, v: unknown) => ctx.state.set({ scopeKind: "instance", stateKey: k }, v),

@@ -5,6 +5,7 @@ import { createTeamsBot, type TeamsBot } from "./bot.js";
 import { BOT_FRAMEWORK_ISSUERS, BotInboundUnauthorizedError } from "./bot-auth.js";
 import { describeMessagingEndpoint } from "./messaging-endpoint.js";
 import { resolveSecretRef } from "./secret-resolve.js";
+import { type CommandDeps } from "./commands.js";
 import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
 import { createApprovalStore } from "./approval-store.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";

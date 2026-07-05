@@ -143,12 +143,32 @@ const manifest: PaperclipPluginManifestV1 = {
           "Consecutive failed deliveries (after retries) to a single Workflows URL before it is flagged as degraded in settings. A successful delivery clears it. Applied at plugin startup. PCLIP-22",
         default: DEFAULT_CONFIG.degradedDeliveryThreshold,
       },
+      botAppId: {
+        type: "string",
+        title: "Bot Microsoft App Id (v2)",
+        description:
+          "The Entra app (client) id of the Azure Bot. Used as the REQUIRED token audience when validating inbound Teams requests, and as the bot identity for proactive messages. PCLIP-23",
+        default: "",
+      },
+      botTenantId: {
+        type: "string",
+        title: "Bot Entra tenant id (v2, optional)",
+        description: "Entra tenant id for a single-tenant bot. Leave empty for multi-tenant. PCLIP-23",
+        default: "",
+      },
+      botAllowedIssuers: {
+        type: "string",
+        title: "Additional allowed token issuers (v2, optional)",
+        description:
+          "Comma-separated extra issuers to accept beyond the Bot Framework default (https://api.botframework.com), e.g. an Entra tenant issuer or a sovereign-cloud issuer. PCLIP-23",
+        default: "",
+      },
       botAppCredentialsRef: {
         type: "string",
         format: "secret-ref",
         title: "Bot credentials (secret reference) — v2",
         description:
-          "Entra app credentials for the Microsoft 365 Agents SDK bot. Requires the paperclip pin while upstream secret-refs are kill-switched (PAP-2394). PCLIP-26",
+          "Entra app client secret (or cert) for the Microsoft 365 Agents SDK bot, used to authenticate OUTBOUND (proactive) calls to Azure Bot Service. Requires the paperclip pin while upstream secret-refs are kill-switched (PAP-2394). PCLIP-23/26",
         default: "",
       },
     },

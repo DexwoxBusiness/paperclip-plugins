@@ -1,5 +1,8 @@
 import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
-import { DEFAULT_CONFIG, JOB_KEYS, PLUGIN_ID } from "./constants.js";
+import { DEFAULT_CONFIG, JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.js";
+import { createConversationStore } from "./bot-conversations.js";
+import { createTeamsBot, type TeamsBot } from "./bot.js";
+import { BOT_FRAMEWORK_ISSUERS } from "./bot-auth.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
 import { buildNotificationCard, channelFor, createBudgetDedupe, type ChannelKind, type TeamsNotification } from "./notifications.js";
 import { classifyWorkflowRef, resolveWorkflowRef, type TeamsInstanceConfig } from "./routing.js";
@@ -35,6 +38,8 @@ import {
  *  - PCLIP-23..28 (T6..T11) v2 bot on the Microsoft 365 Agents SDK
  */
 let context: PluginContext | undefined;
+/** Lazily-constructed v2 bot (PCLIP-23), cached across webhook deliveries. */
+let botPromise: Promise<TeamsBot> | undefined;
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
 
@@ -229,7 +234,9 @@ export default definePlugin({
 
     // Every handler is wrapped so a notification path NEVER throws into the core
     // Paperclip flow that emitted the event (AC #4).
-    const on = (eventName: string, adapt: (ev: RawPluginEvent) => TeamsNotification | null): void => {
+    // eventName is the plugin event-name union ctx.events.on expects (not a bare string),
+    // so the literal calls below type-check against the host's event catalog.
+    const on = (eventName: Parameters<typeof ctx.events.on>[0], adapt: (ev: RawPluginEvent) => TeamsNotification | null): void => {
       ctx.events.on(eventName, async (ev) => {
         try {
           const n = adapt(ev);
@@ -382,8 +389,111 @@ export default definePlugin({
   },
 
   async onWebhook(input: PluginWebhookInput): Promise<void> {
-    // TODO(PCLIP-25/T8): v2 bot messaging endpoint — validate the Entra token and
-    // route Teams activities / Action.Execute invokes.
-    context?.logger.info("teams webhook received", { endpointKey: input.endpointKey });
+    const ctx = context;
+    if (!ctx) throw new Error("teams plugin not initialized");
+    // The bot messaging endpoint (PCLIP-23). Only this endpointKey is a bot inbound;
+    // anything else is ignored (undeclared keys are already 404'd by the host).
+    if (input.endpointKey !== WEBHOOK_KEYS.botMessages) {
+      ctx.logger.info("teams webhook received (non-bot endpoint, ignored)", { endpointKey: input.endpointKey });
+      return;
+    }
+    const bot = await getBot(ctx);
+    // handleInbound authenticates the Entra/Bot-Framework token and dispatches to the
+    // Agents SDK adapter. On auth failure it THROWS — the host maps that to HTTP 502,
+    // which rejects the unauthenticated call (AC #3). The plugin webhook cannot return
+    // 401 or an inline response body (host contract), so replies go via the Connector
+    // and Action.Execute invokes (T7) await an HTTP-response-capable webhook upstream.
+    try {
+      await bot.handleInbound(input.headers, input.rawBody);
+    } catch (e) {
+      // Emit a distinct metric for AUTH rejections so operators can tell a
+      // 502-from-auth apart from a 502-from-error in monitoring (the status alone
+      // can't, given the host limitation). Never let metrics failure mask the reject.
+      const message = e instanceof Error ? e.message : String(e);
+      if (message.includes("unauthorized")) {
+        try {
+          await ctx.metrics.write("teams.bot.inbound.rejected", 1, { reason: "auth" });
+        } catch {
+          /* metrics are best-effort */
+        }
+      }
+      throw e; // re-throw so the host records the rejection (502)
+    }
   },
 });
+
+/**
+ * Build (once) the v2 Teams bot from live config: bot app id, tenant, allowed issuers,
+ * and the outbound credentials secret-ref, plus a conversation store over instance
+ * state for proactive posting. Cached in `botPromise` so the CloudAdapter/JWKS client
+ * is reused across deliveries. SDK-coupled (Agents SDK) — see bot.ts.
+ */
+function getBot(ctx: PluginContext): Promise<TeamsBot> {
+  if (!botPromise) {
+    botPromise = (async () => {
+      const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
+      const botAppId = (cfg.botAppId ?? "").trim();
+      if (!botAppId) throw new Error("bot not configured: set botAppId (Bot Microsoft App Id)");
+      const extraIssuers = (cfg.botAllowedIssuers ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      // Outbound (proactive) credentials — resolved from a secret-ref, never logged.
+      let clientSecret = "";
+      const credRef = (cfg as { botAppCredentialsRef?: string }).botAppCredentialsRef;
+      if (credRef) {
+        try {
+          clientSecret = (await ctx.secrets.resolve(credRef)) || "";
+        } catch {
+          ctx.logger.info("teams bot: could not resolve botAppCredentialsRef (proactive send will be unauthenticated until fixed)");
+        }
+      }
+      const tenantId = (cfg.botTenantId ?? "").trim() || undefined;
+      // Raw auth config mapped onto the SDK's AuthConfiguration fields (verified against
+      // @microsoft/agents-hosting auth/settings.d.ts). bot.ts normalizes it via
+      // getAuthConfigWithDefaults. Field usage in the auth path:
+      //   - clientId   → inbound token AUDIENCE (jwt-middleware verifies aud === clientId).
+      //   - tenantId   → inbound: builds the Entra JWKS discovery URL
+      //       (resolveAuthority(authority, tenantId)/discovery/v2.0/keys) that validates a
+      //       single-tenant token's SIGNATURE; also scopes OUTBOUND MSAL token requests.
+      //   - clientSecret → OUTBOUND (proactive) auth via the adapter's connection manager.
+      // Deliberately NOT setting authConfig.issuers — do NOT "restore" it (verified
+      // against the installed @microsoft/agents-hosting source):
+      //   1. jwt-middleware.js NEVER reads authConfig.issuers. Inbound validation is
+      //      audience (=== clientId) + RS256 signature (JWKS keyed off the token's OWN
+      //      iss) + expiry. Setting issuers is INERT for inbound auth.
+      //   2. getAuthConfigWithDefaults → applyDefaultSettings AUTO-FILLS issuers via
+      //      getDefaultIssuers(tenantId) = [api.botframework.com, sts.windows.net/{t}/,
+      //      login.microsoftonline.com/{t}/v2.0] when left unset. Hard-coding our own
+      //      list would OVERRIDE those SDK-computed, authority-aware defaults (the
+      //      default-set-replacement regression flagged in an earlier review). Leaving
+      //      it unset yields the correct set.
+      // The issuer allow-list that actually gates INBOUND is our assertBotClaims policy
+      // (allowedIssuers below), which mirrors getDefaultIssuers for consistency.
+      const authConfig = { clientId: botAppId, tenantId, clientSecret };
+      // Issuers accepted by assertBotClaims (the real issuer gate). Include the tenant-
+      // derived Entra issuers (v2 login.microsoftonline.com + v1 sts.windows.net) when a
+      // tenant is configured, so SINGLE-TENANT tokens pass without the operator having to
+      // list them; Teams channel/multi-tenant tokens use the Bot Framework issuer.
+      const tenantIssuers = tenantId
+        ? [`https://login.microsoftonline.com/${tenantId}/v2.0`, `https://sts.windows.net/${tenantId}/`]
+        : [];
+      const conversations = createConversationStore({
+        get: (k: string) => ctx.state.get({ scopeKind: "instance", stateKey: k }),
+        set: (k: string, v: unknown) => ctx.state.set({ scopeKind: "instance", stateKey: k }, v),
+      });
+      return createTeamsBot({
+        authConfig,
+        botAppId,
+        allowedIssuers: [...BOT_FRAMEWORK_ISSUERS, ...tenantIssuers, ...extraIssuers],
+        conversations,
+        log: (m, f) => ctx.logger.info(m, f),
+      });
+    })().catch((e) => {
+      // Don't cache a failed construction — allow a later delivery to retry once config is fixed.
+      botPromise = undefined;
+      throw e;
+    });
+  }
+  return botPromise;
+}

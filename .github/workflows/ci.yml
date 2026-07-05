@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  # Run only on pull requests targeting main — no push triggers.
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: typecheck + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # Use a frozen install (reproducible CI) ONCE a pnpm-lock.yaml is committed;
+      # until then --frozen-lockfile would fail outright (Kody), so fall back to a
+      # normal install. Committing the lockfile auto-upgrades this to frozen.
+      - name: Install dependencies
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --frozen-lockfile
+          else
+            echo "::warning::no pnpm-lock.yaml committed — installing without --frozen-lockfile; commit the lockfile for reproducible CI"
+            pnpm install --no-frozen-lockfile
+          fi
+
+      # AC #2 (PCLIP-23): fail the build if any workspace package ever (re)introduces a
+      # botbuilder / Bot Framework SDK dependency. This is the explicit CI enforcement of
+      # the ban — the no-botbuilder guard test scans the whole workspace.
+      - name: Guard — no Bot Framework SDK dependencies
+        run: pnpm --filter @dexwox/paperclip-plugin-teams test -- tests/no-botbuilder.test.ts
+
+      - name: Typecheck (all packages)
+        run: pnpm -r typecheck
+
+      # Runs every package's vitest suite. This ALSO executes the no-botbuilder guard:
+      # vitest globs all packages/teams/tests/*.test.ts (including no-botbuilder.test.ts,
+      # which itself scans the whole workspace), so the ban is enforced here too — the
+      # dedicated step above is just an earlier, faster fail.
+      - name: Test (all packages)
+        run: pnpm -r test

@@ -172,6 +172,11 @@ export interface ApprovalsClientDeps {
 export interface ApprovalDecisionResult {
   ok: boolean;
   status: number;
+  /** The approval's ACTUAL decision from the response record (may differ from the
+   *  click when it was already decided elsewhere — idempotent case). */
+  verb?: ApprovalVerb;
+  /** The decider recorded on the approval record (board identity today). */
+  decidedBy?: string;
   error?: string;
 }
 
@@ -180,7 +185,19 @@ export interface ApprovalStatusResult {
   status: number;
   /** Decision verb derived from the approval's status, when decided. */
   verb?: ApprovalVerb;
+  /** The decider recorded on the approval record. */
+  decidedBy?: string;
   error?: string;
+}
+
+/** Parse an approval record body → its actual decision verb + decider. Never throws. */
+function parseApprovalRecord(text: string): { verb?: ApprovalVerb; decidedBy?: string } {
+  try {
+    const r = JSON.parse(text) as { status?: unknown; decidedByUserId?: unknown };
+    return { verb: verbFromStatus(r.status) ?? undefined, decidedBy: str(r.decidedByUserId) };
+  } catch {
+    return {};
+  }
 }
 
 export interface ApprovalsClient {
@@ -216,8 +233,14 @@ export function createApprovalsClient(deps: ApprovalsClientDeps): ApprovalsClien
       const body = JSON.stringify({ decidedByUserId: opts.actor, decisionNote: note });
       try {
         const res = await deps.fetchFn(url, { method: "POST", headers, body });
-        if (res.status >= 200 && res.status < 300) return { ok: true, status: res.status };
         const text = await res.text().catch(() => "");
+        if (res.status >= 200 && res.status < 300) {
+          // Return the ACTUAL decision from the response record (idempotency-safe): if the
+          // approval was already decided — possibly differently — the card must reflect the
+          // real outcome, not the verb the user just clicked.
+          const rec = parseApprovalRecord(text);
+          return { ok: true, status: res.status, verb: rec.verb ?? verb, decidedBy: rec.decidedBy };
+        }
         return { ok: false, status: res.status, error: `approval ${verb} failed (${res.status})${text ? `: ${text.slice(0, 200)}` : ""}` };
       } catch (e) {
         return { ok: false, status: 0, error: e instanceof Error ? e.message : String(e) };
@@ -233,13 +256,8 @@ export function createApprovalsClient(deps: ApprovalsClientDeps): ApprovalsClien
         const res = await deps.fetchFn(url, { method: "GET", headers });
         const text = await res.text().catch(() => "");
         if (res.status < 200 || res.status >= 300) return { ok: false, status: res.status, error: `approval read failed (${res.status})` };
-        let status: unknown;
-        try {
-          status = (JSON.parse(text) as { status?: unknown }).status;
-        } catch {
-          return { ok: false, status: res.status, error: "approval read: unparseable body" };
-        }
-        return { ok: true, status: res.status, verb: verbFromStatus(status) ?? undefined };
+        const rec = parseApprovalRecord(text);
+        return { ok: true, status: res.status, verb: rec.verb, decidedBy: rec.decidedBy };
       } catch (e) {
         return { ok: false, status: 0, error: e instanceof Error ? e.message : String(e) };
       }

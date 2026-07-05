@@ -40,7 +40,9 @@ import {
   type AuthConfiguration,
   type Request as AgentsRequest,
 } from "@microsoft/agents-hosting";
-import type { Activity } from "@microsoft/agents-activity";
+// Derive Activity from the SDK's own method signature so we don't need a direct
+// @microsoft/agents-activity dependency (it's only a transitive dep of agents-hosting).
+type Activity = Parameters<TurnContext["updateActivity"]>[0];
 
 // The SDK does not export a `Response` type (in the Express example it comes from
 // `express`); derive the exact type CloudAdapter.process expects for our shims.
@@ -215,13 +217,14 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
   const handleApprovalSubmit = async (context: TurnContext, verb: ApprovalVerb, approvalId: string): Promise<void> => {
     if (!deps.approvals) return;
     const actor = teamsActor(context.activity.from?.aadObjectId);
-    const byName = context.activity.from?.name || actor;
-    // Explicitly wire a human-readable decisionNote (AC #4 interim attribution): the note
-    // records who acted from Teams (display name + actor id) while the formal audit actor
-    // stays the board key until a host change lands. actor is also sent as decidedByUserId.
+    // Sanitize the Teams display name before it goes into a decisionNote the Paperclip
+    // audit UI may render (Kody, security): strip HTML/quote/control chars and cap length.
+    // The actor id is a GUID-based teams:{aadObjectId} and is safe as-is.
+    const safeName = sanitizeDisplayName(context.activity.from?.name);
+    const noteName = safeName || actor;
     const result = await deps.approvals.client.decide(verb, approvalId, {
       actor,
-      decisionNote: `Teams approval ${verb} by ${byName} (${actor})`,
+      decisionNote: `Teams approval ${verb} by ${noteName} (${actor})`,
     });
     const stored = await deps.approvals.store.get(approvalId);
     if (!result.ok) {
@@ -246,11 +249,23 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     // (whose payload doesn't carry the outcome). Update in place + forget the ref so the
     // subsequent approval.decided event is a no-op for this card.
     if (stored?.activityId) {
-      // The card shows the raw display name (or nothing) — cleaner than the opaque actor id.
-      const decided = buildDecidedCard(verb, { byName: context.activity.from?.name, title: stored.title });
+      // Refresh with the ACTUAL decision from the server (idempotency-safe): if the approval
+      // was already decided elsewhere — possibly differently — show the true outcome, not the
+      // verb this user just clicked. Attribute to the clicker only when their action was the
+      // one applied; otherwise show the state without a (misleading) name.
+      const actualVerb = result.verb ?? verb;
+      const decidedByName = actualVerb === verb ? safeName : undefined;
+      const decided = buildDecidedCard(actualVerb, { byName: decidedByName, title: stored.title });
       await context.updateActivity({ ...cardActivity(decided), id: stored.activityId } as Activity);
       await deps.approvals.store.forget(approvalId);
     }
+  };
+
+  /** Strip HTML/quote/control chars from a user-controlled display name; cap length. */
+  const sanitizeDisplayName = (name?: string): string | undefined => {
+    if (!name) return undefined;
+    const cleaned = name.replace(/[<>&"'`\r\n\t]/g, "").trim().slice(0, 120);
+    return cleaned || undefined;
   };
 
   return {
@@ -333,7 +348,8 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
         deps.log("teams approval.decided: could not resolve outcome", { approvalId: input.approvalId, status: status.status, error: status.error });
         return false;
       }
-      const decided = buildDecidedCard(status.verb, { byName: input.byName, title: stored.title });
+      // Prefer the decider from the event; fall back to the record's decidedBy (getStatus).
+      const decided = buildDecidedCard(status.verb, { byName: input.byName ?? status.decidedBy, title: stored.title });
       await adapter.continueConversation(deps.botAppId, stored.conversationReference as never, async (ctx) => {
         await ctx.updateActivity({ type: "message", id: stored.activityId, attachments: [CardFactory.adaptiveCard(decided)] } as Activity);
       });

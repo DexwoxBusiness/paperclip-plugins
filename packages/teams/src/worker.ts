@@ -605,12 +605,64 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
         }),
         store: createApprovalStore(stateBackend),
       };
+      // PCLIP-27 (T10): @Paperclip command data, backed by ctx reads. Company resolved once
+      // (first visible company — matches the Slack plugin's fallback). Empty company or a
+      // read failure yields empty lists → the cards render their no-data state, never silence.
+      let cachedCompanyId: string | undefined;
+      const resolveCompanyId = async (): Promise<string> => {
+        if (cachedCompanyId === undefined) {
+          const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+          cachedCompanyId = companies[0]?.id ?? "";
+        }
+        return cachedCompanyId;
+      };
+      const commands: CommandDeps = {
+        listAgents: async () => {
+          const cid = await resolveCompanyId();
+          if (!cid) return [];
+          const agents = await ctx.agents.list({ companyId: cid, limit: 100, offset: 0 });
+          return agents.map((a) => ({ name: a.name, status: a.status }));
+        },
+        listRecentCompletions: async () => {
+          const cid = await resolveCompanyId();
+          if (!cid) return [];
+          const issues = await ctx.issues.list({ companyId: cid, status: "done", limit: 5, offset: 0 });
+          return issues.map((i) => ({ title: i.title ?? "(untitled)", status: i.status ?? "done" }));
+        },
+        listIssues: async (filter) => {
+          const cid = await resolveCompanyId();
+          if (!cid) return [];
+          const status = filter === "done" ? ("done" as const) : filter === "open" ? ("todo" as const) : undefined;
+          const issues = await ctx.issues.list({ companyId: cid, status, limit: 10, offset: 0 });
+          return issues.map((i) => ({
+            title: i.title ?? "(untitled)",
+            status: i.status ?? "",
+            url: buildDeepLink(
+              { kind: "issue-created", issueId: i.id, issueIdentifier: i.identifier ?? undefined, title: i.title ?? "" },
+              { baseUrl: cfg.paperclipBaseUrl ?? "", companyPrefix: cfg.paperclipCompanyPrefix },
+            ),
+          }));
+        },
+        // approve is enabled only when a Paperclip base URL is set (approvals reachable);
+        // otherwise omit it so the command replies with the polite "not enabled" card.
+        approve: (cfg.paperclipBaseUrl ?? "").trim()
+          ? async (approvalId) => {
+              const r = await approvals.client.decide("approve", approvalId, { actor: "teams:command" });
+              return { ok: r.ok, verb: r.verb, error: r.error };
+            }
+          : undefined,
+      };
       return createTeamsBot({
         authConfig,
         botAppId,
         allowedIssuers: [...BOT_FRAMEWORK_ISSUERS, ...tenantIssuers, ...extraIssuers],
         conversations,
         approvals,
+        commands,
+        onCommand: (command) => {
+          // Best-effort metric (parity with Slack's slack.commands.handled); never blocks.
+          void ctx.metrics.write("teams.commands.handled", 1, { command }).catch(() => undefined);
+        },
         log: (m, f) => ctx.logger.info(m, f),
       });
     })().catch((e) => {

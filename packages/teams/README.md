@@ -88,6 +88,20 @@ When the bot is configured, approval cards can carry **Approve / Reject** button
 
 **Actor attribution.** The acting Teams user (`teams:{aadObjectId}`) is sent to the approval API and recorded in the decision note. The approval route currently attributes the formal audit actor to the board key; recording the Teams user as the *audit actor* would require a Paperclip route change and is tracked separately.
 
+## @Paperclip commands (T10 / PCLIP-27)
+
+Once the bot is installed in a channel or chat, **@mention it with a command** and it replies with an Adaptive Card. Parity with the Slack plugin's `/clip` commands:
+
+- **`@Paperclip status`** — active agents + recent completions.
+- **`@Paperclip agents`** — all agents with status badges.
+- **`@Paperclip issues [open|done]`** — issues (default all) with `Action.OpenUrl` deep links.
+- **`@Paperclip approve <id>`** — approve a pending approval via the board key.
+- **`@Paperclip help`** — the command list. **Any unknown or empty command also shows help — the bot never stays silent.**
+
+**How it works.** Commands arrive as message activities; the plugin strips the `<at>…</at>` mention, parses the first word, and reads data via `ctx.agents.list` / `ctx.issues.list` (company resolved via `ctx.companies.list`). Replies go back as cards through the Bot Connector. A `teams.commands.handled{command}` metric is emitted per command. Entirely plugin-side — no Paperclip changes.
+
+**`approve` authorization (board-key parity).** There is **no per-sender allowlist** — any member of a channel where the bot is installed can approve, exactly like the Slack/Discord plugins; the board API key (`paperclipBoardApiKeyRef`) plus Paperclip's own governance is the security boundary. If approvals aren't reachable (no `paperclipBaseUrl`) the bot replies with a polite "approvals aren't enabled here" card; if the API rejects the id, a polite failure card. To restrict approvals to specific people, a per-user allowlist can be added later (tracked follow-up).
+
 ## Backlog
 
 PCLIP-18 … PCLIP-28. Pattern credit: [paperclip-plugin-slack](https://github.com/mvanhorn/paperclip-plugin-slack).

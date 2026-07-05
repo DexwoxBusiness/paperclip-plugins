@@ -50,7 +50,23 @@ Set `botAppId`, `botTenantId` (if single-tenant), `botAppCredentialsRef`, and op
 
 Every inbound Teams request carries an Entra/Bot-Framework bearer token. The plugin validates it **before** dispatching to the SDK adapter — signature/JWKS/issuer/audience via the Agents SDK, plus a defense-in-depth claims policy (`bot-auth.ts`: audience must equal `botAppId`, issuer must be allowed, token unexpired within a 5-min skew). Unauthenticated or invalid calls are **rejected** (the request is not processed).
 
-> **Host limitation.** The Paperclip plugin `onWebhook` returns `void` and cannot set the HTTP status or response body (the host returns 200 on success, 502 on a thrown error). Consequences: (a) auth rejection surfaces as **HTTP 502, not 401** — functionally still a rejection; (b) message replies are sent via the **Bot Connector** (proactive), not the inline HTTP response; (c) `invoke` activities that require an **inline** response body — notably `Action.Execute` Universal Actions for in-place card updates (T7/PCLIP-24) — are **blocked** until the host exposes an HTTP-response-capable webhook. This is tracked as a host dependency on PCLIP-23/24.
+> **Host limitation.** The Paperclip plugin `onWebhook` returns `void` and cannot set the HTTP status or response body (the host returns 200 on success, 502 on a thrown error). Consequences: (a) auth rejection surfaces as **HTTP 502, not 401** — functionally still a rejection; (b) message replies are sent via the **Bot Connector** (proactive/`updateActivity`), not the inline HTTP response. Because of (b), interactive approvals (T7) use `Action.Submit` (which posts a normal activity) rather than `Action.Execute` Universal Actions (which would need an inline invoke response the webhook can't return), and refresh the card via the Connector — see below. No host change is required.
+
+## Interactive approvals (T7 / PCLIP-24)
+
+When the bot is configured, approval cards can carry **Approve / Reject** buttons that act directly from Teams. This is **entirely plugin-side** (no Paperclip changes), mirroring `paperclip-plugin-discord`.
+
+**How it works.** The buttons are `Action.Submit` (a click posts a bot activity, no invoke-response contract). On click the plugin calls the Paperclip approval REST API (`POST /api/approvals/{id}/approve|reject`) and refreshes the card in place to "Approved/Rejected by {name}" via the Bot Connector (`updateActivity`). A decision made elsewhere (Paperclip UI, another channel) arrives as the `approval.decided` event; since that event doesn't carry the outcome, the plugin reads it with `GET /api/approvals/{id}`. Idempotency/governance stay in Paperclip (a second click can't double-approve).
+
+**Delivery is additive ("both").** The existing Workflows approval notification is unchanged; the interactive bot card is posted **in addition**, only when both `botAppId` and `botApprovalsConversationId` are set.
+
+**To enable:**
+
+1. Store your Paperclip **board API key** in the secret provider and put the secret-ref in **`paperclipBoardApiKeyRef`** (optional in `local_trusted` deployments where board access is implicit).
+2. Set **`botApprovalsConversationId`** to the Teams conversation id where interactive approvals should be posted. **The bot must already be installed in that conversation** (it needs a stored conversation reference to post and update). Leave empty to keep approvals Workflows-only.
+3. Ensure `paperclipBaseUrl` is set (the REST calls and the card's "View" link use it).
+
+**Actor attribution.** The acting Teams user (`teams:{aadObjectId}`) is sent to the approval API and recorded in the decision note. The approval route currently attributes the formal audit actor to the board key; recording the Teams user as the *audit actor* would require a Paperclip route change and is tracked separately.
 
 ## Backlog
 

@@ -44,6 +44,8 @@ export interface TeamsInstanceConfig extends TeamsUrlConfig {
   botTenantId?: string;
   /** Extra allowed token issuers (comma-separated) beyond the Bot Framework default. PCLIP-23 */
   botAllowedIssuers?: string;
+  /** Entra client secret (secret-ref) for OUTBOUND/proactive bot auth. PCLIP-23/26 */
+  botAppCredentialsRef?: string;
   /** Board API key secret-ref for interactive approval REST calls. PCLIP-24 */
   paperclipBoardApiKeyRef?: string;
   /** Conversation id the bot posts interactive approval cards to (empty = off). PCLIP-24 */

@@ -7,6 +7,7 @@ export * from "./delivery-health.js";
 export * from "./bot-auth.js";
 export * from "./bot-conversations.js";
 export * from "./messaging-endpoint.js";
+export * from "./secret-resolve.js";
 export * from "./approvals.js";
 export * from "./approval-store.js";
 export * from "./event-adapters.js";

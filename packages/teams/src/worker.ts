@@ -317,8 +317,14 @@ export default definePlugin({
     // called the REST API), refresh the interactive card in place via the bot
     // (updateActivity) — the event-driven path that mirrors Discord's editMessage. Only
     // acts when the bot is configured and we posted an interactive card for this approval.
-    // NOTE: the exact approval.decided payload shape is extracted defensively below and
-    // should be reconfirmed against the host at integration (see PCLIP-24 description).
+    //
+    // There is exactly ONE plugin event for a decision: `approval.decided`. The activity
+    // ACTIONS `approval.approved` / `approval.rejected` (and `approval.revision_requested`)
+    // all map to it (verified in host activity-log.ts) — they are NOT plugin events and are
+    // NOT in PLUGIN_EVENT_TYPES, so `ctx.events.on("approval.approved", …)` is a compile
+    // error. Do NOT add handlers for them; the outcome is read via getStatus below.
+    // NOTE: the exact approval.decided payload shape is extracted defensively and should be
+    // reconfirmed against the host at integration (see PCLIP-24 description).
     ctx.events.on("approval.decided", async (ev) => {
       try {
         const ref = extractDecidedApprovalRef(ev);
@@ -343,6 +349,9 @@ export default definePlugin({
     // Approved/Rejected in place. Only when the bot is configured AND an approvals
     // conversation is set (the bot must already be installed there). Separate try/catch
     // so a bot-post failure never affects the Workflows notification.
+    // approval.created semantically means a NEW pending approval, so we post the actionable
+    // card without a pre-check; if it was decided in the tiny window before posting, the
+    // approval.decided handler above refreshes it to the decided state (self-healing).
     ctx.events.on("approval.created", async (ev) => {
       try {
         const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
@@ -541,6 +550,11 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
       // often runs on localhost and ctx.http rejects private/reserved IPs (same reason the
       // Discord plugin uses native fetch). The base URL is the same paperclipBaseUrl used
       // for deep links.
+      //
+      // local_trusted vs production is distinguished by whether the ref is SET, not by a
+      // mode flag the plugin can't see: NO ref → intentionally unauthenticated (local_trusted),
+      // no warning, Authorization header omitted; ref SET but unresolvable → a real
+      // misconfiguration, so we warn. The host decides whether the key is actually required.
       let boardApiKey: string | undefined;
       const boardRef = (cfg as { paperclipBoardApiKeyRef?: string }).paperclipBoardApiKeyRef;
       if (boardRef) {

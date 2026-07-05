@@ -190,7 +190,15 @@ export interface ApprovalStatusResult {
   error?: string;
 }
 
-/** Parse an approval record body → its actual decision verb + decider. Never throws. */
+/**
+ * Parse an approval record body → its actual decision verb + decider. Never throws.
+ *
+ * NOTE (audit-actor parity): `decidedByUserId` here is the identity the SERVER recorded,
+ * which today is the BOARD key — the approve/reject route ignores a caller-supplied actor
+ * (verified: it uses `req.actor.userId ?? "board"`). So `decidedBy` is NOT the Teams user;
+ * the Teams user is carried in `decisionNote` until a host change accepts a caller actor
+ * (tracked as the PCLIP-24 audit-actor host dependency).
+ */
 function parseApprovalRecord(text: string): { verb?: ApprovalVerb; decidedBy?: string } {
   try {
     const r = JSON.parse(text) as { status?: unknown; decidedByUserId?: unknown };

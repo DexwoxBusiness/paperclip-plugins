@@ -48,6 +48,13 @@ let botPromise: Promise<TeamsBot> | undefined;
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
 
+/**
+ * Terminal (closed) issue statuses. "open" for the @Paperclip issues command = every status
+ * NOT in this set (backlog/todo/in_progress/in_review/blocked all count as open). Kept as a
+ * named set so the open filter stays correct if the IssueStatus model gains terminal states.
+ */
+const TERMINAL_ISSUE_STATUSES: ReadonlySet<string> = new Set(["done", "cancelled"]);
+
 /** Plugin-state key: the date (server-local) the digest last posted, for once-a-day throttling. */
 const DIGEST_LAST_RUN_DATE_KEY = "digest:last-run-date";
 
@@ -642,7 +649,7 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
             filter === "done"
               ? await ctx.issues.list({ companyId: cid, status: "done", limit: 10, offset: 0 })
               : await ctx.issues.list({ companyId: cid, limit: 50, offset: 0 });
-          const kept = filter === "open" ? raw.filter((i) => i.status !== "done" && i.status !== "cancelled") : raw;
+          const kept = filter === "open" ? raw.filter((i) => !TERMINAL_ISSUE_STATUSES.has(i.status)) : raw;
           return kept.slice(0, 10).map((i) => ({
             title: i.title ?? "(untitled)",
             status: i.status ?? "",

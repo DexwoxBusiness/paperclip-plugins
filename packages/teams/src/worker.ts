@@ -4,6 +4,7 @@ import { createConversationStore } from "./bot-conversations.js";
 import { createTeamsBot, type TeamsBot } from "./bot.js";
 import { BOT_FRAMEWORK_ISSUERS, BotInboundUnauthorizedError } from "./bot-auth.js";
 import { describeMessagingEndpoint } from "./messaging-endpoint.js";
+import { resolveSecretRef } from "./secret-resolve.js";
 import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
 import { createApprovalStore } from "./approval-store.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
@@ -529,16 +530,16 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
-      // Outbound (proactive) credentials — resolved from a secret-ref, never logged.
-      let clientSecret = "";
-      const credRef = (cfg as { botAppCredentialsRef?: string }).botAppCredentialsRef;
-      if (credRef) {
-        try {
-          clientSecret = (await ctx.secrets.resolve(credRef)) || "";
-        } catch {
-          ctx.logger.info("teams bot: could not resolve botAppCredentialsRef (proactive send will be unauthenticated until fixed)");
-        }
-      }
+      // Outbound (proactive) credentials — resolved from a secret-ref via the leak-safe helper
+      // (PCLIP-26): held in memory only, never logged/persisted; a failed resolve logs only the
+      // error class. `unset` (no ref) is intentional — proactive send stays unauthenticated.
+      const cred = await resolveSecretRef(
+        (r) => ctx.secrets.resolve(r),
+        cfg.botAppCredentialsRef,
+        (m, f) => ctx.logger.info(m, f),
+        "teams bot: could not resolve botAppCredentialsRef (proactive send will be unauthenticated until fixed)",
+      );
+      const clientSecret = cred.value;
       const tenantId = (cfg.botTenantId ?? "").trim() || undefined;
       // Raw auth config mapped onto the SDK's AuthConfiguration fields (verified against
       // @microsoft/agents-hosting auth/settings.d.ts). bot.ts normalizes it via
@@ -584,15 +585,13 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
       // mode flag the plugin can't see: NO ref → intentionally unauthenticated (local_trusted),
       // no warning, Authorization header omitted; ref SET but unresolvable → a real
       // misconfiguration, so we warn. The host decides whether the key is actually required.
-      let boardApiKey: string | undefined;
-      const boardRef = (cfg as { paperclipBoardApiKeyRef?: string }).paperclipBoardApiKeyRef;
-      if (boardRef) {
-        try {
-          boardApiKey = (await ctx.secrets.resolve(boardRef)) || undefined;
-        } catch {
-          ctx.logger.info("teams approvals: could not resolve paperclipBoardApiKeyRef (approve/reject may be unauthenticated)");
-        }
-      }
+      const board = await resolveSecretRef(
+        (r) => ctx.secrets.resolve(r),
+        cfg.paperclipBoardApiKeyRef,
+        (m, f) => ctx.logger.info(m, f),
+        "teams approvals: could not resolve paperclipBoardApiKeyRef (approve/reject may be unauthenticated)",
+      );
+      const boardApiKey = board.value || undefined;
       const approvals = {
         client: createApprovalsClient({
           baseUrl: cfg.paperclipBaseUrl ?? "",

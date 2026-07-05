@@ -40,11 +40,19 @@ Caddy auto-provisions and renews a Let's Encrypt certificate over ACME, which sa
 ```caddyfile
 teams-bot.example.com {
     # Automatic HTTPS (Let's Encrypt) — public CA, auto-renewed.
-    reverse_proxy /api/plugins/dexwox.teams-chatos/webhooks/bot-messages 127.0.0.1:3100 {
-        header_up X-Forwarded-Proto https
+    #
+    # Wrap in `route` so directives run in WRITTEN order. Caddy's default directive order
+    # sorts `respond` BEFORE `reverse_proxy`, so a matcher-less `respond 404` would answer
+    # every request (including the webhook path) before the proxy could — breaking delivery.
+    # Inside `route`, the path-matched reverse_proxy runs first and only non-webhook paths
+    # fall through to the 404.
+    route {
+        reverse_proxy /api/plugins/dexwox.teams-chatos/webhooks/bot-messages 127.0.0.1:3100 {
+            header_up X-Forwarded-Proto https
+        }
+        # Nothing else is served publicly.
+        respond 404
     }
-    # Nothing else is served publicly.
-    respond 404
 }
 ```
 

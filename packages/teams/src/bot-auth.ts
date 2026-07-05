@@ -34,6 +34,14 @@ export interface BotTokenClaims {
   /** Calling app id (Bot Framework: the bot's app id). */
   appid?: string;
   azp?: string;
+  /**
+   * The channel endpoint the token is bound to. Bot Connector channel tokens emit this as
+   * the LOWERCASE claim `serviceurl` (BotBuilder `AuthenticationConstants.ServiceUrlClaim`);
+   * the camelCase `serviceUrl` is accepted as a fallback for tolerant issuers. Absent on
+   * Emulator / some single-tenant Entra tokens.
+   */
+  serviceurl?: string;
+  serviceUrl?: string;
   [claim: string]: unknown;
 }
 
@@ -127,6 +135,34 @@ export function assertBotClaims(claims: BotTokenClaims, config: InboundAuthConfi
     return { ok: false, reason: `token not yet valid` };
   }
   return { ok: true, claims };
+}
+
+/**
+ * Defense-in-depth serviceUrl binding — Bot Connector auth spec, Connector→Bot requirement
+ * #7 ("the token contains a `serviceUrl` claim whose value matches the `serviceUrl` at the
+ * root of the Activity"). Binding the token to the channel endpoint means a leaked/replayed
+ * token can't be pointed at an attacker-controlled `serviceUrl` to hijack the bot's replies.
+ *
+ * The SDK's inbound `authorizeJWT` validates audience/issuer/RS256/expiry but does NOT check
+ * serviceUrl (verified against @microsoft/agents-hosting jwt-middleware.js), so we enforce it
+ * here. The claim is only present on Bot Connector channel tokens — Emulator / some
+ * single-tenant Entra tokens omit it — so we bind ONLY when the claim is present (absent →
+ * allowed, exactly like the optional `nbf`). Comparison is trailing-slash- and
+ * case-insensitive, since serviceUrls are emitted inconsistently with a trailing slash.
+ */
+export function assertServiceUrl(
+  claims: BotTokenClaims,
+  activityServiceUrl: unknown,
+): { ok: true } | { ok: false; reason: string } {
+  const rawClaim = typeof claims.serviceurl === "string" ? claims.serviceurl : claims.serviceUrl;
+  const claim = typeof rawClaim === "string" ? rawClaim.trim() : "";
+  if (!claim) return { ok: true }; // no serviceUrl claim to bind (Emulator / Entra)
+  const activityUrl = typeof activityServiceUrl === "string" ? activityServiceUrl.trim() : "";
+  const norm = (u: string): string => u.replace(/\/+$/, "").toLowerCase();
+  if (!activityUrl || norm(claim) !== norm(activityUrl)) {
+    return { ok: false, reason: `serviceUrl claim does not match the activity serviceUrl` };
+  }
+  return { ok: true };
 }
 
 /**

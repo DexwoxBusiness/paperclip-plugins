@@ -1,12 +1,33 @@
 import { describe, expect, it } from "vitest";
 import {
   assertBotClaims,
+  assertServiceUrl,
   authorizeInbound,
   BotInboundUnauthorizedError,
   extractBearerToken,
   type BotTokenClaims,
   type InboundAuthConfig,
 } from "../src/bot-auth.js";
+
+describe("assertServiceUrl (Bot Connector spec req #7)", () => {
+  const SVC = "https://smba.trafficmanager.net/amer/";
+  it("allows when the token carries no serviceUrl claim (Emulator/Entra)", () => {
+    expect(assertServiceUrl({}, SVC)).toEqual({ ok: true });
+    expect(assertServiceUrl({ serviceurl: "  " }, SVC)).toEqual({ ok: true });
+  });
+  it("binds the lowercase `serviceurl` claim to the activity serviceUrl (trailing-slash/case-insensitive)", () => {
+    expect(assertServiceUrl({ serviceurl: SVC }, SVC)).toEqual({ ok: true });
+    expect(assertServiceUrl({ serviceurl: "https://SMBA.trafficmanager.net/amer" }, SVC)).toEqual({ ok: true });
+  });
+  it("accepts the camelCase `serviceUrl` fallback", () => {
+    expect(assertServiceUrl({ serviceUrl: SVC }, SVC)).toEqual({ ok: true });
+  });
+  it("rejects a mismatch or a missing activity serviceUrl when the claim is present", () => {
+    expect(assertServiceUrl({ serviceurl: SVC }, "https://evil.example.com/").ok).toBe(false);
+    expect(assertServiceUrl({ serviceurl: SVC }, undefined).ok).toBe(false);
+    expect(assertServiceUrl({ serviceurl: SVC }, "").ok).toBe(false);
+  });
+});
 
 describe("BotInboundUnauthorizedError", () => {
   it("keeps a GENERIC host-facing message but carries the detailed reason (AC #2)", () => {

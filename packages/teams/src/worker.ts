@@ -234,7 +234,9 @@ export default definePlugin({
 
     // Every handler is wrapped so a notification path NEVER throws into the core
     // Paperclip flow that emitted the event (AC #4).
-    const on = (eventName: string, adapt: (ev: RawPluginEvent) => TeamsNotification | null): void => {
+    // eventName is the plugin event-name union ctx.events.on expects (not a bare string),
+    // so the literal calls below type-check against the host's event catalog.
+    const on = (eventName: Parameters<typeof ctx.events.on>[0], adapt: (ev: RawPluginEvent) => TeamsNotification | null): void => {
       ctx.events.on(eventName, async (ev) => {
         try {
           const n = adapt(ev);

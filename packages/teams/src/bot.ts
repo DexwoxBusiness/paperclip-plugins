@@ -14,7 +14,7 @@
  *     JWKS signature/issuer/audience validation and sets `req.user`. `process()` alone
  *     permits ANONYMOUS identity, so we must authenticate before dispatch (AC #3).
  *   - `ActivityHandler` (`onMessage`, `onConversationUpdate`, `run(context)`);
- *     `TurnContext.getConversationReference(activity)` for proactive.
+ *     `context.activity.getConversationReference()` for proactive.
  *   - Bot Framework SDK (`botbuilder`) is RETIRED and MUST NOT be used (AC #2).
  *
  * HOST CONSTRAINT (verified against tools/paperclip): the plugin `onWebhook` returns
@@ -33,13 +33,16 @@
 import {
   ActivityHandler,
   CloudAdapter,
+  TurnContext,
   authorizeJWT,
   getAuthConfigWithDefaults,
   type AuthConfiguration,
   type Request as AgentsRequest,
-  type Response as AgentsResponse,
-  type TurnContext,
 } from "@microsoft/agents-hosting";
+
+// The SDK does not export a `Response` type (in the Express example it comes from
+// `express`); derive the exact type CloudAdapter.process expects for our shims.
+type AdapterResponse = Parameters<CloudAdapter["process"]>[1];
 import { assertBotClaims, extractBearerToken, type AuthDecision, type BotTokenClaims, type InboundAuthConfig } from "./bot-auth.js";
 import { conversationKey, type ConversationRef, type ConversationStore } from "./bot-conversations.js";
 
@@ -96,19 +99,19 @@ function verifyViaSdk(authConfig: AuthConfiguration, authorization: string | str
         resolve(decision);
       }
     };
-    const res = {
-      status(code: number) {
-        if (code >= 400) finish({ ok: false, reason: `token verification failed (status ${code})` });
-        return this;
-      },
-      end() {
-        finish({ ok: false, reason: "token verification failed" });
-        return this;
-      },
-      send() {
-        return this.end();
-      },
-    } as unknown as AgentsResponse;
+    // Minimal Express-style response shim for the authorizeJWT middleware. Any status
+    // >= 400 or a terminal end/send means the middleware rejected the token. Methods
+    // are self-contained (no `this`) so the shim types cleanly.
+    const res: Record<string, (...args: unknown[]) => unknown> = {};
+    res.status = (code: unknown) => {
+      if (typeof code === "number" && code >= 400) finish({ ok: false, reason: `token verification failed (status ${code})` });
+      return res;
+    };
+    res.end = () => {
+      finish({ ok: false, reason: "token verification failed" });
+      return res;
+    };
+    res.send = () => res.end();
     // Express error-first `next(err?)`: an error means verification failed; no error
     // means authenticated (claims on req.user).
     const next = (err?: unknown) => {
@@ -152,7 +155,8 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
   // (AC #1). Both a message and a conversationUpdate (bot added to a team) carry a
   // usable ConversationReference.
   const rememberFrom = async (context: TurnContext): Promise<void> => {
-    const reference = context.getConversationReference(context.activity) as unknown as ConversationRef;
+    // getConversationReference() is an instance method on the ACTIVITY (agents-activity).
+    const reference = context.activity.getConversationReference() as unknown as ConversationRef;
     const key = conversationKey(reference);
     if (key) await deps.conversations.remember(reference);
   };
@@ -192,8 +196,8 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       // the Connector, not this inline response (host can't return a body). A malformed
       // body throws (→ host 502) rather than dispatching an empty activity under a 200.
       const activity = parseActivityBody(rawBody);
-      const req = { headers, body: activity, user: sdkDecision.claims } as unknown as AgentsRequest;
-      const res = { status: () => res, send: () => res, end: () => res, header: () => res } as unknown as AgentsResponse;
+      const req = { method: "POST", headers, body: activity, user: sdkDecision.claims } as unknown as AgentsRequest;
+      const res = { status: () => res, send: () => res, end: () => res, header: () => res } as unknown as AdapterResponse;
       await adapter.process(req, res, async (context) => handler.run(context));
     },
     // Proactive-send CAPABILITY (AC #1 "can post proactively"). The trigger that calls

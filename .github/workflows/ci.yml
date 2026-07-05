@@ -1,9 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: [test_1]
+  # Run only on pull requests targeting main — no push triggers.
   pull_request:
+    branches: [main]
 
 # Cancel superseded runs on the same ref to save runner minutes.
 concurrency:

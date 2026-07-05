@@ -47,7 +47,7 @@ type Activity = Parameters<TurnContext["updateActivity"]>[0];
 // The SDK does not export a `Response` type (in the Express example it comes from
 // `express`); derive the exact type CloudAdapter.process expects for our shims.
 type AdapterResponse = Parameters<CloudAdapter["process"]>[1];
-import { assertBotClaims, extractBearerToken, type AuthDecision, type BotTokenClaims, type InboundAuthConfig } from "./bot-auth.js";
+import { assertBotClaims, BotInboundUnauthorizedError, extractBearerToken, type AuthDecision, type BotTokenClaims, type InboundAuthConfig } from "./bot-auth.js";
 import { conversationKey, type ConversationRef, type ConversationStore } from "./bot-conversations.js";
 import {
   buildApprovalCard,
@@ -278,14 +278,16 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       const sdkDecision = await verifyViaSdk(authConfig, authorization);
       if (!sdkDecision.ok) {
         deps.log("teams bot inbound rejected (auth)", { reason: sdkDecision.reason });
-        // No 401 available (host maps a throw → 502); throwing is the only rejection.
-        throw new Error(`bot inbound unauthorized: ${sdkDecision.reason}`);
+        // No 401/403 available (host maps a throw → 502 and echoes the message). Throw a
+        // GENERIC "unauthorized" so no verification internals reach the caller (AC #2); the
+        // detailed reason rides on .reason for the worker to log, never surfaced (T8).
+        throw new BotInboundUnauthorizedError(sdkDecision.reason);
       }
       // 2) Defense-in-depth claims policy (audience === our app id, allowed issuer, exp/nbf).
       const policy = assertBotClaims(sdkDecision.claims, authPolicy(deps), Date.now());
       if (!policy.ok) {
         deps.log("teams bot inbound rejected (claims policy)", { reason: policy.reason });
-        throw new Error(`bot inbound unauthorized: ${policy.reason}`);
+        throw new BotInboundUnauthorizedError(policy.reason);
       }
       // 3) Dispatch to the adapter with a captured (no-op) response — replies go via
       // the Connector, not this inline response (host can't return a body). A malformed

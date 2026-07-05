@@ -35,7 +35,7 @@ const manifest: PaperclipPluginManifestV1 = {
       endpointKey: WEBHOOK_KEYS.botMessages,
       displayName: "Teams bot messaging endpoint",
       description:
-        "v2: receives Teams activities (messages, Action.Execute invokes) via the reverse-proxied public HTTPS endpoint. PCLIP-25",
+        "v2: receives Teams activities (message activities incl. Action.Submit card posts) via the reverse-proxied public HTTPS endpoint. The host returns a fixed 200/502 envelope and discards any worker return value, so this endpoint CANNOT emit an inline InvokeResponse body — Action.Execute/invoke flows are out of scope (T7 uses Action.Submit for this reason); replies go via the Bot Connector. PCLIP-25",
     },
   ],
   jobs: [

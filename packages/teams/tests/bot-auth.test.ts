@@ -2,10 +2,28 @@ import { describe, expect, it } from "vitest";
 import {
   assertBotClaims,
   authorizeInbound,
+  BotInboundUnauthorizedError,
   extractBearerToken,
   type BotTokenClaims,
   type InboundAuthConfig,
 } from "../src/bot-auth.js";
+
+describe("BotInboundUnauthorizedError", () => {
+  it("keeps a GENERIC host-facing message but carries the detailed reason (AC #2)", () => {
+    const err = new BotInboundUnauthorizedError("token verification failed: jwks 500 from https://login.botframework.com/...");
+    // The message is what the host echoes in its 502 body — must NOT leak internals.
+    expect(err.message).toBe("unauthorized");
+    // The detailed reason is available for internal logging only.
+    expect(err.reason).toContain("jwks");
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("BotInboundUnauthorizedError");
+  });
+  it("is distinguishable via instanceof (robust vs string matching)", () => {
+    const thrown: unknown = new BotInboundUnauthorizedError("issuer not allowed");
+    expect(thrown instanceof BotInboundUnauthorizedError).toBe(true);
+    expect(new Error("unauthorized") instanceof BotInboundUnauthorizedError).toBe(false);
+  });
+});
 
 const APP_ID = "11111111-2222-3333-4444-555555555555";
 const CFG: InboundAuthConfig = { audience: APP_ID };

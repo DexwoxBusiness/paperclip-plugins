@@ -63,6 +63,28 @@ export interface InboundAuthConfig {
 
 export type AuthDecision = { ok: true; claims: BotTokenClaims } | { ok: false; reason: string };
 
+/**
+ * Rejection of an inbound bot call (PCLIP-25 / T8, AC #2).
+ *
+ * The plugin webhook route has NO way to return an HTTP 401/403 body — the host maps any
+ * worker throw to a fixed `502 {status:"failed", error: <thrown message>}` and echoes that
+ * message back to the caller. To avoid leaking verification internals (SDK/JWKS text,
+ * expected audience, issuer lists) in that response, the thrown MESSAGE is a stable,
+ * generic `"unauthorized"`, while the DETAILED reason is carried on `.reason` for the
+ * worker to log internally (ctx.logger / delivery correlation) and NEVER surfaced to the
+ * caller. Callers detect an auth rejection via `instanceof` (not string matching), so the
+ * distinct auth-rejection metric stays robust if the message ever changes.
+ */
+export class BotInboundUnauthorizedError extends Error {
+  /** Detailed, operator-facing reason — logged internally, never returned to the caller. */
+  readonly reason: string;
+  constructor(reason: string) {
+    super("unauthorized");
+    this.name = "BotInboundUnauthorizedError";
+    this.reason = reason;
+  }
+}
+
 /** Verifies a raw JWT (signature + JWKS) and returns its claims, or throws. Injected. */
 export type TokenVerifier = (token: string) => Promise<BotTokenClaims>;
 

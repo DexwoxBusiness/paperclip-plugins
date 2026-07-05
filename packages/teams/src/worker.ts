@@ -322,7 +322,14 @@ export default definePlugin({
     ctx.events.on("approval.decided", async (ev) => {
       try {
         const ref = extractDecidedApprovalRef(ev);
-        if (!ref) return;
+        if (!ref) {
+          // No approval id on the event → nothing to refresh. Log so payload drift is
+          // visible at integration (the event carries entityId = approval.id today).
+          log("teams approval.decided: no approval id extracted (reconfirm payload)", {
+            entityId: (ev as { entityId?: unknown }).entityId,
+          });
+          return;
+        }
         const bot = await getBot(ctx);
         // The event doesn't carry approve-vs-reject; the bot reads it via getStatus.
         await bot.onApprovalDecided({ approvalId: ref.approvalId, byName: ref.decidedBy });

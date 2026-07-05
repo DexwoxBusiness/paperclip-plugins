@@ -215,7 +215,14 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
   const handleApprovalSubmit = async (context: TurnContext, verb: ApprovalVerb, approvalId: string): Promise<void> => {
     if (!deps.approvals) return;
     const actor = teamsActor(context.activity.from?.aadObjectId);
-    const result = await deps.approvals.client.decide(verb, approvalId, { actor });
+    const byName = context.activity.from?.name || actor;
+    // Explicitly wire a human-readable decisionNote (AC #4 interim attribution): the note
+    // records who acted from Teams (display name + actor id) while the formal audit actor
+    // stays the board key until a host change lands. actor is also sent as decidedByUserId.
+    const result = await deps.approvals.client.decide(verb, approvalId, {
+      actor,
+      decisionNote: `Teams approval ${verb} by ${byName} (${actor})`,
+    });
     const stored = await deps.approvals.store.get(approvalId);
     if (!result.ok) {
       deps.log("teams approval decision failed", { approvalId, verb, status: result.status, error: result.error });
@@ -239,6 +246,7 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     // (whose payload doesn't carry the outcome). Update in place + forget the ref so the
     // subsequent approval.decided event is a no-op for this card.
     if (stored?.activityId) {
+      // The card shows the raw display name (or nothing) — cleaner than the opaque actor id.
       const decided = buildDecidedCard(verb, { byName: context.activity.from?.name, title: stored.title });
       await context.updateActivity({ ...cardActivity(decided), id: stored.activityId } as Activity);
       await deps.approvals.store.forget(approvalId);

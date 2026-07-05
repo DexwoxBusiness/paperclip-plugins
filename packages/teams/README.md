@@ -46,6 +46,19 @@ Package a Teams app manifest whose `bot.botId` is the `botAppId`, with the `team
 
 Set `botAppId`, `botTenantId` (if single-tenant), `botAppCredentialsRef`, and optionally `botAllowedIssuers` (comma-separated extra issuers beyond the Bot Framework default `https://api.botframework.com`, e.g. an Entra tenant issuer or a sovereign-cloud issuer).
 
+### Bot credentials & secrets (T9 / PCLIP-26)
+
+All credentials are **secret-refs only** — there is no field or flag that accepts a raw token/secret (unlike the Workflows URL, which has a deliberate opt-in plaintext escape hatch for migration). The secret fields are `botAppCredentialsRef` (the Entra client secret used for **outbound/proactive** bot auth) and `paperclipBoardApiKeyRef` (the board key for approve/reject REST calls). `botAppId` and `botTenantId` are non-secret identifiers and are entered in plaintext. Resolving a secret-ref requires the `secrets.read-ref` capability (declared in the manifest).
+
+**How the value is handled.** Secret-refs are resolved via `ctx.secrets.resolve()` when the bot is built and the resolved value is held **in memory only** (in the Agents SDK adapter / a closure), exactly as the peer Slack plugin does. It is **never** written to logs, plugin state, `ctx.data` settings surfaces, metrics, or agent transcripts — a failed resolve logs only a generic message plus the error *class* (`resolveSecretRef` in `secret-resolve.ts`, unit-tested to prove no-leak even if a provider error embeds the secret).
+
+**Rotation.** A rotated secret is picked up when the bot is next built — i.e. on plugin **re-init/restart**. Rotating a credential in your secret provider therefore needs a plugin restart to take effect (same behavior as the Slack plugin).
+
+**Pin / migration (PAP-2394).** Plugin secret-refs are kill-switched upstream **after** the pinned build, so the plugin is pinned to `canary/v2026.509.0-canary.1` where `ctx.secrets.resolve()` still works. When company-scoped `plugin_config` lands upstream and we unpin:
+1. Re-create each credential in the (new) company-scoped secret store and update `botAppCredentialsRef` / `paperclipBoardApiKeyRef` to the new reference ids.
+2. Restart the plugin so the new refs are resolved.
+3. Re-verify: send a proactive message / interactive approval and confirm outbound auth succeeds, and confirm no secret appears in logs (`resolveSecretRef` keeps this true, but re-check after any host secret-API change).
+
 ### Inbound authentication (AC #3)
 
 Every inbound Teams request carries an Entra/Bot-Framework bearer token. The plugin validates it **before** dispatching to the SDK adapter — RS256 signature / JWKS / issuer / audience / 5-min skew via the Agents SDK's `authorizeJWT` (JWKS keys are cached and refreshed by the SDK's `jwks-rsa` client, well within the Bot Connector spec's 24h bound, plus a fresh fetch on key rotation — so we don't hand-roll a JWKS cache). On top of that the plugin adds a defense-in-depth layer in `bot-auth.ts`: a claims policy (audience must equal `botAppId`, issuer must be allowed, token unexpired within a 5-min skew) **and** a `serviceUrl` binding (`assertServiceUrl` — the token's `serviceurl` claim, when present, must match the activity's `serviceUrl`, per Bot Connector spec req #7, so a leaked token can't redirect the bot's replies). Unauthenticated or invalid calls are **rejected** (the request is not processed).

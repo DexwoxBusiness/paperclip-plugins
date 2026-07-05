@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [test_1]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: typecheck + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # AC #2 (PCLIP-23): fail the build if any workspace package ever (re)introduces a
+      # botbuilder / Bot Framework SDK dependency. This is the explicit CI enforcement of
+      # the ban — the no-botbuilder guard test scans the whole workspace.
+      - name: Guard — no Bot Framework SDK dependencies
+        run: pnpm --filter @dexwox/paperclip-plugin-teams test -- tests/no-botbuilder.test.ts
+
+      - name: Typecheck (all packages)
+        run: pnpm -r typecheck
+
+      - name: Test (all packages)
+        run: pnpm -r test

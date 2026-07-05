@@ -3,7 +3,7 @@ import { DEFAULT_CONFIG, JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.j
 import { createConversationStore } from "./bot-conversations.js";
 import { createTeamsBot, type TeamsBot } from "./bot.js";
 import { BOT_FRAMEWORK_ISSUERS } from "./bot-auth.js";
-import { createApprovalsClient, extractDecidedApprovalRef } from "./approvals.js";
+import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
 import { createApprovalStore } from "./approval-store.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
 import { buildNotificationCard, channelFor, createBudgetDedupe, type ChannelKind, type TeamsNotification } from "./notifications.js";
@@ -547,7 +547,11 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
         client: createApprovalsClient({
           baseUrl: cfg.paperclipBaseUrl ?? "",
           apiKey: boardApiKey,
-          fetchFn: (async (url, init) => fetch(url, init)) as never,
+          // Native fetch (not ctx.http) — ctx.http rejects private/reserved IPs and the
+          // Paperclip API often runs on localhost. Params typed to avoid implicit any;
+          // the native Response satisfies ApprovalFetchResponse (status + text()).
+          fetchFn: ((url: string, init: { method: string; headers: Record<string, string>; body?: string }) =>
+            fetch(url, init as RequestInit)) as ApprovalFetch,
         }),
         store: createApprovalStore(stateBackend),
       };

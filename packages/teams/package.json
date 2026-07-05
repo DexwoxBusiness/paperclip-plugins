@@ -17,6 +17,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
+    "@microsoft/agents-activity": "^1.6.0",
     "@microsoft/agents-hosting": "^1.6.0",
     "@microsoft/agents-hosting-extensions-teams": "^1.6.0"
   },

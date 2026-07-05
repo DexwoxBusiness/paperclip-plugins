@@ -146,4 +146,21 @@ describe("dispatchCommand", () => {
     ok(card);
     expect(JSON.stringify(card)).not.toMatch(/Unknown command/i);
   });
+
+  it("no company / empty data → each command renders its no-data card, never help or silence", async () => {
+    // Simulates resolveCompanyId() returning "" in the worker: every data fn yields [].
+    const empty = deps({ listAgents: async () => [], listRecentCompletions: async () => [], listIssues: async () => [] });
+    const status = await dispatchCommand(parseCommand("status"), empty);
+    expect(status.command).toBe("status");
+    ok(status.card);
+    expect(JSON.stringify(status.card)).toMatch(/No active agents/i);
+
+    const agents = await dispatchCommand(parseCommand("agents"), empty);
+    ok(agents.card);
+    expect(JSON.stringify(agents.card)).toMatch(/No agents found/i);
+
+    const issues = await dispatchCommand(parseCommand("issues open"), empty);
+    ok(issues.card);
+    expect(JSON.stringify(issues.card)).toMatch(/No open issues/i);
+  });
 });

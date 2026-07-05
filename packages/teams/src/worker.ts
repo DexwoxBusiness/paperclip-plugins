@@ -632,9 +632,18 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
         listIssues: async (filter) => {
           const cid = await resolveCompanyId();
           if (!cid) return [];
-          const status = filter === "done" ? ("done" as const) : filter === "open" ? ("todo" as const) : undefined;
-          const issues = await ctx.issues.list({ companyId: cid, status, limit: 10, offset: 0 });
-          return issues.map((i) => ({
+          // "open" = every NON-terminal status. ctx.issues.list takes a SINGLE status, and a
+          // single status:"todo" would silently drop in_progress/in_review/backlog/blocked
+          // work that is still open (Codex). So "done" filters server-side; "open"/"all" list
+          // unfiltered and (for open) exclude the terminal statuses (done, cancelled)
+          // client-side. Fetch a larger page so the post-filter top-10 isn't starved by
+          // terminal issues. Each issue's deep link is built via buildDeepLink (T3).
+          const raw =
+            filter === "done"
+              ? await ctx.issues.list({ companyId: cid, status: "done", limit: 10, offset: 0 })
+              : await ctx.issues.list({ companyId: cid, limit: 50, offset: 0 });
+          const kept = filter === "open" ? raw.filter((i) => i.status !== "done" && i.status !== "cancelled") : raw;
+          return kept.slice(0, 10).map((i) => ({
             title: i.title ?? "(untitled)",
             status: i.status ?? "",
             url: buildDeepLink(

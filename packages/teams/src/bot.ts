@@ -120,19 +120,46 @@ function verifyViaSdk(authConfig: AuthConfiguration, authorization: string | str
         resolve(decision);
       }
     };
-    // Minimal Express-style response shim for the authorizeJWT middleware. Any status
-    // >= 400 or a terminal end/send means the middleware rejected the token. Methods
-    // are self-contained (no `this`) so the shim types cleanly.
+    // Minimal Express-style response shim for the authorizeJWT middleware. The middleware
+    // ONLY touches res on FAILURE — it calls `res.status(4xx).send({ 'jwt-auth-error': msg })`
+    // (success goes through `next()`), so any status >= 400 / terminal send/end is a rejection.
+    // We capture the SDK's error MESSAGE from the `.send()` payload into the reason so the
+    // worker's internal log can distinguish a JWKS/Bot-Framework INFRASTRUCTURE failure (e.g.
+    // "SigningKeyNotFoundError", a JWKS 5xx/timeout) from a plain bad/expired TOKEN — the
+    // reviewer's infra-vs-auth triage point. This reason is logged internally only; the caller
+    // still receives the generic "unauthorized", so no internals leak (AC #2). Methods are
+    // self-contained (no `this`) so the shim types cleanly.
+    let pendingStatus: number | undefined;
+    const rejectReason = (message?: string): string => {
+      const base = pendingStatus !== undefined ? `token verification failed (status ${pendingStatus})` : "token verification failed";
+      return message ? `${base}: ${message}` : base;
+    };
+    const sdkError = (payload: unknown): string | undefined => {
+      if (payload && typeof payload === "object") {
+        const v = (payload as Record<string, unknown>)["jwt-auth-error"];
+        if (typeof v === "string" && v.trim()) return v.trim();
+      }
+      return undefined;
+    };
     const res: Record<string, (...args: unknown[]) => unknown> = {};
     res.status = (code: unknown) => {
-      if (typeof code === "number" && code >= 400) finish({ ok: false, reason: `token verification failed (status ${code})` });
+      if (typeof code === "number" && code >= 400) {
+        pendingStatus = code;
+        // The SDK calls `.send()` synchronously right after `.status()`, carrying the error
+        // message — let it win. This microtask is a defensive guard so a >= 400 status that is
+        // (unexpectedly) never followed by send/end still rejects instead of hanging.
+        queueMicrotask(() => finish({ ok: false, reason: rejectReason() }));
+      }
+      return res;
+    };
+    res.send = (payload?: unknown) => {
+      finish({ ok: false, reason: rejectReason(sdkError(payload)) });
       return res;
     };
     res.end = () => {
-      finish({ ok: false, reason: "token verification failed" });
+      finish({ ok: false, reason: rejectReason() });
       return res;
     };
-    res.send = () => res.end();
     // Express error-first `next(err?)`: an error means verification failed; no error
     // means authenticated (claims on req.user).
     const next = (err?: unknown) => {

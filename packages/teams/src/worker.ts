@@ -487,6 +487,12 @@ export default definePlugin({
         // 502-from-error, since the fixed host envelope can't return a 401/403. Metrics
         // are best-effort and must not mask the rejection.
         ctx.logger.info("teams bot inbound rejected", { requestId: input.requestId, reason: e.reason });
+        // `ctx.metrics.write` is FREE-FORM: the host contract is {name, value, tags} gated
+        // ONLY by the `metrics.write` capability (declared in the manifest) — there is no
+        // per-metric pre-declaration/allowlist/registry to add a metric name to (verified
+        // against the plugin-sdk protocol + host). This emits the same way as the shipped
+        // T5 `teams.delivery.*` metrics. Auth-path only; JWKS/infra vs bad-token detail is
+        // in the log line above (e.reason). Best-effort: a metrics failure must not mask the reject.
         try {
           await ctx.metrics.write("teams.bot.inbound.rejected", 1, { reason: "auth" });
         } catch {

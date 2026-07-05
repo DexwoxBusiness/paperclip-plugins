@@ -124,7 +124,18 @@ not allocated per run). Only change it if you change the public host or the plug
 1. **Host exposure/version.** Before pointing Teams at it, run `paperclipai plugin target`
    — it prints the resolved API URL plus the server's status, version, `deploymentMode`, and
    `deploymentExposure`. A private/unexposed host or a stale server version is the most common
-   cause of "Teams can't reach the bot" that looks like a plugin bug but isn't.
+   cause of "Teams can't reach the bot" that looks like a plugin bug but isn't. Expected fields
+   to check:
+   - `apiUrl` — resolves to the public `https://<public-host>` you configured above.
+   - `status` — `ok`/ready.
+   - `version` — ≥ the version this plugin targets (an older host is a frequent false "bug").
+   - `deploymentExposure` — indicates public reachability; a `private`/`internal`/`local`
+     value means the host is not internet-reachable and Teams will not be able to deliver.
+   - `deploymentMode` — `local_trusted` vs a production mode (affects secret-ref resolution).
+
+   The plugin also surfaces a config-level check: the settings page (`messaging-endpoint`
+   data surface) flags a `paperclipBaseUrl` that is empty, non-HTTPS, or non-publicly-routable
+   before you ever reach the `plugin target` step.
 
 2. **Plugin installed + ready.** The host route requires the plugin to be installed, in
    `ready` state, holding the `webhooks.receive` capability, with the `bot-messages` endpoint

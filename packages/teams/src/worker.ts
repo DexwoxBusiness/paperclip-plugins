@@ -448,24 +448,28 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
           ctx.logger.info("teams bot: could not resolve botAppCredentialsRef (proactive send will be unauthenticated until fixed)");
         }
       }
+      const tenantId = (cfg.botTenantId ?? "").trim() || undefined;
       // Raw auth config mapped onto the SDK's AuthConfiguration fields (verified against
       // @microsoft/agents-hosting auth/settings.d.ts). bot.ts normalizes it via
-      // getAuthConfigWithDefaults. Every field IS used in the auth path:
-      //   - clientId   → inbound token AUDIENCE (jwt-middleware validates aud against it)
+      // getAuthConfigWithDefaults. Field usage in the auth path:
+      //   - clientId   → inbound token AUDIENCE (jwt-middleware verifies aud === clientId).
       //   - tenantId   → inbound: builds the Entra JWKS discovery URL
       //       (resolveAuthority(authority, tenantId)/discovery/v2.0/keys) that validates a
       //       single-tenant token's SIGNATURE; also scopes OUTBOUND MSAL token requests.
       //   - clientSecret → OUTBOUND (proactive) auth via the adapter's connection manager.
-      //   - issuers    → additional valid issuers accepted by the SDK validator itself, so
-      //       operator-configured extra issuers actually take effect at the crypto layer
-      //       (not just our defense-in-depth policy). Left unset when none are configured,
-      //       so the SDK keeps its defaults (Bot Framework + tenant-derived Entra issuer).
-      const authConfig = {
-        clientId: botAppId,
-        tenantId: (cfg.botTenantId ?? "").trim() || undefined,
-        clientSecret,
-        issuers: extraIssuers.length ? [...BOT_FRAMEWORK_ISSUERS, ...extraIssuers] : undefined,
-      };
+      // NOTE (verified in jwt-middleware.js): authorizeJWT validates audience + RS256
+      // signature (JWKS keyed off the token's OWN iss) and passes NO `issuer` option —
+      // it does NOT check an issuer allow-list. So we do NOT set authConfig.issuers (it
+      // would be inert here); the issuer allow-list is enforced by our assertBotClaims
+      // policy below, which is the meaningful issuer gate.
+      const authConfig = { clientId: botAppId, tenantId, clientSecret };
+      // Issuers accepted by assertBotClaims (the real issuer gate). Include the tenant-
+      // derived Entra issuers (v2 login.microsoftonline.com + v1 sts.windows.net) when a
+      // tenant is configured, so SINGLE-TENANT tokens pass without the operator having to
+      // list them; Teams channel/multi-tenant tokens use the Bot Framework issuer.
+      const tenantIssuers = tenantId
+        ? [`https://login.microsoftonline.com/${tenantId}/v2.0`, `https://sts.windows.net/${tenantId}/`]
+        : [];
       const conversations = createConversationStore({
         get: (k: string) => ctx.state.get({ scopeKind: "instance", stateKey: k }),
         set: (k: string, v: unknown) => ctx.state.set({ scopeKind: "instance", stateKey: k }, v),
@@ -473,7 +477,7 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
       return createTeamsBot({
         authConfig,
         botAppId,
-        allowedIssuers: [...BOT_FRAMEWORK_ISSUERS, ...extraIssuers],
+        allowedIssuers: [...BOT_FRAMEWORK_ISSUERS, ...tenantIssuers, ...extraIssuers],
         conversations,
         log: (m, f) => ctx.logger.info(m, f),
       });

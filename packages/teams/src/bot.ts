@@ -34,6 +34,7 @@ import {
   ActivityHandler,
   CloudAdapter,
   authorizeJWT,
+  getAuthConfigWithDefaults,
   type AuthConfiguration,
   type Request as AgentsRequest,
   type Response as AgentsResponse,
@@ -43,7 +44,8 @@ import { assertBotClaims, extractBearerToken, type AuthDecision, type BotTokenCl
 import { conversationKey, type ConversationRef, type ConversationStore } from "./bot-conversations.js";
 
 export interface TeamsBotDeps {
-  authConfig: AuthConfiguration;
+  /** Raw settings-derived auth config; normalized via getAuthConfigWithDefaults internally. */
+  authConfig: Parameters<typeof getAuthConfigWithDefaults>[0];
   /** The bot's Microsoft App Id — required inbound token audience + proactive identity. */
   botAppId: string;
   /** Extra allowed issuers beyond the Bot Framework default. */
@@ -79,51 +81,72 @@ function verifyViaSdk(authConfig: AuthConfiguration, authorization: string | str
       resolve({ ok: false, reason: "missing or malformed Authorization bearer token" });
       return;
     }
-    const req = { headers: { authorization: Array.isArray(authorization) ? authorization[0] : authorization } } as unknown as AgentsRequest & {
-      user?: BotTokenClaims;
-    };
+    // The shim MUST carry method: "POST" (Codex): authorizeJWT rejects any request
+    // whose method isn't POST/GET BEFORE it verifies the token, so a method-less shim
+    // would send every valid Teams message down the unauthorized path. Teams delivers
+    // bot activities as POST.
+    const req = {
+      method: "POST",
+      headers: { authorization: Array.isArray(authorization) ? authorization[0] : authorization },
+    } as unknown as AgentsRequest & { user?: BotTokenClaims };
     let settled = false;
+    const finish = (decision: AuthDecision) => {
+      if (!settled) {
+        settled = true;
+        resolve(decision);
+      }
+    };
     const res = {
       status(code: number) {
-        if (!settled && code >= 400) {
-          settled = true;
-          resolve({ ok: false, reason: `token verification failed (status ${code})` });
-        }
+        if (code >= 400) finish({ ok: false, reason: `token verification failed (status ${code})` });
         return this;
       },
       end() {
-        if (!settled) {
-          settled = true;
-          resolve({ ok: false, reason: "token verification failed" });
-        }
+        finish({ ok: false, reason: "token verification failed" });
         return this;
       },
       send() {
         return this.end();
       },
     } as unknown as AgentsResponse;
-    const next = () => {
-      if (!settled) {
-        settled = true;
-        resolve({ ok: true, claims: (req.user ?? {}) as BotTokenClaims });
-      }
+    // Express error-first `next(err?)`: an error means verification failed; no error
+    // means authenticated (claims on req.user).
+    const next = (err?: unknown) => {
+      if (err) finish({ ok: false, reason: `token verification failed: ${err instanceof Error ? err.message : String(err)}` });
+      else finish({ ok: true, claims: (req.user ?? {}) as BotTokenClaims });
     };
     try {
-      // authorizeJWT(authConfig) → Express-style (req,res,next) middleware.
-      (authorizeJWT(authConfig) as (r: unknown, s: unknown, n: () => void) => void)(req, res, next);
-    } catch (e) {
-      if (!settled) {
-        settled = true;
-        resolve({ ok: false, reason: `token verification failed: ${e instanceof Error ? e.message : String(e)}` });
+      // authorizeJWT(authConfig) → Express-style (req,res,next) middleware. It may be
+      // ASYNC (JWKS fetch): route a rejected promise through next(err) so an async
+      // verification failure resolves this promise instead of hanging the webhook
+      // handler or raising an unhandled rejection (Kody, critical).
+      const maybePromise = (authorizeJWT(authConfig) as (r: unknown, s: unknown, n: (err?: unknown) => void) => unknown)(req, res, next);
+      if (maybePromise && typeof (maybePromise as Promise<unknown>).catch === "function") {
+        (maybePromise as Promise<unknown>).catch((e) => next(e));
       }
+    } catch (e) {
+      next(e);
     }
   });
 }
 
 /** Create the Teams bot: adapter + activity handler + inbound/proactive plumbing. */
 export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
-  const adapter = new CloudAdapter(deps.authConfig);
+  // Normalize the raw settings-derived config through the SDK helper BEFORE use
+  // (Codex): authorizeJWT resolves the expected audience from `authConfig.connections`,
+  // which is only populated by getAuthConfigWithDefaults / the env loader — a raw
+  // { clientId, tenantId, clientSecret } object would otherwise fail every token with
+  // an audience mismatch. The normalized config also carries clientSecret into the
+  // CloudAdapter's connection manager for OUTBOUND (proactive) auth (AC #1).
+  const authConfig = getAuthConfigWithDefaults(deps.authConfig);
+  const adapter = new CloudAdapter(authConfig);
   const handler = new ActivityHandler();
+  // T7/PCLIP-24 SEAM: Action.Execute / Universal Action `invoke` activities are handled
+  // here once the host exposes an HTTP-response-capable webhook (invoke REQUIRES an
+  // inline response body, which the current void-returning onWebhook cannot provide —
+  // see the file header + PCLIP-23 description). The handler + adapter are already
+  // constructed, so unblocking T7 is a localized change: add the invoke handler and
+  // return its AdaptiveCardInvokeResponse through the (future) response channel.
 
   // Remember the conversation on any inbound turn so we can post proactively later
   // (AC #1). Both a message and a conversationUpdate (bot added to a team) carry a
@@ -151,8 +174,9 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     handler,
     async handleInbound(headers, rawBody) {
       const authorization = headers["authorization"] ?? headers["Authorization"];
-      // 1) Cryptographic validation via the SDK (signature/JWKS/issuer/audience).
-      const sdkDecision = await verifyViaSdk(deps.authConfig, authorization);
+      // 1) Cryptographic validation via the SDK (signature/JWKS/issuer/audience),
+      // using the SAME normalized authConfig as the adapter.
+      const sdkDecision = await verifyViaSdk(authConfig, authorization);
       if (!sdkDecision.ok) {
         deps.log("teams bot inbound rejected (auth)", { reason: sdkDecision.reason });
         // No 401 available (host maps a throw → 502); throwing is the only rejection.
@@ -165,12 +189,17 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
         throw new Error(`bot inbound unauthorized: ${policy.reason}`);
       }
       // 3) Dispatch to the adapter with a captured (no-op) response — replies go via
-      // the Connector, not this inline response (host can't return a body).
-      const activity = safeJsonParse(rawBody);
+      // the Connector, not this inline response (host can't return a body). A malformed
+      // body throws (→ host 502) rather than dispatching an empty activity under a 200.
+      const activity = parseActivityBody(rawBody);
       const req = { headers, body: activity, user: sdkDecision.claims } as unknown as AgentsRequest;
       const res = { status: () => res, send: () => res, end: () => res, header: () => res } as unknown as AgentsResponse;
       await adapter.process(req, res, async (context) => handler.run(context));
     },
+    // Proactive-send CAPABILITY (AC #1 "can post proactively"). The trigger that calls
+    // this (e.g. routing v1 notifications through the bot instead of a Workflows URL) is
+    // a follow-up once bot-channel delivery is offered as an alternative to Workflows;
+    // the capability + its conversation store are complete and tested here.
     async postProactively(conversationKeyId, activityFactory) {
       const stored = await deps.conversations.get(conversationKeyId);
       if (!stored) {
@@ -183,10 +212,14 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
   };
 }
 
-function safeJsonParse(raw: string): unknown {
+/**
+ * Parse the inbound activity body. A malformed body THROWS (Kody) so the host rejects
+ * it (→ 502) instead of dispatching an empty activity and returning a misleading 200.
+ */
+function parseActivityBody(raw: string): unknown {
   try {
     return JSON.parse(raw);
-  } catch {
-    return {};
+  } catch (e) {
+    throw new Error(`invalid JSON activity body: ${e instanceof Error ? e.message : String(e)}`);
   }
 }

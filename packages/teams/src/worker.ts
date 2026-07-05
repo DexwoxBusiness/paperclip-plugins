@@ -401,7 +401,22 @@ export default definePlugin({
     // which rejects the unauthenticated call (AC #3). The plugin webhook cannot return
     // 401 or an inline response body (host contract), so replies go via the Connector
     // and Action.Execute invokes (T7) await an HTTP-response-capable webhook upstream.
-    await bot.handleInbound(input.headers, input.rawBody);
+    try {
+      await bot.handleInbound(input.headers, input.rawBody);
+    } catch (e) {
+      // Emit a distinct metric for AUTH rejections so operators can tell a
+      // 502-from-auth apart from a 502-from-error in monitoring (the status alone
+      // can't, given the host limitation). Never let metrics failure mask the reject.
+      const message = e instanceof Error ? e.message : String(e);
+      if (message.includes("unauthorized")) {
+        try {
+          await ctx.metrics.write("teams.bot.inbound.rejected", 1, { reason: "auth" });
+        } catch {
+          /* metrics are best-effort */
+        }
+      }
+      throw e; // re-throw so the host records the rejection (502)
+    }
   },
 });
 
@@ -431,9 +446,11 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
           ctx.logger.info("teams bot: could not resolve botAppCredentialsRef (proactive send will be unauthenticated until fixed)");
         }
       }
-      // AuthConfiguration shape (clientId/tenantId/clientSecret) matches the Agents SDK
-      // env loader; constructed from plugin config here. Verified at integration build.
-      const authConfig = { clientId: botAppId, tenantId: (cfg.botTenantId ?? "").trim() || undefined, clientSecret } as never;
+      // Raw auth config (clientId/tenantId/clientSecret) — bot.ts normalizes it via the
+      // SDK's getAuthConfigWithDefaults (populates the audience/connections map used by
+      // authorizeJWT, and carries clientSecret into the adapter's OUTBOUND auth). No
+      // `as never` cast: the shape matches the SDK env-loader config.
+      const authConfig = { clientId: botAppId, tenantId: (cfg.botTenantId ?? "").trim() || undefined, clientSecret };
       const conversations = createConversationStore({
         get: (k: string) => ctx.state.get({ scopeKind: "instance", stateKey: k }),
         set: (k: string, v: unknown) => ctx.state.set({ scopeKind: "instance", stateKey: k }, v),

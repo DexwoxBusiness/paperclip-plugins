@@ -84,6 +84,16 @@ export interface ConversationStore {
  * Persist conversation references for proactive messaging. `remember` is idempotent
  * per conversation id (a re-install / new activity just refreshes serviceUrl and the
  * timestamp), so we never accumulate duplicates for the same channel.
+ *
+ * Storage model (re: the "O(N) get()" review note): all references live in ONE state
+ * blob under {@link CONVERSATIONS_KEY}. `get()` therefore parses that single blob — it
+ * is NOT N backend round-trips. N here is the number of teams/channels the bot is
+ * installed in (bounded and small — tens, not millions), so a single-blob read is
+ * cheap and, more importantly, keeps `remember` a SINGLE atomic write. Splitting into
+ * per-key entries + a separate index for `list()` would turn every write into two
+ * writes (entry + index) with a partial-failure window between them — a data-
+ * consistency hazard the engineering standard forbids without idempotent multi-write
+ * handling. The single blob is the deliberate, safer choice at this scale.
  */
 export function createConversationStore(backend: ConversationStoreBackend, opts: { now?: () => number } = {}): ConversationStore {
   const now = opts.now ?? Date.now;

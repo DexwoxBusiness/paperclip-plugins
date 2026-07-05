@@ -60,6 +60,7 @@ import {
   type ApprovalVerb,
 } from "./approvals.js";
 import { type ApprovalStore } from "./approval-store.js";
+import { buildHelpCard, dispatchCommand, parseCommand, type CommandDeps, type CommandName } from "./commands.js";
 
 export interface TeamsBotDeps {
   /** Raw settings-derived auth config; normalized via getAuthConfigWithDefaults internally. */
@@ -71,6 +72,10 @@ export interface TeamsBotDeps {
   conversations: ConversationStore;
   /** Interactive approvals (PCLIP-24). Omit to disable approve/reject handling. */
   approvals?: { client: ApprovalsClient; store: ApprovalStore };
+  /** @Paperclip command set (PCLIP-27 / T10). Omit to fall back to the friendly notice. */
+  commands?: CommandDeps;
+  /** Called after a command is handled, for the `teams.commands.handled` metric. */
+  onCommand?: (command: CommandName) => void;
   log: (message: string, fields?: Record<string, unknown>) => void;
 }
 
@@ -223,8 +228,30 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       await next();
       return;
     }
-    // Otherwise: v1 is notification-only; conversational replies land with T8+.
-    await context.sendActivity("Thanks — I post Paperclip notifications and approvals here. Interactive commands are coming soon.");
+    // PCLIP-27 (T10): an @mention text command. parseCommand strips the <at>…</at> mention
+    // span itself (this SDK's ActivityHandler has no removeRecipientMention), and unknown/
+    // empty text renders help — so the user is never left in silence.
+    if (deps.commands) {
+      const text = typeof context.activity.text === "string" ? context.activity.text : "";
+      const parsed = parseCommand(text);
+      // Thread the acting Teams user so `approve` attributes the decision to the real person
+      // (audit parity with handleApprovalSubmit), not a generic label.
+      const actor = { actor: teamsActor(context.activity.from?.aadObjectId), actorName: sanitizeDisplayName(context.activity.from?.name) };
+      try {
+        const outcome = await dispatchCommand(parsed, deps.commands, actor);
+        await context.sendActivity(cardActivity(outcome.card) as Activity);
+        deps.onCommand?.(outcome.command);
+      } catch (e) {
+        // A data-fetch (ctx.agents/issues) failure must not leave the user in silence:
+        // log the detail and still reply with help.
+        deps.log("teams command failed", { command: parsed.command, error: e instanceof Error ? e.message : String(e) });
+        await context.sendActivity(cardActivity(buildHelpCard()) as Activity);
+      }
+      await next();
+      return;
+    }
+    // No command deps wired (bot not fully configured): keep a friendly, non-silent notice.
+    await context.sendActivity("Thanks — I post Paperclip notifications and approvals here.");
     await next();
   });
 

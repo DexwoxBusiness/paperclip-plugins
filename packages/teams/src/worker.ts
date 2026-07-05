@@ -5,6 +5,7 @@ import { createTeamsBot, type TeamsBot } from "./bot.js";
 import { BOT_FRAMEWORK_ISSUERS, BotInboundUnauthorizedError } from "./bot-auth.js";
 import { describeMessagingEndpoint } from "./messaging-endpoint.js";
 import { resolveSecretRef } from "./secret-resolve.js";
+import { type CommandDeps } from "./commands.js";
 import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
 import { createApprovalStore } from "./approval-store.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
@@ -46,6 +47,13 @@ let context: PluginContext | undefined;
 let botPromise: Promise<TeamsBot> | undefined;
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
+
+/**
+ * Terminal (closed) issue statuses. "open" for the @Paperclip issues command = every status
+ * NOT in this set (backlog/todo/in_progress/in_review/blocked all count as open). Kept as a
+ * named set so the open filter stays correct if the IssueStatus model gains terminal states.
+ */
+const TERMINAL_ISSUE_STATUSES: ReadonlySet<string> = new Set(["done", "cancelled"]);
 
 /** Plugin-state key: the date (server-local) the digest last posted, for once-a-day throttling. */
 const DIGEST_LAST_RUN_DATE_KEY = "digest:last-run-date";
@@ -604,12 +612,76 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
         }),
         store: createApprovalStore(stateBackend),
       };
+      // PCLIP-27 (T10): @Paperclip command data, backed by ctx reads. Company resolved once
+      // (first visible company — matches the Slack plugin's fallback). Empty company or a
+      // read failure yields empty lists → the cards render their no-data state, never silence.
+      let cachedCompanyId: string | undefined;
+      const resolveCompanyId = async (): Promise<string> => {
+        if (cachedCompanyId === undefined) {
+          const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+          cachedCompanyId = companies[0]?.id ?? "";
+        }
+        return cachedCompanyId;
+      };
+      const commands: CommandDeps = {
+        listAgents: async () => {
+          const cid = await resolveCompanyId();
+          if (!cid) return [];
+          const agents = await ctx.agents.list({ companyId: cid, limit: 100, offset: 0 });
+          return agents.map((a) => ({ name: a.name, status: a.status }));
+        },
+        listRecentCompletions: async () => {
+          const cid = await resolveCompanyId();
+          if (!cid) return [];
+          const issues = await ctx.issues.list({ companyId: cid, status: "done", limit: 5, offset: 0 });
+          return issues.map((i) => ({ title: i.title ?? "(untitled)", status: i.status ?? "done" }));
+        },
+        listIssues: async (filter) => {
+          const cid = await resolveCompanyId();
+          if (!cid) return [];
+          // "open" = every NON-terminal status. ctx.issues.list takes a SINGLE status, and a
+          // single status:"todo" would silently drop in_progress/in_review/backlog/blocked
+          // work that is still open (Codex). So "done" filters server-side; "open"/"all" list
+          // unfiltered and (for open) exclude the terminal statuses (done, cancelled)
+          // client-side. Fetch a larger page so the post-filter top-10 isn't starved by
+          // terminal issues. Each issue's deep link is built via buildDeepLink (T3).
+          const raw =
+            filter === "done"
+              ? await ctx.issues.list({ companyId: cid, status: "done", limit: 10, offset: 0 })
+              : await ctx.issues.list({ companyId: cid, limit: 50, offset: 0 });
+          const kept = filter === "open" ? raw.filter((i) => !TERMINAL_ISSUE_STATUSES.has(i.status)) : raw;
+          return kept.slice(0, 10).map((i) => ({
+            title: i.title ?? "(untitled)",
+            status: i.status ?? "",
+            url: buildDeepLink(
+              { kind: "issue-created", issueId: i.id, issueIdentifier: i.identifier ?? undefined, title: i.title ?? "" },
+              { baseUrl: cfg.paperclipBaseUrl ?? "", companyPrefix: cfg.paperclipCompanyPrefix },
+            ),
+          }));
+        },
+        // approve is enabled only when a Paperclip base URL is set (approvals reachable);
+        // otherwise omit it so the command replies with the polite "not enabled" card.
+        approve: (cfg.paperclipBaseUrl ?? "").trim()
+          ? async (approvalId, opts) => {
+              // Attribute the decision to the acting Teams user (audit parity with the T7
+              // button flow / handleApprovalSubmit), not a generic label.
+              const note = `Teams approval approve by ${opts.actorName || opts.actor} (${opts.actor})`;
+              const r = await approvals.client.decide("approve", approvalId, { actor: opts.actor, decisionNote: note });
+              return { ok: r.ok, verb: r.verb, error: r.error };
+            }
+          : undefined,
+      };
       return createTeamsBot({
         authConfig,
         botAppId,
         allowedIssuers: [...BOT_FRAMEWORK_ISSUERS, ...tenantIssuers, ...extraIssuers],
         conversations,
         approvals,
+        commands,
+        onCommand: (command) => {
+          // Best-effort metric (parity with Slack's slack.commands.handled); never blocks.
+          void ctx.metrics.write("teams.commands.handled", 1, { command }).catch(() => undefined);
+        },
         log: (m, f) => ctx.logger.info(m, f),
       });
     })().catch((e) => {

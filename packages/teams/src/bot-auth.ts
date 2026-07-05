@@ -38,9 +38,17 @@ export interface BotTokenClaims {
 }
 
 /**
- * Default issuer for Azure Bot Service channel tokens (public cloud). Entra app
- * tokens use tenant-scoped issuers, so the issuer set is configurable — operators on
- * sovereign clouds or using Entra-issued tokens can extend it.
+ * Default issuer for Azure Bot Service channel tokens (public cloud).
+ *
+ * This is grounded in the official Bot Connector authentication spec
+ * (learn.microsoft.com "Authenticate requests with the Bot Connector API",
+ * "Connector to Bot" §), which requires: issuer === "https://api.botframework.com",
+ * audience === the bot's Microsoft App ID, ≤5-min clock skew, RS256 signature from the
+ * OpenID keys doc. The EMULATOR / single-tenant path uses tenant issuers instead
+ * (`https://sts.windows.net/{tenant}/` v1 or `https://login.microsoftonline.com/{tenant}/v2.0`
+ * v2), which the worker adds to the allow-list when a tenant is configured. Sovereign
+ * clouds/other Entra issuers can be added via config. Signature+audience are enforced by
+ * the SDK's authorizeJWT; this issuer allow-list is our defense-in-depth gate.
  */
 export const BOT_FRAMEWORK_ISSUERS: readonly string[] = ["https://api.botframework.com"];
 

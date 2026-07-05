@@ -457,11 +457,19 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
       //       (resolveAuthority(authority, tenantId)/discovery/v2.0/keys) that validates a
       //       single-tenant token's SIGNATURE; also scopes OUTBOUND MSAL token requests.
       //   - clientSecret → OUTBOUND (proactive) auth via the adapter's connection manager.
-      // NOTE (verified in jwt-middleware.js): authorizeJWT validates audience + RS256
-      // signature (JWKS keyed off the token's OWN iss) and passes NO `issuer` option —
-      // it does NOT check an issuer allow-list. So we do NOT set authConfig.issuers (it
-      // would be inert here); the issuer allow-list is enforced by our assertBotClaims
-      // policy below, which is the meaningful issuer gate.
+      // Deliberately NOT setting authConfig.issuers — do NOT "restore" it (verified
+      // against the installed @microsoft/agents-hosting source):
+      //   1. jwt-middleware.js NEVER reads authConfig.issuers. Inbound validation is
+      //      audience (=== clientId) + RS256 signature (JWKS keyed off the token's OWN
+      //      iss) + expiry. Setting issuers is INERT for inbound auth.
+      //   2. getAuthConfigWithDefaults → applyDefaultSettings AUTO-FILLS issuers via
+      //      getDefaultIssuers(tenantId) = [api.botframework.com, sts.windows.net/{t}/,
+      //      login.microsoftonline.com/{t}/v2.0] when left unset. Hard-coding our own
+      //      list would OVERRIDE those SDK-computed, authority-aware defaults (the
+      //      default-set-replacement regression flagged in an earlier review). Leaving
+      //      it unset yields the correct set.
+      // The issuer allow-list that actually gates INBOUND is our assertBotClaims policy
+      // (allowedIssuers below), which mirrors getDefaultIssuers for consistency.
       const authConfig = { clientId: botAppId, tenantId, clientSecret };
       // Issuers accepted by assertBotClaims (the real issuer gate). Include the tenant-
       // derived Entra issuers (v2 login.microsoftonline.com + v1 sts.windows.net) when a

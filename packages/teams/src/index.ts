@@ -4,6 +4,8 @@ export * from "./adaptive-card.js";
 export * from "./notifications.js";
 export * from "./delivery.js";
 export * from "./delivery-health.js";
+export * from "./bot-auth.js";
+export * from "./bot-conversations.js";
 export * from "./event-adapters.js";
 export * from "./routing.js";
 export * from "./links.js";

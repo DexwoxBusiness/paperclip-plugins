@@ -1,5 +1,8 @@
 import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
-import { DEFAULT_CONFIG, JOB_KEYS, PLUGIN_ID } from "./constants.js";
+import { DEFAULT_CONFIG, JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.js";
+import { createConversationStore } from "./bot-conversations.js";
+import { createTeamsBot, type TeamsBot } from "./bot.js";
+import { BOT_FRAMEWORK_ISSUERS } from "./bot-auth.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
 import { buildNotificationCard, channelFor, createBudgetDedupe, type ChannelKind, type TeamsNotification } from "./notifications.js";
 import { classifyWorkflowRef, resolveWorkflowRef, type TeamsInstanceConfig } from "./routing.js";
@@ -35,6 +38,8 @@ import {
  *  - PCLIP-23..28 (T6..T11) v2 bot on the Microsoft 365 Agents SDK
  */
 let context: PluginContext | undefined;
+/** Lazily-constructed v2 bot (PCLIP-23), cached across webhook deliveries. */
+let botPromise: Promise<TeamsBot> | undefined;
 
 const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
 
@@ -382,8 +387,69 @@ export default definePlugin({
   },
 
   async onWebhook(input: PluginWebhookInput): Promise<void> {
-    // TODO(PCLIP-25/T8): v2 bot messaging endpoint — validate the Entra token and
-    // route Teams activities / Action.Execute invokes.
-    context?.logger.info("teams webhook received", { endpointKey: input.endpointKey });
+    const ctx = context;
+    if (!ctx) throw new Error("teams plugin not initialized");
+    // The bot messaging endpoint (PCLIP-23). Only this endpointKey is a bot inbound;
+    // anything else is ignored (undeclared keys are already 404'd by the host).
+    if (input.endpointKey !== WEBHOOK_KEYS.botMessages) {
+      ctx.logger.info("teams webhook received (non-bot endpoint, ignored)", { endpointKey: input.endpointKey });
+      return;
+    }
+    const bot = await getBot(ctx);
+    // handleInbound authenticates the Entra/Bot-Framework token and dispatches to the
+    // Agents SDK adapter. On auth failure it THROWS — the host maps that to HTTP 502,
+    // which rejects the unauthenticated call (AC #3). The plugin webhook cannot return
+    // 401 or an inline response body (host contract), so replies go via the Connector
+    // and Action.Execute invokes (T7) await an HTTP-response-capable webhook upstream.
+    await bot.handleInbound(input.headers, input.rawBody);
   },
 });
+
+/**
+ * Build (once) the v2 Teams bot from live config: bot app id, tenant, allowed issuers,
+ * and the outbound credentials secret-ref, plus a conversation store over instance
+ * state for proactive posting. Cached in `botPromise` so the CloudAdapter/JWKS client
+ * is reused across deliveries. SDK-coupled (Agents SDK) — see bot.ts.
+ */
+function getBot(ctx: PluginContext): Promise<TeamsBot> {
+  if (!botPromise) {
+    botPromise = (async () => {
+      const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
+      const botAppId = (cfg.botAppId ?? "").trim();
+      if (!botAppId) throw new Error("bot not configured: set botAppId (Bot Microsoft App Id)");
+      const extraIssuers = (cfg.botAllowedIssuers ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      // Outbound (proactive) credentials — resolved from a secret-ref, never logged.
+      let clientSecret = "";
+      const credRef = (cfg as { botAppCredentialsRef?: string }).botAppCredentialsRef;
+      if (credRef) {
+        try {
+          clientSecret = (await ctx.secrets.resolve(credRef)) || "";
+        } catch {
+          ctx.logger.info("teams bot: could not resolve botAppCredentialsRef (proactive send will be unauthenticated until fixed)");
+        }
+      }
+      // AuthConfiguration shape (clientId/tenantId/clientSecret) matches the Agents SDK
+      // env loader; constructed from plugin config here. Verified at integration build.
+      const authConfig = { clientId: botAppId, tenantId: (cfg.botTenantId ?? "").trim() || undefined, clientSecret } as never;
+      const conversations = createConversationStore({
+        get: (k: string) => ctx.state.get({ scopeKind: "instance", stateKey: k }),
+        set: (k: string, v: unknown) => ctx.state.set({ scopeKind: "instance", stateKey: k }, v),
+      });
+      return createTeamsBot({
+        authConfig,
+        botAppId,
+        allowedIssuers: [...BOT_FRAMEWORK_ISSUERS, ...extraIssuers],
+        conversations,
+        log: (m, f) => ctx.logger.info(m, f),
+      });
+    })().catch((e) => {
+      // Don't cache a failed construction — allow a later delivery to retry once config is fixed.
+      botPromise = undefined;
+      throw e;
+    });
+  }
+  return botPromise;
+}

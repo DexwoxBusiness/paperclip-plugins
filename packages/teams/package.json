@@ -16,6 +16,10 @@
     "test": "vitest run --passWithNoTests",
     "prepublishOnly": "npm run build"
   },
+  "dependencies": {
+    "@microsoft/agents-hosting": "^1.6.0",
+    "@microsoft/agents-hosting-extensions-teams": "^1.6.0"
+  },
   "peerDependencies": {
     "@paperclipai/plugin-sdk": "*",
     "@paperclipai/shared": "*"

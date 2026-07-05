@@ -39,6 +39,11 @@ export interface TeamsInstanceConfig extends TeamsUrlConfig {
   digestTimezone?: string;
   /** Consecutive failures on one URL before it is flagged degraded (default 5). PCLIP-22 */
   degradedDeliveryThreshold?: number;
+  /** v2 bot (Microsoft 365 Agents SDK). PCLIP-23 */
+  botAppId?: string;
+  botTenantId?: string;
+  /** Extra allowed token issuers (comma-separated) beyond the Bot Framework default. PCLIP-23 */
+  botAllowedIssuers?: string;
 }
 
 /** Which config field backs each channel. */

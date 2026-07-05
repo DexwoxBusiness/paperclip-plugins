@@ -31,6 +31,33 @@ export type SecretResolver = (ref: string) => Promise<string>;
 export type LeakSafeLog = (message: string, fields?: Record<string, unknown>) => void;
 
 /**
+ * Allowlist of standard JS error constructor names. We bucket the caught error to one of
+ * these for triage, or "unknown" otherwise — we must NOT log `e.name` (or `e.message`)
+ * directly: a hostile/pathological secret provider could throw
+ * `Object.assign(new Error(), { name: <secret> })`, and logging `e.name` verbatim would leak
+ * the secret. The allowlist guarantees only fixed, non-secret strings are ever logged.
+ */
+const SAFE_ERROR_CLASSES: ReadonlySet<string> = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "SyntaxError",
+  "ReferenceError",
+  "EvalError",
+  "URIError",
+  "AggregateError",
+  "DOMException",
+]);
+
+/** Map any thrown value to a fixed, non-secret class bucket for leak-safe logging. */
+export function safeErrorClass(e: unknown): string {
+  if (e instanceof Error && typeof e.name === "string" && SAFE_ERROR_CLASSES.has(e.name)) {
+    return e.name;
+  }
+  return "unknown";
+}
+
+/**
  * Resolve a secret-ref to its value without ever leaking it.
  *
  * @param resolve         Injected `ctx.secrets.resolve` (requires the `secrets.read-ref` capability).
@@ -50,9 +77,11 @@ export async function resolveSecretRef(
     const value = (await resolve(trimmed)) || "";
     return value ? { value, status: "resolved" } : { value: "", status: "unset" };
   } catch (e) {
-    // ONLY the error class — never the ref, the resolved value, or e.message. This is what
-    // makes AC #2 (never in logs) provable even if the provider error embeds the secret.
-    log(onErrorMessage, { errorClass: e instanceof Error ? e.name : "unknown" });
+    // Log a fixed message + an ALLOWLISTED class bucket only — never the ref, the resolved
+    // value, e.message, or a raw e.name (a provider could set `name` to secret material).
+    // This is what makes AC #2 (never in logs) provable even if the provider error embeds
+    // the secret in its name or message.
+    log(onErrorMessage, { errorClass: safeErrorClass(e) });
     return { value: "", status: "error" };
   }
 }

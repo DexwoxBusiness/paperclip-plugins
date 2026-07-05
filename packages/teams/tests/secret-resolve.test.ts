@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { resolveSecretRef } from "../src/secret-resolve.js";
+import { resolveSecretRef, safeErrorClass } from "../src/secret-resolve.js";
 
 const SECRET = "super-secret-client-secret-value-9f3a";
 const REF = "ref-uuid-1234";
@@ -68,5 +68,28 @@ describe("resolveSecretRef", () => {
     expect(r.status).toBe("error");
     expect(calls[0].fields).toEqual({ errorClass: "unknown" });
     expect(dump()).not.toContain(SECRET);
+  });
+
+  it("NO-LEAK: an Error whose NAME is the secret is bucketed to 'unknown' (Codex P2)", async () => {
+    // A hostile/pathological provider that puts secret material in Error.name.
+    const resolve = async () => { throw Object.assign(new Error("boom"), { name: SECRET }); };
+    const { log, calls, dump } = spyLog();
+    const r = await resolveSecretRef(resolve, REF, log, "could not resolve secret");
+    expect(r.status).toBe("error");
+    expect(calls[0].fields).toEqual({ errorClass: "unknown" }); // NOT the secret name
+    expect(dump()).not.toContain(SECRET);
+  });
+});
+
+describe("safeErrorClass", () => {
+  it("passes allowlisted standard classes, buckets everything else to 'unknown'", () => {
+    expect(safeErrorClass(new TypeError("x"))).toBe("TypeError");
+    expect(safeErrorClass(new Error("x"))).toBe("Error");
+    expect(safeErrorClass(new RangeError("x"))).toBe("RangeError");
+    // Anything not on the allowlist — including a crafted secret name — is bucketed.
+    expect(safeErrorClass(Object.assign(new Error(), { name: "sk-live-secret-123" }))).toBe("unknown");
+    expect(safeErrorClass("a raw string")).toBe("unknown");
+    expect(safeErrorClass(null)).toBe("unknown");
+    expect(safeErrorClass(undefined)).toBe("unknown");
   });
 });

@@ -30,6 +30,8 @@ export const DEFAULT_CONFIG = {
   digestTimezone: "",
   /** Security default: only secret-refs are honored; raw plaintext URLs are a deliberate legacy opt-in. PCLIP-19 */
   allowPlaintextWorkflowUrl: false,
+  /** Consecutive delivery failures on one URL before it is marked degraded. PCLIP-22 (T5). */
+  degradedDeliveryThreshold: 5,
 } as const;
 
 /** Teams supports Adaptive Cards ~v1.5 for bot/webhook cards. Do not use newer schema features. (T1) */

@@ -136,6 +136,13 @@ const manifest: PaperclipPluginManifestV1 = {
           "Legacy escape hatch. When OFF (recommended), Workflows URLs must be secret-refs. Enable only to keep an un-migrated plaintext URL working while you move it into a secret reference. PCLIP-19",
         default: DEFAULT_CONFIG.allowPlaintextWorkflowUrl,
       },
+      degradedDeliveryThreshold: {
+        type: "number",
+        title: "Degraded-delivery threshold",
+        description:
+          "Consecutive failed deliveries (after retries) to a single Workflows URL before it is flagged as degraded in settings. A successful delivery clears it. Applied at plugin startup. PCLIP-22",
+        default: DEFAULT_CONFIG.degradedDeliveryThreshold,
+      },
       botAppCredentialsRef: {
         type: "string",
         format: "secret-ref",

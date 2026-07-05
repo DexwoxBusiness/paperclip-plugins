@@ -174,9 +174,23 @@ describe("delivery retries with backoff (PCLIP-22 AC #1/#2)", () => {
     };
     const r = await deliverWithRetry(client, "https://x.logic.azure.com/y", MSG, (m) => logs.push(m), {}, policy, 30_000, now);
     expect(r.outcome).toMatchObject({ ok: false, transient: true });
-    expect(calls()).toBe(3); // fewer than the full 4 attempts — budget stopped it early
-    expect(r.attempts).toBe(3);
+    // 2 real attempts: attempt 1 (sleep 1000) then attempt 2 (sleep clamped to 500 →
+    // budget hits 1500). The post-backoff guard stops a 3rd request from firing.
+    expect(calls()).toBe(2);
+    expect(r.attempts).toBe(2);
     expect(logs.some((l) => l.includes("retry budget exhausted"))).toBe(true);
+  });
+
+  it("does not start a fresh request after a backoff that consumes the deadline (Kody)", async () => {
+    const { fetchFn, calls } = sequencedFetch([503]);
+    const client = createWorkflowsClient({ fetchFn });
+    let clock = 0;
+    const now = () => clock;
+    // One retry allowed by count, but the single backoff spends the whole budget.
+    const policy = { random: () => 1, baseDelayMs: 1000, factor: 2, overallDeadlineMs: 1000, sleep: async (ms: number) => { clock += ms; } };
+    const r = await deliverWithRetry(client, "https://x.logic.azure.com/y", MSG, () => {}, {}, policy, 30_000, now);
+    expect(calls()).toBe(1); // only the first request ran; no attempt after the deadline-consuming sleep
+    expect(r.attempts).toBe(1);
   });
 });
 

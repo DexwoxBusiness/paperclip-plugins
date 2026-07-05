@@ -251,6 +251,19 @@ export async function deliverWithRetry(
       status: outcome.status,
     });
     await sleep(delayMs);
+    // Re-check AFTER the backoff (Kody): the sleep may have consumed the remaining
+    // budget, so without this the loop would start another real safeDeliver request
+    // and push total callback time past the deadline. The pre-sleep check alone can't
+    // catch time spent sleeping — guard the next attempt here.
+    if (now() - startedAt >= overallDeadlineMs) {
+      log("teams delivery retry budget exhausted after backoff — returning last transient failure", {
+        ...context,
+        attempt,
+        elapsedMs: now() - startedAt,
+        overallDeadlineMs,
+      });
+      return { outcome, attempts: attempt, retried: attempt - 1 };
+    }
   }
 }
 
@@ -278,6 +291,11 @@ export interface MetricPoint {
  * chart success/failure RATES per event type and per channel (AC #4). Kept pure so
  * the exact names/tags are unit-asserted; the worker just forwards each to
  * `ctx.metrics.write`. Tag values are always strings (host contract).
+ *
+ * Note: we emit `total` + `success`/`failure` COUNTERS, not a pre-computed
+ * success_rate. A per-delivery rate is meaningless (it's 0 or 1) — "success rate =
+ * success/total" is an AGGREGATE the metrics backend derives over a window from
+ * these counters. Emitting a per-event rate would be wrong, not just redundant.
  */
 export function deliveryMetricPoints(r: RetriedDelivery, meta: { eventType: string; channel: string }): MetricPoint[] {
   const base = { event_type: meta.eventType, channel: meta.channel };

@@ -533,7 +533,9 @@ export default definePlugin({
           status: "open",
           createdAtMs: Date.now(),
         };
-        await escalationStore.create(record);
+        // Post the card FIRST; only persist the record once it's actually posted (Kody). If
+        // getBot throws or the post fails, we return a clear non-throwing result and never
+        // leave an orphan OPEN record that the sweep would later falsely time out.
         let bot: TeamsBot;
         try {
           bot = await getBot(ctx);
@@ -542,12 +544,17 @@ export default definePlugin({
           return { content: JSON.stringify({ escalated: false, reason: "bot not configured", escalationId: record.id }) };
         }
         const ref = await bot.postEscalationCard(conversationId, record);
-        if (ref) await escalationStore.attachCard(record.id, ref);
+        if (!ref) {
+          log("teams escalation: card post failed", { escalationId: record.id });
+          return { content: JSON.stringify({ escalated: false, reason: "card post failed", escalationId: record.id }) };
+        }
+        await escalationStore.create(record);
+        await escalationStore.attachCard(record.id, ref);
         await ctx.activity
           .log({ companyId: runCtx.companyId, message: `Escalation posted to Teams: ${record.reason}`, entityType: "plugin", entityId: record.id })
           .catch(() => undefined);
         await ctx.metrics.write("teams.escalations.created", 1).catch(() => undefined);
-        return { content: JSON.stringify({ escalated: !!ref, escalationId: record.id }) };
+        return { content: JSON.stringify({ escalated: true, escalationId: record.id }) };
       },
     );
 
@@ -568,18 +575,27 @@ export default definePlugin({
       }
       for (const id of expired) {
         const entry = open.find((e) => e.record.id === id);
-        const closed = await escalationStore.close(id, "timed_out", "system:timeout", Date.now());
-        if (!closed) continue; // resolved between listOpen and now — skip (no double action)
-        if (bot && entry?.conversationReference && entry?.activityId) {
-          await bot
-            .updateEscalationCard(
-              { conversationReference: entry.conversationReference, activityId: entry.activityId },
-              buildEscalationResolvedCard(closed.record, "timed_out"),
-            )
-            .catch((e) => log("teams escalation timeout card update failed", { id, error: e instanceof Error ? e.message : String(e) }));
+        if (!entry) continue;
+        if (defaultAction === "dismiss") {
+          // Terminal: close it and update the card to its final state.
+          const closed = await escalationStore.close(id, "timed_out", "system:timeout", Date.now());
+          if (!closed) continue; // resolved between listOpen and now — skip (no double action)
+          if (bot && entry.conversationReference && entry.activityId) {
+            await bot
+              .updateEscalationCard(
+                { conversationReference: entry.conversationReference, activityId: entry.activityId },
+                buildEscalationResolvedCard(closed.record, "timed_out"),
+              )
+              .catch((e) => log("teams escalation timeout card update failed", { id, error: e instanceof Error ? e.message : String(e) }));
+          }
+        } else {
+          // defer (default): leave it OPEN + actionable — mark deferred so the sweep won't
+          // re-fire, but the card keeps its buttons so a late human can still use the reply.
+          const deferred = await escalationStore.defer(id, Date.now());
+          if (!deferred) continue;
         }
         await ctx.activity
-          .log({ companyId: closed.record.companyId, message: `Escalation timed out — default action: ${defaultAction}`, entityType: "plugin", entityId: id })
+          .log({ companyId: entry.record.companyId, message: `Escalation timed out — default action: ${defaultAction}`, entityType: "plugin", entityId: id })
           .catch(() => undefined);
         await ctx.metrics.write("teams.escalations.timed_out", 1, { action: defaultAction }).catch(() => undefined);
         log("teams escalation timed out", { id, action: defaultAction });
@@ -799,7 +815,8 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
           actor: { actor: string; actorName?: string },
         ): Promise<{ record: EscalationRecord; status: "resolved" | "dismissed"; activityId?: string } | null> => {
           const status = action === "reply" ? "resolved" : "dismissed";
-          // close() transitions only an OPEN escalation → a second click never double-invokes.
+          // close() ATOMICALLY transitions only an OPEN escalation → a second click gets null
+          // (no double reply-back). We close FIRST to claim it, then invoke.
           const closed = await escStore.close(escalationId, status, actor.actor, Date.now());
           if (!closed) return null;
           if (action === "reply" && closed.record.suggestedReply) {
@@ -809,9 +826,17 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
                 reason: "HITL escalation reply from Microsoft Teams",
               });
             } catch (e) {
-              ctx.logger.info("teams escalation reply invoke failed", { escalationId, error: e instanceof Error ? e.message : String(e) });
+              // Invoke failed (transient host/API): the reply must NOT be lost. Re-open the
+              // escalation so the card stays actionable and a retry can re-claim it (Codex).
+              ctx.logger.info("teams escalation reply invoke failed — reopening", { escalationId, error: e instanceof Error ? e.message : String(e) });
+              await escStore.reopen(escalationId).catch(() => undefined);
+              return null;
             }
           }
+          // Log the human resolution (parity with the created/timeout paths — Kody/validator).
+          await ctx.activity
+            .log({ companyId: closed.record.companyId, message: `Escalation ${status} by ${actor.actorName || actor.actor}`, entityType: "plugin", entityId: escalationId })
+            .catch(() => undefined);
           await ctx.metrics.write("teams.escalations.resolved", 1, { action: action === "reply" ? "human_reply" : "dismissed" }).catch(() => undefined);
           // Return the stored card activity id so the bot can update the exact card even when
           // Teams omits replyToId (multiple cards in one channel — MS docs caveat).

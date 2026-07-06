@@ -44,6 +44,37 @@ export interface EscalationRecord {
   resolvedAtMs?: number;
   /** Who/what resolved it: `teams:{aadObjectId}` or `system:timeout`. */
   resolvedBy?: string;
+  /**
+   * Epoch ms the escalation was DEFERRED at timeout (default action = "defer"). Set means the
+   * sweep already handled it once and left it OPEN + actionable — the sweep skips it thereafter
+   * (no re-fire), but a human can still click "Use suggested reply". "dismiss" CLOSES instead.
+   */
+  deferredAtMs?: number;
+}
+
+/** Caps so an agent-supplied escalation can't build an oversized card / bloat state (Kody). */
+export const MAX_HISTORY_TURNS = 10;
+export const MAX_TEXT_LEN = 2000;
+
+// Built from strings so the SOURCE stays ASCII (no literal control / zero-width bytes).
+const CONTROL_CHARS = new RegExp("[\\u0000-\\u001F\\u007F]", "g");
+const MARKDOWN_CHARS = /[\\`*_{}[\]()#+\-!<>|~]/g;
+const ZERO_WIDTH = "​";
+const ELLIPSIS = "…";
+
+/**
+ * Neutralize agent/user-supplied text before it enters a human-facing Adaptive Card TextBlock
+ * (Kody security): TextBlocks render a Markdown subset, so untrusted text could inject links,
+ * emphasis, or @mentions into the escalation channel. Escape the Markdown-significant chars,
+ * strip control chars, defuse `@`-mentions with a zero-width break, and cap the length.
+ */
+export function sanitizeCardText(text: string | undefined, maxLen = MAX_TEXT_LEN): string {
+  if (typeof text !== "string" || !text) return "";
+  const escaped = text
+    .replace(CONTROL_CHARS, " ")
+    .replace(MARKDOWN_CHARS, (c) => `\\${c}`)
+    .replace(/@/g, `@${ZERO_WIDTH}`);
+  return escaped.length > maxLen ? `${escaped.slice(0, maxLen - 1)}${ELLIPSIS}` : escaped;
 }
 
 // --------------------------------------------------------------------------
@@ -90,22 +121,23 @@ export function formatConfidence(confidence: number | undefined): string {
 
 /**
  * The open escalation card: reason, confidence, agent reasoning, conversation history, and the
- * "Use suggested reply" (only when a suggestedReply exists) + "Dismiss" buttons (AC #1).
+ * "Use suggested reply" (only when a suggestedReply exists) + "Dismiss" buttons (AC #1). All
+ * agent-supplied text is sanitized (Kody) and length-capped (Kody perf) before rendering.
  */
 export function buildEscalationCard(record: EscalationRecord): AdaptiveCard {
   const body = [
     textBlock("🚨 Agent needs help", { size: "Large", weight: "Bolder" }),
-    textBlock(record.reason, { weight: "Bolder", wrap: true }),
+    textBlock(sanitizeCardText(record.reason), { weight: "Bolder", wrap: true }),
     factSet([
-      { title: "Agent", value: record.agentName ?? "" },
+      { title: "Agent", value: sanitizeCardText(record.agentName ?? "", 120) },
       { title: "Confidence", value: formatConfidence(record.confidence) },
     ]),
     ...(record.agentReasoning
-      ? [textBlock("Agent reasoning", { weight: "Bolder", spacing: "Medium" }), textBlock(record.agentReasoning, { wrap: true, isSubtle: true })]
+      ? [textBlock("Agent reasoning", { weight: "Bolder", spacing: "Medium" }), textBlock(sanitizeCardText(record.agentReasoning), { wrap: true, isSubtle: true })]
       : []),
     ...renderHistory(record.conversationHistory),
     ...(record.suggestedReply
-      ? [textBlock("Suggested reply", { weight: "Bolder", spacing: "Medium" }), textBlock(record.suggestedReply, { wrap: true })]
+      ? [textBlock("Suggested reply", { weight: "Bolder", spacing: "Medium" }), textBlock(sanitizeCardText(record.suggestedReply), { wrap: true })]
       : []),
   ];
   const actions: CardAction[] = [
@@ -117,15 +149,17 @@ export function buildEscalationCard(record: EscalationRecord): AdaptiveCard {
 
 function renderHistory(history: ConversationTurn[] | undefined) {
   if (!history || history.length === 0) return [];
+  // Cap to the last N turns so a long transcript can't build an oversized card (Kody perf).
+  const turns = history.slice(-MAX_HISTORY_TURNS);
   return [
     textBlock("Conversation", { weight: "Bolder", spacing: "Medium" }),
-    ...history.map((t) => textBlock(`**${t.role}:** ${t.text}`, { wrap: true, isSubtle: true })),
+    ...turns.map((t) => textBlock(`**${sanitizeCardText(t.role, 60)}:** ${sanitizeCardText(t.text)}`, { wrap: true, isSubtle: true })),
   ];
 }
 
 /**
  * The resolved/dismissed/timed-out card, with the actions removed. `byName` names the human
- * for a reply/dismiss; timeouts read "timed out".
+ * for a reply/dismiss; timeouts read "timed out". The reason is sanitized (agent-supplied).
  */
 export function buildEscalationResolvedCard(record: EscalationRecord, status: Exclude<EscalationStatus, "open">, opts: { byName?: string } = {}): AdaptiveCard {
   const label =
@@ -133,7 +167,7 @@ export function buildEscalationResolvedCard(record: EscalationRecord, status: Ex
   const by = opts.byName ? ` by ${opts.byName}` : "";
   return adaptiveCard([
     textBlock(`${label}${status === "timed_out" ? "" : by}`, { size: "Medium", weight: "Bolder", color: status === "resolved" ? "Good" : "Attention" }),
-    textBlock(record.reason, { isSubtle: true, wrap: true }),
+    textBlock(sanitizeCardText(record.reason), { isSubtle: true, wrap: true }),
   ]);
 }
 
@@ -142,13 +176,13 @@ export function buildEscalationResolvedCard(record: EscalationRecord, status: Ex
 // --------------------------------------------------------------------------
 
 /**
- * Given the current open escalation records, return the ids that have exceeded `timeoutMs`
- * (and are still open) and should get the default action. Non-open records are skipped
- * (idempotent — a resolved/dismissed record is never timed out).
+ * Given the current open escalation records, return the ids that have exceeded `timeoutMs` and
+ * should get the default action. Skips non-open records (idempotent) AND already-DEFERRED ones
+ * (`deferredAtMs` set) so a deferred escalation isn't re-processed every sweep tick.
  */
 export function expiredEscalations(records: EscalationRecord[], nowMs: number, timeoutMs: number): string[] {
   return records
-    .filter((r) => r.status === "open" && Number.isFinite(r.createdAtMs) && nowMs - r.createdAtMs >= timeoutMs)
+    .filter((r) => r.status === "open" && r.deferredAtMs == null && Number.isFinite(r.createdAtMs) && nowMs - r.createdAtMs >= timeoutMs)
     .map((r) => r.id);
 }
 

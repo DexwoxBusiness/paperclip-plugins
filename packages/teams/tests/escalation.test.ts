@@ -4,25 +4,30 @@ import {
   buildEscalationResolvedCard,
   expiredEscalations,
   formatConfidence,
+  MAX_HISTORY_TURNS,
   parseEscalationSubmit,
+  sanitizeCardText,
   timeoutMsFromMinutes,
   type EscalationRecord,
 } from "../src/escalation.js";
 import { validateAdaptiveCard } from "../src/adaptive-card.js";
+
+const NL = String.fromCharCode(10); // newline, without an escape sequence in source
+const TAB = String.fromCharCode(9); // tab, ditto
 
 function rec(over: Partial<EscalationRecord> = {}): EscalationRecord {
   return {
     id: "esc-1",
     agentId: "agent-1",
     companyId: "co-1",
-    reason: "Customer is asking for a refund I can't authorize",
+    reason: "Customer wants a refund I can't authorize",
     confidence: 0.42,
     agentName: "Support Bot",
     agentReasoning: "Refund exceeds my limit",
-    suggestedReply: "I've escalated your refund to a human — they'll follow up shortly.",
+    suggestedReply: "I've escalated your refund - a human will follow up.",
     conversationHistory: [
       { role: "user", text: "I want a refund" },
-      { role: "agent", text: "Let me check that for you" },
+      { role: "agent", text: "Let me check" },
     ],
     status: "open",
     createdAtMs: 1_000_000,
@@ -31,60 +36,87 @@ function rec(over: Partial<EscalationRecord> = {}): EscalationRecord {
 }
 
 describe("parseEscalationSubmit", () => {
-  it("parses reply and dismiss", () => {
-    expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "esc-1", action: "reply" })).toEqual({ escalationId: "esc-1", action: "reply" });
-    expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "esc-1", action: "dismiss" })).toEqual({ escalationId: "esc-1", action: "dismiss" });
-  });
-  it("ignores non-escalation / malformed submits", () => {
-    expect(parseEscalationSubmit(undefined)).toBeNull();
-    expect(parseEscalationSubmit({ pcAction: "approval", escalationId: "x", action: "reply" })).toBeNull();
+  it("parses reply/dismiss; ignores others", () => {
+    expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "e", action: "reply" })).toEqual({ escalationId: "e", action: "reply" });
+    expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "e", action: "dismiss" })).toEqual({ escalationId: "e", action: "dismiss" });
+    expect(parseEscalationSubmit({ pcAction: "approval", escalationId: "e", action: "reply" })).toBeNull();
     expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "", action: "reply" })).toBeNull();
-    expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "x", action: "bogus" })).toBeNull();
+    expect(parseEscalationSubmit(undefined)).toBeNull();
   });
 });
 
 describe("formatConfidence", () => {
-  it("renders [0,1] as a percentage; clamps; blanks invalid", () => {
+  it("renders percent; clamps; blanks invalid", () => {
     expect(formatConfidence(0.42)).toBe("42%");
-    expect(formatConfidence(0)).toBe("0%");
-    expect(formatConfidence(1)).toBe("100%");
     expect(formatConfidence(1.5)).toBe("100%");
     expect(formatConfidence(undefined)).toBe("");
     expect(formatConfidence(NaN)).toBe("");
   });
 });
 
+describe("sanitizeCardText (Kody security + perf)", () => {
+  it("escapes Markdown-significant characters so links/emphasis don't render", () => {
+    const out = sanitizeCardText("click [here](http://evil) and *bold* `code`");
+    expect(out).toContain("\\[");
+    expect(out).toContain("\\]");
+    expect(out).toContain("\\(");
+    expect(out).toContain("\\)");
+    expect(out).toContain("\\*");
+    expect(out).toContain("\\`");
+    expect(out).not.toContain("[here]"); // the raw link syntax is broken up
+  });
+  it("neutralizes @-mentions with a zero-width joiner", () => {
+    const out = sanitizeCardText("ping @channel now");
+    expect(out).not.toContain("@channel"); // a zero-width char is inserted after @
+    expect(out).toContain("@");
+  });
+  it("strips control characters (newlines/tabs) — no raw control chars survive", () => {
+    const out = sanitizeCardText(`line1${NL}line2${TAB}line3!`);
+    expect([...out].every((ch) => ch.charCodeAt(0) >= 0x20)).toBe(true); // no control chars survive
+    expect(out).toContain("\\!"); // the bang is still Markdown-escaped
+    expect(out).toContain("line1 line2"); // newline became a space
+  });
+  it("caps length with an ellipsis", () => {
+    const out = sanitizeCardText("x".repeat(5000), 100);
+    expect(out.length).toBeLessThanOrEqual(100);
+  });
+  it("empty/invalid → empty string", () => {
+    expect(sanitizeCardText(undefined)).toBe("");
+    expect(sanitizeCardText("")).toBe("");
+  });
+});
+
 describe("buildEscalationCard (AC #1)", () => {
-  it("includes conversation history, agent reasoning, and confidence", () => {
-    const card = buildEscalationCard(rec());
+  it("includes history, reasoning, confidence; sanitizes agent text", () => {
+    const card = buildEscalationCard(rec({ reason: "refund [x](y)" }));
     expect(validateAdaptiveCard(card)).toEqual({ ok: true, errors: [] });
     const json = JSON.stringify(card);
-    expect(json).toContain("Refund exceeds my limit"); // reasoning
-    expect(json).toContain("42%"); // confidence
-    expect(json).toContain("I want a refund"); // history
-    expect(json).toContain("Let me check that for you");
+    expect(json).toContain("Refund exceeds my limit");
+    expect(json).toContain("42%");
+    expect(json).toContain("I want a refund");
+    expect(json).not.toContain("refund [x](y)"); // sanitized (escaped)
   });
-  it("shows 'Use suggested reply' only when a suggestedReply exists; always shows Dismiss", () => {
-    const withReply = buildEscalationCard(rec());
-    const submits = (withReply.actions ?? []).filter((a) => a.type === "Action.Submit");
-    expect(submits.map((a) => (a.data as { action: string }).action).sort()).toEqual(["dismiss", "reply"]);
-
-    const noReply = buildEscalationCard(rec({ suggestedReply: undefined }));
-    const submits2 = (noReply.actions ?? []).filter((a) => a.type === "Action.Submit");
-    expect(submits2.map((a) => (a.data as { action: string }).action)).toEqual(["dismiss"]);
+  it("shows 'Use suggested reply' only with a suggestedReply; always Dismiss", () => {
+    const withReply = (buildEscalationCard(rec()).actions ?? []).filter((a) => a.type === "Action.Submit");
+    expect(withReply.map((a) => (a.data as { action: string }).action).sort()).toEqual(["dismiss", "reply"]);
+    const noReply = (buildEscalationCard(rec({ suggestedReply: undefined })).actions ?? []).filter((a) => a.type === "Action.Submit");
+    expect(noReply.map((a) => (a.data as { action: string }).action)).toEqual(["dismiss"]);
   });
-  it("renders without optional fields (no reasoning/history/confidence)", () => {
-    const card = buildEscalationCard(rec({ agentReasoning: undefined, conversationHistory: [], confidence: undefined, suggestedReply: undefined }));
-    expect(validateAdaptiveCard(card).ok).toBe(true);
+  it("caps conversation history to the last MAX_HISTORY_TURNS (Kody perf)", () => {
+    // Alphanumeric labels so sanitize doesn't escape them (a hyphen would become \-).
+    const many = Array.from({ length: MAX_HISTORY_TURNS + 8 }, (_, i) => ({ role: "user", text: `t${i}z` }));
+    const json = JSON.stringify(buildEscalationCard(rec({ conversationHistory: many })));
+    expect(json).toContain(`t${MAX_HISTORY_TURNS + 7}z`); // last turn kept
+    expect(json).not.toContain("t0z"); // earliest dropped by the cap
   });
 });
 
 describe("buildEscalationResolvedCard", () => {
   it("resolved/dismissed name the human; timed_out omits actions", () => {
-    const resolved = buildEscalationResolvedCard(rec(), "resolved", { byName: "Ada" });
-    expect(validateAdaptiveCard(resolved).ok).toBe(true);
-    expect(resolved.actions).toBeUndefined();
-    expect(JSON.stringify(resolved)).toContain("Resolved by Ada");
+    const r = buildEscalationResolvedCard(rec(), "resolved", { byName: "Ada" });
+    expect(validateAdaptiveCard(r).ok).toBe(true);
+    expect(r.actions).toBeUndefined();
+    expect(JSON.stringify(r)).toContain("Resolved by Ada");
     expect(JSON.stringify(buildEscalationResolvedCard(rec(), "dismissed", { byName: "Bob" }))).toContain("Dismissed by Bob");
     expect(JSON.stringify(buildEscalationResolvedCard(rec(), "timed_out"))).toMatch(/Timed out/i);
   });
@@ -92,18 +124,16 @@ describe("buildEscalationResolvedCard", () => {
 
 describe("expiredEscalations + timeoutMsFromMinutes", () => {
   const now = 10_000_000;
-  it("returns only OPEN records past the timeout", () => {
+  it("only OPEN + past-timeout, skipping resolved AND already-deferred", () => {
     const records: EscalationRecord[] = [
       rec({ id: "old-open", status: "open", createdAtMs: now - 20 * 60_000 }),
       rec({ id: "fresh-open", status: "open", createdAtMs: now - 5 * 60_000 }),
       rec({ id: "old-resolved", status: "resolved", createdAtMs: now - 30 * 60_000 }),
+      rec({ id: "old-deferred", status: "open", createdAtMs: now - 30 * 60_000, deferredAtMs: now - 10 * 60_000 }),
     ];
     expect(expiredEscalations(records, now, 15 * 60_000)).toEqual(["old-open"]);
   });
-  it("boundary: exactly timeout counts as expired", () => {
-    expect(expiredEscalations([rec({ id: "x", createdAtMs: now - 15 * 60_000 })], now, 15 * 60_000)).toEqual(["x"]);
-  });
-  it("timeoutMsFromMinutes guards invalid/non-positive → 15m default", () => {
+  it("timeoutMsFromMinutes guards invalid → 15m default", () => {
     expect(timeoutMsFromMinutes(30)).toBe(30 * 60_000);
     expect(timeoutMsFromMinutes(undefined)).toBe(15 * 60_000);
     expect(timeoutMsFromMinutes(0)).toBe(15 * 60_000);

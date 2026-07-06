@@ -372,10 +372,16 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     // Teams may omit replyToId when several Adaptive Cards share a channel (MS docs). If we
     // still have no id, post a fresh card so the human always sees the outcome (never silent).
     const targetId = (context.activity as { replyToId?: string }).replyToId ?? result.activityId;
-    if (targetId) {
-      await context.updateActivity({ ...cardActivity(card), id: targetId } as Activity);
-    } else {
-      await context.sendActivity(cardActivity(card) as Activity);
+    try {
+      if (targetId) {
+        await context.updateActivity({ ...cardActivity(card), id: targetId } as Activity);
+      } else {
+        await context.sendActivity(cardActivity(card) as Activity);
+      }
+    } catch (e) {
+      // The resolution already succeeded (agent invoked + state updated); a failed card render
+      // must NOT fail the whole turn (Kody) — log and let the turn complete gracefully.
+      deps.log("teams escalation card update failed", { escalationId, error: e instanceof Error ? e.message : String(e) });
     }
   };
 

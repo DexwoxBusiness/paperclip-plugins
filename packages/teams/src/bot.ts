@@ -94,6 +94,7 @@ export interface TeamsBotDeps {
       escalationId: string,
       action: EscalationAction,
       actor: { actor: string; actorName?: string },
+      replyText?: string,
     ): Promise<{ record: EscalationRecord; status: "resolved" | "dismissed"; activityId?: string } | null>;
   };
   log: (message: string, fields?: Record<string, unknown>) => void;
@@ -257,7 +258,7 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     // commands (a card submit has no command text).
     const escalationSubmit = parseEscalationSubmit(context.activity.value);
     if (escalationSubmit && deps.escalations) {
-      await handleEscalationSubmit(context, escalationSubmit.escalationId, escalationSubmit.action);
+      await handleEscalationSubmit(context, escalationSubmit.escalationId, escalationSubmit.action, escalationSubmit.replyText);
       await next();
       return;
     }
@@ -361,11 +362,11 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
    * the card the button was on (`replyToId`) to its resolved/dismissed state. Unknown/already-
    * resolved escalations return null and leave the card untouched (idempotent, no double-invoke).
    */
-  const handleEscalationSubmit = async (context: TurnContext, escalationId: string, action: EscalationAction): Promise<void> => {
+  const handleEscalationSubmit = async (context: TurnContext, escalationId: string, action: EscalationAction, replyText?: string): Promise<void> => {
     if (!deps.escalations) return;
     const actor = teamsActor(context.activity.from?.aadObjectId);
     const actorName = sanitizeDisplayName(context.activity.from?.name);
-    const result = await deps.escalations.onSubmit(escalationId, action, { actor, actorName });
+    const result = await deps.escalations.onSubmit(escalationId, action, { actor, actorName }, replyText);
     if (!result) return;
     const card = buildEscalationResolvedCard(result.record, result.status, { byName: actorName });
     // Prefer the activity's own replyToId; fall back to the STORED card activity id, since

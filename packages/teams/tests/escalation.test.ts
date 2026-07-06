@@ -6,6 +6,8 @@ import {
   formatConfidence,
   MAX_HISTORY_TURNS,
   parseEscalationSubmit,
+  REPLY_INPUT_ID,
+  resolveEscalationReply,
   sanitizeCardText,
   timeoutMsFromMinutes,
   type EscalationRecord,
@@ -37,11 +39,31 @@ function rec(over: Partial<EscalationRecord> = {}): EscalationRecord {
 
 describe("parseEscalationSubmit", () => {
   it("parses reply/dismiss; ignores others", () => {
-    expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "e", action: "reply" })).toEqual({ escalationId: "e", action: "reply" });
-    expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "e", action: "dismiss" })).toEqual({ escalationId: "e", action: "dismiss" });
+    expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "e", action: "reply" })).toEqual({ escalationId: "e", action: "reply", replyText: undefined });
+    expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "e", action: "dismiss" })).toEqual({ escalationId: "e", action: "dismiss", replyText: undefined });
     expect(parseEscalationSubmit({ pcAction: "approval", escalationId: "e", action: "reply" })).toBeNull();
     expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "", action: "reply" })).toBeNull();
     expect(parseEscalationSubmit(undefined)).toBeNull();
+  });
+  it("extracts the human's edited reply from the Input.Text field (trimmed; blank → undefined)", () => {
+    expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "e", action: "reply", [REPLY_INPUT_ID]: "  edited reply  " }))
+      .toEqual({ escalationId: "e", action: "reply", replyText: "edited reply" });
+    expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "e", action: "reply", [REPLY_INPUT_ID]: "   " }))
+      .toEqual({ escalationId: "e", action: "reply", replyText: undefined });
+  });
+});
+
+describe("resolveEscalationReply (human edit vs. fallback vs. nothing)", () => {
+  it("prefers the human's edited text over the agent suggestion", () => {
+    expect(resolveEscalationReply("  human edited  ", "agent suggestion")).toBe("human edited");
+  });
+  it("falls back to the suggestion when the field is blank/undefined", () => {
+    expect(resolveEscalationReply(undefined, "agent suggestion")).toBe("agent suggestion");
+    expect(resolveEscalationReply("   ", "agent suggestion")).toBe("agent suggestion");
+  });
+  it("returns null when there is nothing to send (both empty) so the worker re-opens", () => {
+    expect(resolveEscalationReply("", "")).toBeNull();
+    expect(resolveEscalationReply(undefined, undefined)).toBeNull();
   });
 });
 
@@ -96,11 +118,22 @@ describe("buildEscalationCard (AC #1)", () => {
     expect(json).toContain("I want a refund");
     expect(json).not.toContain("refund [x](y)"); // sanitized (escaped)
   });
-  it("shows 'Use suggested reply' only with a suggestedReply; always Dismiss", () => {
+  it("shows the reply action only with a suggestedReply; always Dismiss", () => {
     const withReply = (buildEscalationCard(rec()).actions ?? []).filter((a) => a.type === "Action.Submit");
     expect(withReply.map((a) => (a.data as { action: string }).action).sort()).toEqual(["dismiss", "reply"]);
     const noReply = (buildEscalationCard(rec({ suggestedReply: undefined })).actions ?? []).filter((a) => a.type === "Action.Submit");
     expect(noReply.map((a) => (a.data as { action: string }).action)).toEqual(["dismiss"]);
+  });
+  it("renders an EDITABLE reply input prefilled with the suggestion (no input when none)", () => {
+    const card = buildEscalationCard(rec({ suggestedReply: "Please try restarting" }));
+    expect(validateAdaptiveCard(card).ok).toBe(true);
+    const input = card.body.find((e) => e.type === "Input.Text");
+    expect(input).toBeDefined();
+    expect(input?.id).toBe(REPLY_INPUT_ID);
+    expect(input?.value).toBe("Please try restarting"); // verbatim prefill (edit box, not Markdown)
+    expect(input?.isMultiline).toBe(true);
+    // No suggestion → no input field to edit.
+    expect(buildEscalationCard(rec({ suggestedReply: undefined })).body.find((e) => e.type === "Input.Text")).toBeUndefined();
   });
   it("caps conversation history to the last MAX_HISTORY_TURNS (Kody perf)", () => {
     // Alphanumeric labels so sanitize doesn't escape them (a hyphen would become \-).

@@ -11,7 +11,14 @@
  * the worker owns the tool registration, proactive post, agents.invoke, state, and the job.
  */
 
-import { adaptiveCard, factSet, submitAction, textBlock, type AdaptiveCard, type CardAction } from "./adaptive-card.js";
+import { adaptiveCard, factSet, inputText, submitAction, textBlock, type AdaptiveCard, type CardAction } from "./adaptive-card.js";
+
+/**
+ * Id of the editable reply field on the escalation card. Teams returns its value in the submit
+ * activity's `value` bag under this key (merged with the Action.Submit `data`), so the human can
+ * EDIT the agent's suggested reply before sending it back (PCLIP-28 / T11).
+ */
+export const REPLY_INPUT_ID = "escalationReplyText";
 
 export type EscalationStatus = "open" | "resolved" | "dismissed" | "timed_out";
 export type EscalationDefaultAction = "defer" | "dismiss";
@@ -96,16 +103,33 @@ function submitData(escalationId: string, action: EscalationAction): EscalationS
 
 /**
  * Parse an inbound Action.Submit value into an escalation action, or null when the activity
- * is not one of our escalation submits (so the worker ignores other messages).
+ * is not one of our escalation submits (so the worker ignores other messages). On a "reply"
+ * submit, `replyText` carries the human's (possibly edited) reply from the Input.Text field —
+ * trimmed, and undefined when the field is absent/blank so the worker can fall back to the
+ * agent's suggestedReply.
  */
-export function parseEscalationSubmit(value: unknown): { escalationId: string; action: EscalationAction } | null {
+export function parseEscalationSubmit(
+  value: unknown,
+): { escalationId: string; action: EscalationAction; replyText?: string } | null {
   if (!value || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
   if (v.pcAction !== "escalation") return null;
   const escalationId = typeof v.escalationId === "string" ? v.escalationId.trim() : "";
   const action = v.action;
   if (!escalationId || (action !== "reply" && action !== "dismiss")) return null;
-  return { escalationId, action };
+  const rawReply = typeof v[REPLY_INPUT_ID] === "string" ? (v[REPLY_INPUT_ID] as string).trim() : "";
+  return { escalationId, action, replyText: rawReply || undefined };
+}
+
+/**
+ * Decide the text to send back to the escalating agent on a "reply": the human's edited
+ * `replyText` wins; a blank field falls back to the agent's `suggestedReply`. Returns null when
+ * there is nothing to send (both empty) so the worker can re-open rather than resolve on an empty
+ * prompt. Pure so the "human edit vs. fallback vs. nothing" decision is unit-tested (PCLIP-28).
+ */
+export function resolveEscalationReply(replyText: string | undefined, suggestedReply: string | undefined): string | null {
+  const reply = (replyText ?? "").trim() || (suggestedReply ?? "").trim();
+  return reply || null;
 }
 
 // --------------------------------------------------------------------------
@@ -137,11 +161,22 @@ export function buildEscalationCard(record: EscalationRecord): AdaptiveCard {
       : []),
     ...renderHistory(record.conversationHistory),
     ...(record.suggestedReply
-      ? [textBlock("Suggested reply", { weight: "Bolder", spacing: "Medium" }), textBlock(sanitizeCardText(record.suggestedReply), { wrap: true })]
+      ? [
+          textBlock("Reply to send back (edit before sending)", { weight: "Bolder", spacing: "Medium" }),
+          // Editable field prefilled with the agent's suggestion. Its value is NOT Markdown-rendered
+          // (it's an edit box), so prefill verbatim, only length-bounded — the human owns this text.
+          inputText(REPLY_INPUT_ID, {
+            value: record.suggestedReply.slice(0, MAX_TEXT_LEN),
+            isMultiline: true,
+            maxLength: MAX_TEXT_LEN,
+            placeholder: "Edit the reply, or send as-is",
+          }),
+        ]
       : []),
   ];
   const actions: CardAction[] = [
-    ...(record.suggestedReply ? [submitAction("Use suggested reply", submitData(record.id, "reply"))] : []),
+    // "Send reply" submits the (possibly edited) Input.Text value alongside the action data.
+    ...(record.suggestedReply ? [submitAction("Send reply", submitData(record.id, "reply"))] : []),
     submitAction("Dismiss", submitData(record.id, "dismiss")),
   ];
   return adaptiveCard(body, actions);

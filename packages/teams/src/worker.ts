@@ -9,6 +9,7 @@ import { type CommandDeps } from "./commands.js";
 import {
   buildEscalationResolvedCard,
   expiredEscalations,
+  resolveEscalationReply,
   timeoutMsFromMinutes,
   type ConversationTurn,
   type EscalationRecord,
@@ -813,16 +814,26 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
           escalationId: string,
           action: "reply" | "dismiss",
           actor: { actor: string; actorName?: string },
+          replyText?: string,
         ): Promise<{ record: EscalationRecord; status: "resolved" | "dismissed"; activityId?: string } | null> => {
           const status = action === "reply" ? "resolved" : "dismissed";
           // close() ATOMICALLY transitions only an OPEN escalation → a second click gets null
           // (no double reply-back). We close FIRST to claim it, then invoke.
           const closed = await escStore.close(escalationId, status, actor.actor, Date.now());
           if (!closed) return null;
-          if (action === "reply" && closed.record.suggestedReply) {
+          if (action === "reply") {
+            // Prefer the human's edited text from the card's Input.Text; fall back to the agent's
+            // suggestion only when the human left it unchanged/blank. The HUMAN owns what is sent.
+            const humanReply = resolveEscalationReply(replyText, closed.record.suggestedReply);
+            if (!humanReply) {
+              // "Send reply" with nothing to send (no suggestion + empty field): don't invoke with an
+              // empty prompt — re-open so the escalation stays actionable rather than silently resolving.
+              await escStore.reopen(escalationId).catch(() => undefined);
+              return null;
+            }
             try {
               await ctx.agents.invoke(closed.record.agentId, closed.record.companyId, {
-                prompt: `Human reply to escalation: ${closed.record.suggestedReply}`,
+                prompt: `Human reply to escalation: ${humanReply}`,
                 reason: "HITL escalation reply from Microsoft Teams",
               });
             } catch (e) {

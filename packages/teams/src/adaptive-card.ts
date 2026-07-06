@@ -80,6 +80,19 @@ export function openUrlAction(title: string, url: string): CardAction {
   return { type: "Action.OpenUrl", title, url };
 }
 
+/**
+ * Input.Text — an editable field whose value is returned in the submit activity's `value` under
+ * `id` (merged with the triggering Action.Submit's `data`). Used for the HITL escalation reply so
+ * a human can edit the agent's suggestion before sending (PCLIP-28). The `value` prefill is shown
+ * verbatim in an edit box (NOT Markdown-rendered), so it is passed through as-is, only length-bounded.
+ */
+export function inputText(
+  id: string,
+  opts: { value?: string; isMultiline?: boolean; placeholder?: string; maxLength?: number } = {},
+): CardElement {
+  return { type: "Input.Text", id, ...opts };
+}
+
 /** Action.Submit — a click posts a bot activity carrying `data` (no invoke-response contract). */
 export function submitAction(title: string, data: Record<string, unknown>): CardAction {
   return { type: "Action.Submit", title, data };
@@ -156,6 +169,8 @@ function validateElement(el: unknown, path: string): string[] {
   if (!e || typeof e !== "object") return [`${path}: not an object`];
   if (typeof e.type !== "string" || !e.type) errors.push(`${path}.type is required`);
   if (e.type === "TextBlock" && (typeof e.text !== "string" || !e.text)) errors.push(`${path}.text is required for a TextBlock`);
+  // Input.Text must carry a non-empty string `id` — that id is the key its value is returned under.
+  if (e.type === "Input.Text" && (typeof e.id !== "string" || !e.id)) errors.push(`${path}.id is required for an Input.Text`);
   if (e.type === "FactSet") {
     if (!Array.isArray(e.facts)) errors.push(`${path}.facts must be an array`);
     else

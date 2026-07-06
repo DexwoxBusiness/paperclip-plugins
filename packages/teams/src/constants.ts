@@ -9,6 +9,8 @@ export const WEBHOOK_KEYS = {
 export const JOB_KEYS = {
   /** Daily digest of agent activity. PCLIP-21 */
   dailyDigest: "daily-digest",
+  /** HITL escalation timeout sweep (applies the default action to expired escalations). PCLIP-28 */
+  checkEscalationTimeouts: "check-escalation-timeouts",
 } as const;
 
 export const BUDGET_THRESHOLDS = [80, 90, 100] as const;
@@ -36,6 +38,12 @@ export const DEFAULT_CONFIG = {
   paperclipBoardApiKeyRef: "",
   /** Teams conversation id the bot posts INTERACTIVE approval cards to (the bot must be installed there). Empty = interactive approvals off (Workflows-only). PCLIP-24 (T7). */
   botApprovalsConversationId: "",
+  /** Teams conversation id the bot posts HITL escalation cards to (bot must be installed there). Empty = escalation disabled. PCLIP-28 (T11). */
+  escalationConversationId: "",
+  /** Minutes an escalation waits for a human before the default action fires (default 15). PCLIP-28 */
+  escalationTimeoutMinutes: 15,
+  /** Default action when an escalation times out: "defer" (leave for later) or "dismiss". PCLIP-28 */
+  escalationDefaultAction: "defer",
 } as const;
 
 /** Teams supports Adaptive Cards ~v1.5 for bot/webhook cards. Do not use newer schema features. (T1) */

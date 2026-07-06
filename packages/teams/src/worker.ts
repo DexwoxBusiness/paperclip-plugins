@@ -6,6 +6,14 @@ import { BOT_FRAMEWORK_ISSUERS, BotInboundUnauthorizedError } from "./bot-auth.j
 import { describeMessagingEndpoint } from "./messaging-endpoint.js";
 import { resolveSecretRef } from "./secret-resolve.js";
 import { type CommandDeps } from "./commands.js";
+import {
+  buildEscalationResolvedCard,
+  expiredEscalations,
+  timeoutMsFromMinutes,
+  type ConversationTurn,
+  type EscalationRecord,
+} from "./escalation.js";
+import { createEscalationStore, type EscalationStoreBackend } from "./escalation-store.js";
 import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
 import { createApprovalStore } from "./approval-store.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
@@ -54,6 +62,16 @@ const INSTANCE_SCOPE = { scopeKind: "instance" } as const;
  * named set so the open filter stays correct if the IssueStatus model gains terminal states.
  */
 const TERMINAL_ISSUE_STATUSES: ReadonlySet<string> = new Set(["done", "cancelled"]);
+
+/** Coerce a tool's `conversationHistory` param into clean turns (drop non-objects/empty text). */
+function normalizeTurns(raw: unknown): ConversationTurn[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const turns = raw
+    .filter((t): t is Record<string, unknown> => !!t && typeof t === "object")
+    .map((t) => ({ role: String(t.role ?? ""), text: String(t.text ?? "") }))
+    .filter((t) => t.text.trim().length > 0);
+  return turns.length ? turns : undefined;
+}
 
 /** Plugin-state key: the date (server-local) the digest last posted, for once-a-day throttling. */
 const DIGEST_LAST_RUN_DATE_KEY = "digest:last-run-date";
@@ -467,6 +485,106 @@ export default definePlugin({
         throw e;
       }
     });
+
+    // ---- HITL escalation (PCLIP-28 / T11) ----
+    const escalationStore = createEscalationStore(state as EscalationStoreBackend);
+
+    // Agent tool: a stuck agent escalates with context; we post an interactive card to the
+    // configured Teams conversation. No-ops (does NOT throw) when escalation/bot isn't
+    // configured, returning a clear result to the agent (AC #4).
+    ctx.tools.register(
+      "escalate_to_human",
+      {
+        displayName: "Escalate to human",
+        description:
+          "Escalate the current conversation to a human via the configured Microsoft Teams channel, with a suggested reply they can send back with one click.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            reason: { type: "string", description: "Why the agent is escalating" },
+            confidence: { type: "number", description: "Agent confidence in [0,1]" },
+            agentName: { type: "string", description: "Name of the escalating agent" },
+            agentReasoning: { type: "string", description: "The agent's reasoning for escalating" },
+            suggestedReply: { type: "string", description: "A reply the human can send back with one click" },
+            conversationHistory: {
+              type: "array",
+              description: "Recent conversation turns for context",
+              items: { type: "object", properties: { role: { type: "string" }, text: { type: "string" } } },
+            },
+          },
+          required: ["reason"],
+        },
+      },
+      async (params, runCtx) => {
+        const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
+        const conversationId = (cfg.escalationConversationId ?? "").trim();
+        if (!conversationId) return { content: JSON.stringify({ escalated: false, reason: "escalation not configured" }) };
+        const p = (params ?? {}) as Record<string, unknown>;
+        const record: EscalationRecord = {
+          id: `esc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+          agentId: runCtx.agentId,
+          companyId: runCtx.companyId,
+          reason: String(p.reason ?? ""),
+          confidence: typeof p.confidence === "number" ? p.confidence : undefined,
+          agentName: p.agentName != null ? String(p.agentName) : undefined,
+          agentReasoning: p.agentReasoning != null ? String(p.agentReasoning) : undefined,
+          suggestedReply: p.suggestedReply != null ? String(p.suggestedReply) : undefined,
+          conversationHistory: normalizeTurns(p.conversationHistory),
+          status: "open",
+          createdAtMs: Date.now(),
+        };
+        await escalationStore.create(record);
+        let bot: TeamsBot;
+        try {
+          bot = await getBot(ctx);
+        } catch (e) {
+          log("teams escalation: bot not configured", { error: e instanceof Error ? e.message : String(e) });
+          return { content: JSON.stringify({ escalated: false, reason: "bot not configured", escalationId: record.id }) };
+        }
+        const ref = await bot.postEscalationCard(conversationId, record);
+        if (ref) await escalationStore.attachCard(record.id, ref);
+        await ctx.activity
+          .log({ companyId: runCtx.companyId, message: `Escalation posted to Teams: ${record.reason}`, entityType: "plugin", entityId: record.id })
+          .catch(() => undefined);
+        await ctx.metrics.write("teams.escalations.created", 1).catch(() => undefined);
+        return { content: JSON.stringify({ escalated: !!ref, escalationId: record.id }) };
+      },
+    );
+
+    // Timeout sweep: apply the default action to escalations past their timeout (AC #3). Runs
+    // every minute (manifest cron); the effective timeout is enforced here against config.
+    ctx.jobs.register(JOB_KEYS.checkEscalationTimeouts, async () => {
+      const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
+      const timeoutMs = timeoutMsFromMinutes(cfg.escalationTimeoutMinutes);
+      const defaultAction = cfg.escalationDefaultAction === "dismiss" ? "dismiss" : "defer";
+      const open = await escalationStore.listOpen();
+      const expired = expiredEscalations(open.map((e) => e.record), Date.now(), timeoutMs);
+      if (expired.length === 0) return;
+      let bot: TeamsBot | undefined;
+      try {
+        bot = await getBot(ctx);
+      } catch {
+        bot = undefined; // still close them; the card just won't visually update
+      }
+      for (const id of expired) {
+        const entry = open.find((e) => e.record.id === id);
+        const closed = await escalationStore.close(id, "timed_out", "system:timeout", Date.now());
+        if (!closed) continue; // resolved between listOpen and now — skip (no double action)
+        if (bot && entry?.conversationReference && entry?.activityId) {
+          await bot
+            .updateEscalationCard(
+              { conversationReference: entry.conversationReference, activityId: entry.activityId },
+              buildEscalationResolvedCard(closed.record, "timed_out"),
+            )
+            .catch((e) => log("teams escalation timeout card update failed", { id, error: e instanceof Error ? e.message : String(e) }));
+        }
+        await ctx.activity
+          .log({ companyId: closed.record.companyId, message: `Escalation timed out — default action: ${defaultAction}`, entityType: "plugin", entityId: id })
+          .catch(() => undefined);
+        await ctx.metrics.write("teams.escalations.timed_out", 1, { action: defaultAction }).catch(() => undefined);
+        log("teams escalation timed out", { id, action: defaultAction });
+      }
+    });
   },
 
   async onWebhook(input: PluginWebhookInput): Promise<void> {
@@ -671,6 +789,35 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
             }
           : undefined,
       };
+      // PCLIP-28 (T11): escalation card-click resolution. Over the SAME instance-state backend
+      // as the setup() escalation store, so the tool/job and the bot see the same records.
+      const escStore = createEscalationStore(stateBackend as EscalationStoreBackend);
+      const escalations = {
+        onSubmit: async (
+          escalationId: string,
+          action: "reply" | "dismiss",
+          actor: { actor: string; actorName?: string },
+        ): Promise<{ record: EscalationRecord; status: "resolved" | "dismissed"; activityId?: string } | null> => {
+          const status = action === "reply" ? "resolved" : "dismissed";
+          // close() transitions only an OPEN escalation → a second click never double-invokes.
+          const closed = await escStore.close(escalationId, status, actor.actor, Date.now());
+          if (!closed) return null;
+          if (action === "reply" && closed.record.suggestedReply) {
+            try {
+              await ctx.agents.invoke(closed.record.agentId, closed.record.companyId, {
+                prompt: `Human reply to escalation: ${closed.record.suggestedReply}`,
+                reason: "HITL escalation reply from Microsoft Teams",
+              });
+            } catch (e) {
+              ctx.logger.info("teams escalation reply invoke failed", { escalationId, error: e instanceof Error ? e.message : String(e) });
+            }
+          }
+          await ctx.metrics.write("teams.escalations.resolved", 1, { action: action === "reply" ? "human_reply" : "dismissed" }).catch(() => undefined);
+          // Return the stored card activity id so the bot can update the exact card even when
+          // Teams omits replyToId (multiple cards in one channel — MS docs caveat).
+          return { record: closed.record, status, activityId: closed.activityId };
+        },
+      };
       return createTeamsBot({
         authConfig,
         botAppId,
@@ -678,6 +825,7 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
         conversations,
         approvals,
         commands,
+        escalations,
         onCommand: (command) => {
           // Best-effort metric (parity with Slack's slack.commands.handled); never blocks.
           void ctx.metrics.write("teams.commands.handled", 1, { command }).catch(() => undefined);

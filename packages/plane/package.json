@@ -1,9 +1,15 @@
 {
   "name": "@dexwox-labs/paperclip-plugin-plane",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Bidirectional Plane CE sync for Paperclip: webhook intake with HMAC verification, agent tools for work items, status/comment mirroring, and a reconciliation backstop for unreliable webhooks.",
-  "keywords": ["paperclip-plugin", "paperclip", "plane", "project-management", "sync"],
+  "keywords": [
+    "paperclip-plugin",
+    "paperclip",
+    "plane",
+    "project-management",
+    "sync"
+  ],
   "main": "./dist/index.js",
   "paperclipPlugin": {
     "manifest": "./dist/manifest.js",
@@ -27,7 +33,9 @@
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
-  "files": ["dist/"],
+  "files": [
+    "dist/"
+  ],
   "publishConfig": {
     "access": "public"
   },

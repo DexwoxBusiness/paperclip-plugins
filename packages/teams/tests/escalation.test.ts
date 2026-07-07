@@ -9,9 +9,15 @@ import {
   REPLY_INPUT_ID,
   resolveEscalationReply,
   sanitizeCardText,
+  sanitizeInputPrefill,
   timeoutMsFromMinutes,
   type EscalationRecord,
 } from "../src/escalation.js";
+
+const CTRL_NUL = String.fromCharCode(0);
+const CTRL_DEL = String.fromCharCode(127);
+const CTRL_NL = String.fromCharCode(10);
+const CTRL_TAB = String.fromCharCode(9);
 import { validateAdaptiveCard } from "../src/adaptive-card.js";
 
 const NL = String.fromCharCode(10); // newline, without an escape sequence in source
@@ -50,6 +56,20 @@ describe("parseEscalationSubmit", () => {
       .toEqual({ escalationId: "e", action: "reply", replyText: "edited reply" });
     expect(parseEscalationSubmit({ pcAction: "escalation", escalationId: "e", action: "reply", [REPLY_INPUT_ID]: "   " }))
       .toEqual({ escalationId: "e", action: "reply", replyText: undefined });
+  });
+});
+
+describe("sanitizeInputPrefill (editable reply prefill — NOT the same as sanitizeCardText)", () => {
+  it("strips C0 controls + DEL but KEEPS newline/tab so a multiline reply survives", () => {
+    expect(sanitizeInputPrefill(`line1${CTRL_NL}line2${CTRL_TAB}x${CTRL_NUL}${CTRL_DEL}`)).toBe(`line1${CTRL_NL}line2${CTRL_TAB}x`);
+  });
+  it("does NOT Markdown-escape — the human sends this text verbatim", () => {
+    expect(sanitizeInputPrefill("use [brackets] and *stars*")).toBe("use [brackets] and *stars*");
+  });
+  it("length-bounds and guards empty/undefined", () => {
+    expect(sanitizeInputPrefill("y".repeat(50), 5).length).toBe(5);
+    expect(sanitizeInputPrefill(undefined)).toBe("");
+    expect(sanitizeInputPrefill("")).toBe("");
   });
 });
 

@@ -117,9 +117,9 @@ Once the bot is installed in a channel or chat, **@mention it with a command** a
 
 ## HITL escalation with suggested replies (T11 / PCLIP-28)
 
-A stuck agent calls the **`escalate_to_human`** agent tool (registered via the `agent.tools.register` capability) with a reason, its reasoning, confidence, conversation history, and a suggested reply. The plugin posts an interactive Adaptive Card to a configured Teams conversation with that context and two buttons: **Use suggested reply** and **Dismiss**. Modeled on the Slack plugin's escalation flow, adapted to Teams-accessible APIs.
+A stuck agent calls the **`escalate_to_human`** agent tool (registered via the `agent.tools.register` capability) with a reason, its reasoning, confidence, conversation history, and a suggested reply. The plugin posts an interactive Adaptive Card to a configured Teams conversation with that context, an **editable reply field prefilled with the suggestion** (so the human reviews/edits before sending), and two buttons: **Send reply** and **Dismiss**. Modeled on the Slack plugin's escalation flow, adapted to Teams-accessible APIs.
 
-**Reply-back is via `ctx.agents.invoke`.** Slack routes the reply into a live ACP agent *session* (`sessions.sendMessage`); Teams has no ACP session bridge, so clicking **Use suggested reply** wakes the escalating agent (its `agentId`, captured from the tool run context) with a new prompt `"Human reply to escalation: …"` via the `agents.invoke` capability. The card is then updated in place to its resolved state.
+**Reply-back is via `ctx.agents.invoke`.** Slack routes the reply into a live ACP agent *session* (`sessions.sendMessage`); Teams has no ACP session bridge, so clicking **Send reply** wakes the escalating agent (its `agentId`, captured from the tool run context) with a new prompt `"Human reply to escalation: …"` — using the human's edited text, falling back to the agent's suggestion when the field is left blank — via the `agents.invoke` capability. The card is then updated in place to its resolved state.
 
 **Timeout.** A `check-escalation-timeouts` job (every minute) applies the configured default action to escalations older than `escalationTimeoutMinutes` (default 15): `escalationDefaultAction` is `defer` (leave it) or `dismiss`. The card updates to "Timed out"; `teams.escalations.timed_out{action}` is emitted.
 

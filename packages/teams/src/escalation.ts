@@ -65,6 +65,9 @@ export const MAX_TEXT_LEN = 2000;
 
 // Built from strings so the SOURCE stays ASCII (no literal control / zero-width bytes).
 const CONTROL_CHARS = new RegExp("[\\u0000-\\u001F\\u007F]", "g");
+// For the editable reply prefill: strip the C0 controls + DEL but KEEP tab (U+0009) and newline
+// (U+000A) — the field is multiline, so those are legitimate content, not an injection vector.
+const INPUT_UNSAFE_CHARS = new RegExp("[\\u0000-\\u0008\\u000B-\\u001F\\u007F]", "g");
 const MARKDOWN_CHARS = /[\\`*_{}[\]()#+\-!<>|~]/g;
 const ZERO_WIDTH = "​";
 const ELLIPSIS = "…";
@@ -82,6 +85,21 @@ export function sanitizeCardText(text: string | undefined, maxLen = MAX_TEXT_LEN
     .replace(MARKDOWN_CHARS, (c) => `\\${c}`)
     .replace(/@/g, `@${ZERO_WIDTH}`);
   return escaped.length > maxLen ? `${escaped.slice(0, maxLen - 1)}${ELLIPSIS}` : escaped;
+}
+
+/**
+ * Sanitize the agent's suggestedReply for use as the EDITABLE reply field's prefill. Unlike
+ * {@link sanitizeCardText}, this does NOT Markdown-escape and does NOT strip tab/newline: an
+ * Input.Text value is shown in a plain (non-Markdown) multiline edit box and is round-tripped
+ * verbatim into the reply the human sends, so escaping would inject stray backslashes and control
+ * stripping would flatten a legitimate multiline reply. We only remove the genuinely-unsafe C0
+ * control chars (except tab/newline) + DEL, and length-bound it — defense-in-depth without
+ * corrupting the human-owned text.
+ */
+export function sanitizeInputPrefill(text: string | undefined, maxLen = MAX_TEXT_LEN): string {
+  if (typeof text !== "string" || !text) return "";
+  const cleaned = text.replace(INPUT_UNSAFE_CHARS, "");
+  return cleaned.length > maxLen ? cleaned.slice(0, maxLen) : cleaned;
 }
 
 // --------------------------------------------------------------------------
@@ -144,9 +162,10 @@ export function formatConfidence(confidence: number | undefined): string {
 }
 
 /**
- * The open escalation card: reason, confidence, agent reasoning, conversation history, and the
- * "Use suggested reply" (only when a suggestedReply exists) + "Dismiss" buttons (AC #1). All
- * agent-supplied text is sanitized (Kody) and length-capped (Kody perf) before rendering.
+ * The open escalation card: reason, confidence, agent reasoning, conversation history, an editable
+ * reply field prefilled with the suggestion, and the "Send reply" (only when a suggestedReply
+ * exists) + "Dismiss" buttons (AC #1, #2). Agent display text is sanitized (Kody) and length-capped
+ * (Kody perf); the editable reply prefill is control-safe-stripped (see sanitizeInputPrefill).
  */
 export function buildEscalationCard(record: EscalationRecord): AdaptiveCard {
   const body = [
@@ -164,9 +183,10 @@ export function buildEscalationCard(record: EscalationRecord): AdaptiveCard {
       ? [
           textBlock("Reply to send back (edit before sending)", { weight: "Bolder", spacing: "Medium" }),
           // Editable field prefilled with the agent's suggestion. Its value is NOT Markdown-rendered
-          // (it's an edit box), so prefill verbatim, only length-bounded — the human owns this text.
+          // (it's an edit box) and is round-tripped verbatim into the sent reply, so it is control-
+          // safe-stripped (tab/newline kept for multiline) + length-bounded, NOT Markdown-escaped.
           inputText(REPLY_INPUT_ID, {
-            value: record.suggestedReply.slice(0, MAX_TEXT_LEN),
+            value: sanitizeInputPrefill(record.suggestedReply),
             isMultiline: true,
             maxLength: MAX_TEXT_LEN,
             placeholder: "Edit the reply, or send as-is",

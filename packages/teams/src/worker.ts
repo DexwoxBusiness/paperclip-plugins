@@ -15,6 +15,8 @@ import {
   type EscalationRecord,
 } from "./escalation.js";
 import { createEscalationStore, type EscalationStoreBackend } from "./escalation-store.js";
+import { buildAskCancelledCard, formatAskResponse, type AskField, type AskRequest } from "./ask.js";
+import { createAskStore, type AskStoreBackend } from "./ask-store.js";
 import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
 import { createApprovalStore } from "./approval-store.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
@@ -617,6 +619,176 @@ export default definePlugin({
         log("teams escalation timed out", { id, action: defaultAction });
       }
     });
+
+    // ---- Generic ask surface (PCLIP-43 / T12) ----
+    const askStore = createAskStore(state as AskStoreBackend);
+
+    // Map an agent-supplied fields array into typed AskFields, dropping id-less entries. Kept
+    // permissive (the pure buildAskCard also caps/filters) so a malformed field never throws.
+    const normalizeAskFields = (raw: unknown): AskField[] | undefined => {
+      if (!Array.isArray(raw)) return undefined;
+      const fields = raw
+        .map((f) => (f && typeof f === "object" ? (f as Record<string, unknown>) : null))
+        .filter((f): f is Record<string, unknown> => f != null && typeof f.id === "string" && f.id.trim() !== "")
+        .map((f) => ({
+          id: String(f.id),
+          label: typeof f.label === "string" ? f.label : String(f.id),
+          multiline: typeof f.multiline === "boolean" ? f.multiline : undefined,
+          placeholder: typeof f.placeholder === "string" ? f.placeholder : undefined,
+          prefill: typeof f.prefill === "string" ? f.prefill : undefined,
+        }));
+      return fields.length ? fields : undefined;
+    };
+
+    // Agent tool: ask a specific person a question in Teams and get the answer routed back. Generic
+    // (no scrum vocabulary) — the agent decides what a question means and when to re-ask. No-ops
+    // (never throws) when the person isn't reachable or the input is invalid.
+    ctx.tools.register(
+      "ask_person",
+      {
+        displayName: "Ask a person",
+        description:
+          "Ask a specific person a question in Microsoft Teams and have their answer delivered back to you. The plugin only carries the message and tracks who answered; you decide whether and when to ask again.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            personRef: { type: "string", description: "The person's stored 1:1 conversation key (they must have interacted with the bot). Plane/Teams identity mapping is a separate capability." },
+            prompt: { type: "string", description: "The question to ask" },
+            fields: {
+              type: "array",
+              description: "Optional structured inputs to collect (each rendered as an editable field)",
+              items: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  label: { type: "string" },
+                  multiline: { type: "boolean" },
+                  placeholder: { type: "string" },
+                  prefill: { type: "string" },
+                },
+                required: ["id"],
+              },
+            },
+            correlationId: { type: "string", description: "Your own key to tie the answer to a work item, e.g. plane:<id>" },
+          },
+          required: ["personRef", "prompt"],
+        },
+      },
+      async (params, runCtx) => {
+        const p = (params ?? {}) as Record<string, unknown>;
+        const personRef = String(p.personRef ?? "").trim();
+        const prompt = String(p.prompt ?? "").trim();
+        if (!personRef) return { content: JSON.stringify({ asked: false, reason: "personRef required" }) };
+        if (!prompt) return { content: JSON.stringify({ asked: false, reason: "prompt required" }) };
+        const agentId = typeof runCtx.agentId === "string" ? runCtx.agentId : "";
+        const companyId = typeof runCtx.companyId === "string" ? runCtx.companyId : "";
+        if (!agentId || !companyId) return { content: JSON.stringify({ asked: false, reason: "missing agent context" }) };
+        const request: AskRequest = {
+          id: `ask-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+          personRef,
+          agentId,
+          companyId,
+          prompt,
+          fields: normalizeAskFields(p.fields),
+          correlationId: p.correlationId != null ? String(p.correlationId) : undefined,
+          status: "open",
+          createdAtMs: Date.now(),
+        };
+        // Post the card FIRST; only persist the request once it's actually posted (post-before-create,
+        // like escalation). A not-reachable person (no stored ref / 403-class send) → clean no-op.
+        let bot: TeamsBot;
+        try {
+          bot = await getBot(ctx);
+        } catch (e) {
+          log("teams ask: bot not configured", { error: e instanceof Error ? e.message : String(e) });
+          return { content: JSON.stringify({ asked: false, reason: "bot not configured", requestId: request.id }) };
+        }
+        const ref = await bot.postAskCard(personRef, request);
+        if (!ref) {
+          log("teams ask: person not reachable", { requestId: request.id });
+          return { content: JSON.stringify({ asked: false, reason: "person not reachable / needs install", requestId: request.id }) };
+        }
+        await askStore.create(request, ref); // record + card ref in one write (no orphan window)
+        await ctx.activity
+          .log({ companyId, message: `Asked a person: ${request.prompt}`, entityType: "plugin", entityId: request.id })
+          .catch(() => undefined);
+        await ctx.metrics.write("teams.asks.created", 1).catch(() => undefined);
+        return { content: JSON.stringify({ asked: true, requestId: request.id }) };
+      },
+    );
+
+    // Agent tool: list the still-open asks so the AGENT (not the plugin) decides whether to re-ask.
+    ctx.tools.register(
+      "list_open_asks",
+      {
+        displayName: "List open asks",
+        description:
+          "List the questions this plugin is still waiting on answers for, so you can decide whether to re-ask or follow up. The plugin never nudges people on its own.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            correlationPrefix: { type: "string", description: "Optional: only asks whose correlationId starts with this (e.g. plane:)" },
+          },
+        },
+      },
+      async (params, runCtx) => {
+        const p = (params ?? {}) as Record<string, unknown>;
+        const prefix = typeof p.correlationPrefix === "string" ? p.correlationPrefix : "";
+        const agentId = typeof runCtx.agentId === "string" ? runCtx.agentId : "";
+        const companyId = typeof runCtx.companyId === "string" ? runCtx.companyId : "";
+        if (!agentId || !companyId) return { content: JSON.stringify({ openAsks: [] }) };
+        const open = await askStore.listOpen();
+        const openAsks = open
+          .map((e) => e.request)
+          // Scope to the CALLER's own asks (Codex P2): never expose another agent/company's
+          // personRef/prompt/correlationId/requestId across a shared plugin instance.
+          .filter((r) => r.agentId === agentId && r.companyId === companyId)
+          .filter((r) => !prefix || (r.correlationId ?? "").startsWith(prefix))
+          .map((r) => ({ requestId: r.id, personRef: r.personRef, correlationId: r.correlationId, prompt: r.prompt, createdAtMs: r.createdAtMs }));
+        return { content: JSON.stringify({ openAsks }) };
+      },
+    );
+
+    // Agent tool: cancel an outstanding ask (no longer needed). Updates the person's card so they
+    // don't answer a dead question. Idempotent — a second cancel / already-answered returns false.
+    ctx.tools.register(
+      "cancel_ask",
+      {
+        displayName: "Cancel an ask",
+        description: "Withdraw a question you previously asked a person (e.g. it's no longer relevant). Their card updates to show it's no longer needed.",
+        parametersSchema: {
+          type: "object",
+          properties: { requestId: { type: "string", description: "The requestId returned by ask_person" } },
+          required: ["requestId"],
+        },
+      },
+      async (params, runCtx) => {
+        const p = (params ?? {}) as Record<string, unknown>;
+        const requestId = String(p.requestId ?? "").trim();
+        if (!requestId) return { content: JSON.stringify({ cancelled: false, reason: "requestId required" }) };
+        const agentId = typeof runCtx.agentId === "string" ? runCtx.agentId : "";
+        const companyId = typeof runCtx.companyId === "string" ? runCtx.companyId : "";
+        if (!agentId || !companyId) return { content: JSON.stringify({ cancelled: false, reason: "missing agent context" }) };
+        // Ownership-scoped cancel (Codex P2): only the creating agent+company can cancel; a mismatch
+        // returns null → reported as "unknown", so a leaked requestId can't cancel someone else's ask.
+        const cancelled = await askStore.cancel(requestId, Date.now(), { agentId, companyId });
+        if (!cancelled) return { content: JSON.stringify({ cancelled: false, reason: "unknown or already closed" }) };
+        // Best-effort card update; the state transition already succeeded so a failure never throws.
+        if (cancelled.conversationReference && cancelled.activityId) {
+          try {
+            const bot = await getBot(ctx);
+            await bot.updateAskCard(
+              { conversationReference: cancelled.conversationReference, activityId: cancelled.activityId },
+              buildAskCancelledCard(cancelled.request),
+            );
+          } catch (e) {
+            log("teams ask cancel card update failed", { requestId, error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+        await ctx.metrics.write("teams.asks.cancelled", 1).catch(() => undefined);
+        return { content: JSON.stringify({ cancelled: true }) };
+      },
+    );
   },
 
   async onWebhook(input: PluginWebhookInput): Promise<void> {
@@ -893,6 +1065,39 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
           return { record: closed.record, status, activityId: closed.activityId };
         },
       };
+      // PCLIP-43 (T12): generic ask answer routing. Same instance-state backend as the setup()
+      // ask store, so the tool and the bot see the same ledger.
+      const askStore = createAskStore(stateBackend as AskStoreBackend);
+      const asks = {
+        onSubmit: async (
+          requestId: string,
+          values: Record<string, string>,
+          actor: { actor: string; actorName?: string },
+        ): Promise<{ request: AskRequest; activityId?: string } | null> => {
+          // answer() ATOMICALLY transitions only an OPEN ask → a second click gets null (route once).
+          const answered = await askStore.answer(requestId, values, actor.actor, Date.now());
+          if (!answered) return null;
+          const responseText = formatAskResponse(answered.request, values);
+          try {
+            await ctx.agents.invoke(answered.request.agentId, answered.request.companyId, {
+              prompt: `Reply from the person to "${answered.request.prompt}": ${responseText}`,
+              reason: "Ask response from Microsoft Teams",
+            });
+          } catch (e) {
+            // Unlike escalation, the human's answer IS already recorded — re-showing the card would
+            // wrongly ask them again. So we do NOT reopen; the answer is preserved in the ledger and
+            // we surface the failed route-back LOUDLY for operator recovery (error log + metric).
+            ctx.logger.error("teams ask route-back invoke failed — answer recorded but agent not woken; manual recovery needed", { requestId, error: e instanceof Error ? e.message : String(e) });
+            await ctx.metrics.write("teams.asks.route_failed", 1).catch(() => undefined);
+          }
+          await ctx.activity
+            .log({ companyId: answered.request.companyId, message: `Ask answered by ${actor.actorName || actor.actor}`, entityType: "plugin", entityId: requestId })
+            .catch(() => undefined);
+          await ctx.metrics.write("teams.asks.answered", 1).catch(() => undefined);
+          // Return the answered request (+ stored activity id) so the bot updates the exact card.
+          return { request: answered.request, activityId: answered.activityId };
+        },
+      };
       return createTeamsBot({
         authConfig,
         botAppId,
@@ -901,6 +1106,7 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
         approvals,
         commands,
         escalations,
+        asks,
         onCommand: (command) => {
           // Best-effort metric (parity with Slack's slack.commands.handled); never blocks.
           void ctx.metrics.write("teams.commands.handled", 1, { command }).catch(() => undefined);

@@ -2,9 +2,20 @@ import { describe, expect, it } from "vitest";
 import {
   conversationKey,
   createConversationStore,
+  isPersonalConversationRef,
   type ConversationRef,
   type ConversationStoreBackend,
 } from "../src/bot-conversations.js";
+
+describe("isPersonalConversationRef (PCLIP-43 — gate ask DMs to 1:1 chats, fail closed)", () => {
+  it("passes only a personal 1:1 conversation", () => {
+    expect(isPersonalConversationRef({ conversation: { id: "a", conversationType: "personal" } })).toBe(true);
+    expect(isPersonalConversationRef({ conversation: { id: "b", conversationType: "channel" } })).toBe(false);
+    expect(isPersonalConversationRef({ conversation: { id: "c", conversationType: "groupChat" } })).toBe(false);
+    expect(isPersonalConversationRef({ conversation: { id: "d" } })).toBe(false);
+    expect(isPersonalConversationRef(undefined)).toBe(false);
+  });
+});
 
 function makeBackend(): ConversationStoreBackend & { map: Map<string, unknown> } {
   const map = new Map<string, unknown>();

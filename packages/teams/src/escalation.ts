@@ -2,10 +2,11 @@
  * HITL escalation channel with suggested replies (PCLIP-28 / T11) — pure, SDK-decoupled logic.
  *
  * A stuck agent calls the `escalate_to_human` tool; the plugin posts an Adaptive Card to a
- * dedicated Teams conversation with the conversation history, the agent's reasoning, and its
- * confidence, plus a "Use suggested reply" button. Clicking it wakes the escalating agent via
- * `ctx.agents.invoke` with the reply (Teams has no ACP session bridge, unlike Slack). If no
- * human acts within the timeout, a background job applies the default action (defer/dismiss).
+ * dedicated Teams conversation with the conversation history, the agent's reasoning, its
+ * confidence, and an editable reply field prefilled with the suggestion, plus a "Send reply"
+ * button. Clicking it wakes the escalating agent via `ctx.agents.invoke` with the human's
+ * (possibly edited) reply (Teams has no ACP session bridge, unlike Slack). If no human acts
+ * within the timeout, a background job applies the default action (defer/dismiss).
  *
  * This module holds the pure pieces (record shape, cards, submit parsing, timeout decision);
  * the worker owns the tool registration, proactive post, agents.invoke, state, and the job.
@@ -54,7 +55,7 @@ export interface EscalationRecord {
   /**
    * Epoch ms the escalation was DEFERRED at timeout (default action = "defer"). Set means the
    * sweep already handled it once and left it OPEN + actionable — the sweep skips it thereafter
-   * (no re-fire), but a human can still click "Use suggested reply". "dismiss" CLOSES instead.
+   * (no re-fire), but a human can still click "Send reply". "dismiss" CLOSES instead.
    */
   deferredAtMs?: number;
 }

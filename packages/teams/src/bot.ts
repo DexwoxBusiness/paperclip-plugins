@@ -254,9 +254,9 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       await next();
       return;
     }
-    // PCLIP-28 (T11): a HITL escalation card click ("Use suggested reply" / "Dismiss")
-    // arrives as a message activity with our data in `activity.value`. Route it before
-    // commands (a card submit has no command text).
+    // PCLIP-28 (T11): a HITL escalation card click ("Send reply" / "Dismiss") arrives as a
+    // message activity with our data in `activity.value` (plus the editable reply field). Route
+    // it before commands (a card submit has no command text).
     const escalationSubmit = parseEscalationSubmit(context.activity.value);
     if (escalationSubmit && deps.escalations) {
       await handleEscalationSubmit(context, escalationSubmit.escalationId, escalationSubmit.action, escalationSubmit.replyText);

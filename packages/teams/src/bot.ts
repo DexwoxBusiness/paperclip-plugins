@@ -65,6 +65,7 @@ import {
   buildEscalationCard,
   buildEscalationResolvedCard,
   parseEscalationSubmit,
+  resolveCardUpdateTarget,
   type EscalationAction,
   type EscalationRecord,
 } from "./escalation.js";
@@ -369,13 +370,14 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     const result = await deps.escalations.onSubmit(escalationId, action, { actor, actorName }, replyText);
     if (!result) return;
     const card = buildEscalationResolvedCard(result.record, result.status, { byName: actorName });
-    // Prefer the activity's own replyToId; fall back to the STORED card activity id, since
-    // Teams may omit replyToId when several Adaptive Cards share a channel (MS docs). If we
-    // still have no id, post a fresh card so the human always sees the outcome (never silent).
-    const targetId = (context.activity as { replyToId?: string }).replyToId ?? result.activityId;
+    // Prefer the activity's own replyToId; fall back to the STORED card activity id, since Teams
+    // may omit replyToId when several Adaptive Cards share a channel (MS docs). If we still have no
+    // id, post a fresh card so the human always sees the outcome (never silent). Decision is the
+    // pure resolveCardUpdateTarget (unit-tested).
+    const target = resolveCardUpdateTarget((context.activity as { replyToId?: string }).replyToId, result.activityId);
     try {
-      if (targetId) {
-        await context.updateActivity({ ...cardActivity(card), id: targetId } as Activity);
+      if (target.mode === "update") {
+        await context.updateActivity({ ...cardActivity(card), id: target.id } as Activity);
       } else {
         await context.sendActivity(cardActivity(card) as Activity);
       }

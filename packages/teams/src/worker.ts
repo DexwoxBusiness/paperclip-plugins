@@ -821,6 +821,15 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
           // (no double reply-back). We close FIRST to claim it, then invoke.
           const closed = await escStore.close(escalationId, status, actor.actor, Date.now());
           if (!closed) return null;
+          // Observability for the non-terminal REOPEN outcomes (empty reply / invoke failure): an
+          // aborted resolution must not be silent — audit-log + metric it with parity to the
+          // resolved/timeout paths so operators can see reply-backs that didn't land.
+          const auditReopen = async (reason: string) => {
+            await ctx.activity
+              .log({ companyId: closed.record.companyId, message: `Escalation reply not delivered (${reason}) — kept open for retry`, entityType: "plugin", entityId: escalationId })
+              .catch(() => undefined);
+            await ctx.metrics.write("teams.escalations.reopened", 1, { reason }).catch(() => undefined);
+          };
           if (action === "reply") {
             // Prefer the human's edited text from the card's Input.Text; fall back to the agent's
             // suggestion only when the human left it unchanged/blank. The HUMAN owns what is sent.
@@ -828,6 +837,7 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
             if (!humanReply) {
               // "Send reply" with nothing to send (no suggestion + empty field): don't invoke with an
               // empty prompt — re-open so the escalation stays actionable rather than silently resolving.
+              await auditReopen("empty_reply");
               await escStore.reopen(escalationId).catch(() => undefined);
               return null;
             }
@@ -839,7 +849,9 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
             } catch (e) {
               // Invoke failed (transient host/API): the reply must NOT be lost. Re-open the
               // escalation so the card stays actionable and a retry can re-claim it (Codex).
+              // logger.info carries the error detail; auditReopen records the business audit + metric.
               ctx.logger.info("teams escalation reply invoke failed — reopening", { escalationId, error: e instanceof Error ? e.message : String(e) });
+              await auditReopen("invoke_failed");
               await escStore.reopen(escalationId).catch(() => undefined);
               return null;
             }

@@ -150,6 +150,21 @@ export function resolveEscalationReply(replyText: string | undefined, suggestedR
   return reply || null;
 }
 
+/**
+ * Decide how to render the resolved/dismissed card back to Teams. Prefer the submit activity's own
+ * `replyToId` (the exact card the button was on); fall back to the STORED card activity id captured
+ * at post time, because Teams may omit `replyToId` when several Adaptive Cards share a channel
+ * (MS docs caveat). If neither is available, post a fresh card so the human always sees the
+ * outcome (never silent). Pure so this fallback chain is unit-tested without the bot runtime.
+ */
+export function resolveCardUpdateTarget(
+  replyToId: string | undefined,
+  storedActivityId: string | undefined,
+): { mode: "update"; id: string } | { mode: "post" } {
+  const id = (typeof replyToId === "string" && replyToId) || (typeof storedActivityId === "string" && storedActivityId) || "";
+  return id ? { mode: "update", id } : { mode: "post" };
+}
+
 // --------------------------------------------------------------------------
 // Cards
 // --------------------------------------------------------------------------

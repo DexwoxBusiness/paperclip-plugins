@@ -7,6 +7,7 @@ import {
   MAX_HISTORY_TURNS,
   parseEscalationSubmit,
   REPLY_INPUT_ID,
+  resolveCardUpdateTarget,
   resolveEscalationReply,
   sanitizeCardText,
   sanitizeInputPrefill,
@@ -70,6 +71,16 @@ describe("sanitizeInputPrefill (editable reply prefill — NOT the same as sanit
     expect(sanitizeInputPrefill("y".repeat(50), 5).length).toBe(5);
     expect(sanitizeInputPrefill(undefined)).toBe("");
     expect(sanitizeInputPrefill("")).toBe("");
+  });
+});
+
+describe("resolveCardUpdateTarget (Teams may omit replyToId — MS docs caveat)", () => {
+  it("prefers replyToId; falls back to the stored activity id; else posts fresh", () => {
+    expect(resolveCardUpdateTarget("reply-1", "stored-1")).toEqual({ mode: "update", id: "reply-1" });
+    expect(resolveCardUpdateTarget(undefined, "stored-1")).toEqual({ mode: "update", id: "stored-1" });
+    expect(resolveCardUpdateTarget("", "stored-1")).toEqual({ mode: "update", id: "stored-1" }); // empty replyToId ignored
+    expect(resolveCardUpdateTarget(undefined, undefined)).toEqual({ mode: "post" });
+    expect(resolveCardUpdateTarget("", "")).toEqual({ mode: "post" });
   });
 });
 

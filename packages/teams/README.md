@@ -125,7 +125,7 @@ A stuck agent calls the **`escalate_to_human`** agent tool (registered via the `
 
 **Config:** `escalationConversationId` (the bot must be installed there; empty = the tool no-ops with a clear result, never throws), `escalationTimeoutMinutes`, `escalationDefaultAction`.
 
-**Grounded in the Microsoft docs:** the card is updated in place with `updateActivity` + the message id, and proactive posts/updates use `CloudAdapter.continueConversation` with a persisted conversation reference. Because Teams may omit `replyToId` when multiple cards share a channel, the resolve path falls back to the **stored** card activity id (captured at post time) rather than relying on `replyToId` alone. Metrics: `teams.escalations.created` / `.resolved{action}` / `.timed_out{action}`. Entirely plugin-side; the pure card/parse/timeout/store logic is unit-tested (SDK-decoupled).
+**Grounded in the Microsoft docs:** the card is updated in place with `updateActivity` + the message id, and proactive posts/updates use `CloudAdapter.continueConversation` with a persisted conversation reference. Because Teams may omit `replyToId` when multiple cards share a channel, the resolve path falls back to the **stored** card activity id (captured at post time) rather than relying on `replyToId` alone. Metrics: `teams.escalations.created` / `.resolved{action}` / `.timed_out{action}` / `.reopened{reason}` (a reply that couldn't be delivered — `empty_reply` or `invoke_failed` — so the escalation was kept open) / `.reopen_failed{after}` (the rare double-failure where re-open itself failed, surfaced loudly for manual recovery). Entirely plugin-side; the pure card/parse/timeout/store logic is unit-tested (SDK-decoupled).
 
 ## Backlog
 

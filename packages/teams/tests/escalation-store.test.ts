@@ -89,4 +89,48 @@ describe("createEscalationStore", () => {
     await store.close("e2", "dismissed", "u", 1);
     expect((await store.listOpen()).map((e) => e.record.id).sort()).toEqual(["e1", "e3"]);
   });
+
+  it("create(record, ref) persists the card reference in one write (no attachCard window)", async () => {
+    const b = memoryBackend();
+    const store = createEscalationStore(b);
+    await store.create(rec("e1"), { conversationReference: { conv: 1 }, activityId: "act-9" });
+    const got = await store.get("e1");
+    expect(got?.activityId).toBe("act-9");
+    expect(got?.conversationReference).toEqual({ conv: 1 });
+    expect(b.dump.get(ESCALATION_INDEX_KEY)).toEqual(["e1"]);
+  });
+});
+
+// A backend that yields on every op so concurrent operations interleave — this is what exposes a
+// shared-index race if index writes aren't serialized under their own lock.
+function yieldingBackend(): EscalationStoreBackend & { dump: Map<string, unknown> } {
+  const m = new Map<string, unknown>();
+  return {
+    dump: m,
+    async get(k) { await Promise.resolve(); return m.has(k) ? m.get(k) : null; },
+    async set(k, v) { await Promise.resolve(); if (v === null) m.delete(k); else m.set(k, v); },
+  };
+}
+
+describe("shared open-index concurrency (Kody critical — index is cross-id shared state)", () => {
+  it("concurrent close() on DIFFERENT ids never leaves stale ids in the index", async () => {
+    const b = yieldingBackend();
+    const store = createEscalationStore(b);
+    const ids = Array.from({ length: 25 }, (_, i) => `e${i}`);
+    for (const id of ids) await store.create(rec(id));
+    expect(([...(b.dump.get(ESCALATION_INDEX_KEY) as string[])]).sort()).toEqual([...ids].sort());
+    // With per-id-only locking these index RMWs interleave and drop removals; the shared index
+    // lock makes each read-modify-write atomic, so the final index is exactly empty.
+    await Promise.all(ids.map((id) => store.close(id, "resolved", "u", 1)));
+    expect(b.dump.get(ESCALATION_INDEX_KEY)).toEqual([]);
+    expect(await store.listOpen()).toHaveLength(0);
+  });
+
+  it("concurrent create() on different ids keeps every id (no lost appends)", async () => {
+    const b = yieldingBackend();
+    const store = createEscalationStore(b);
+    const ids = Array.from({ length: 25 }, (_, i) => `n${i}`);
+    await Promise.all(ids.map((id) => store.create(rec(id))));
+    expect(([...(b.dump.get(ESCALATION_INDEX_KEY) as string[])]).sort()).toEqual([...ids].sort());
+  });
 });

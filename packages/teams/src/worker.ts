@@ -519,13 +519,28 @@ export default definePlugin({
       async (params, runCtx) => {
         const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
         const conversationId = (cfg.escalationConversationId ?? "").trim();
-        if (!conversationId) return { content: JSON.stringify({ escalated: false, reason: "escalation not configured" }) };
+        if (!conversationId) {
+          // No-op (not an error) — but log so operators can spot agents escalating while disabled.
+          log("teams escalation: not configured (escalationConversationId empty) — no-op");
+          return { content: JSON.stringify({ escalated: false, reason: "escalation not configured" }) };
+        }
         const p = (params ?? {}) as Record<string, unknown>;
+        // Validate at runtime, not just via the JSON schema: reason is required and the agent
+        // context must be present, else the record (and the later ctx.agents.invoke reply-back
+        // keyed off agentId/companyId) would be malformed. Fail loudly with a clear result.
+        const reason = String(p.reason ?? "").trim();
+        if (!reason) return { content: JSON.stringify({ escalated: false, reason: "reason required" }) };
+        const agentId = typeof runCtx.agentId === "string" ? runCtx.agentId : "";
+        const companyId = typeof runCtx.companyId === "string" ? runCtx.companyId : "";
+        if (!agentId || !companyId) {
+          log("teams escalation: missing agent context", { hasAgentId: !!agentId, hasCompanyId: !!companyId });
+          return { content: JSON.stringify({ escalated: false, reason: "missing agent context" }) };
+        }
         const record: EscalationRecord = {
           id: `esc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-          agentId: runCtx.agentId,
-          companyId: runCtx.companyId,
-          reason: String(p.reason ?? ""),
+          agentId,
+          companyId,
+          reason,
           confidence: typeof p.confidence === "number" ? p.confidence : undefined,
           agentName: p.agentName != null ? String(p.agentName) : undefined,
           agentReasoning: p.agentReasoning != null ? String(p.agentReasoning) : undefined,
@@ -549,10 +564,10 @@ export default definePlugin({
           log("teams escalation: card post failed", { escalationId: record.id });
           return { content: JSON.stringify({ escalated: false, reason: "card post failed", escalationId: record.id }) };
         }
-        await escalationStore.create(record);
-        await escalationStore.attachCard(record.id, ref);
+        // Persist the record WITH the card ref in one write (no create()+attachCard() orphan window).
+        await escalationStore.create(record, ref);
         await ctx.activity
-          .log({ companyId: runCtx.companyId, message: `Escalation posted to Teams: ${record.reason}`, entityType: "plugin", entityId: record.id })
+          .log({ companyId, message: `Escalation posted to Teams: ${record.reason}`, entityType: "plugin", entityId: record.id })
           .catch(() => undefined);
         await ctx.metrics.write("teams.escalations.created", 1).catch(() => undefined);
         return { content: JSON.stringify({ escalated: true, escalationId: record.id }) };
@@ -838,7 +853,11 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
               // "Send reply" with nothing to send (no suggestion + empty field): don't invoke with an
               // empty prompt — re-open so the escalation stays actionable rather than silently resolving.
               await auditReopen("empty_reply");
-              await escStore.reopen(escalationId).catch(() => undefined);
+              const reopened = await escStore.reopen(escalationId).then(() => true, () => false);
+              if (!reopened) {
+                ctx.logger.error("teams escalation reopen FAILED after empty reply — escalation stuck closed with an actionable card; manual recovery needed", { escalationId });
+                await ctx.metrics.write("teams.escalations.reopen_failed", 1, { after: "empty_reply" }).catch(() => undefined);
+              }
               return null;
             }
             try {
@@ -852,7 +871,15 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
               // logger.info carries the error detail; auditReopen records the business audit + metric.
               ctx.logger.info("teams escalation reply invoke failed — reopening", { escalationId, error: e instanceof Error ? e.message : String(e) });
               await auditReopen("invoke_failed");
-              await escStore.reopen(escalationId).catch(() => undefined);
+              // If reopen ALSO fails, the escalation is stuck CLOSED while its card stays actionable
+              // — a retry click would hit close() on an already-closed record and silently drop the
+              // reply. We can't self-heal (the store itself is failing), so surface it LOUDLY for
+              // operators (error log + metric) instead of swallowing the error (Kody bug high).
+              const reopened = await escStore.reopen(escalationId).then(() => true, () => false);
+              if (!reopened) {
+                ctx.logger.error("teams escalation reopen FAILED after invoke failure — escalation stuck closed with an actionable card; manual recovery needed", { escalationId });
+                await ctx.metrics.write("teams.escalations.reopen_failed", 1, { after: "invoke_failed" }).catch(() => undefined);
+              }
               return null;
             }
           }

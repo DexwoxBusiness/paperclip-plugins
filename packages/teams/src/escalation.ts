@@ -234,7 +234,9 @@ function renderHistory(history: ConversationTurn[] | undefined) {
 export function buildEscalationResolvedCard(record: EscalationRecord, status: Exclude<EscalationStatus, "open">, opts: { byName?: string } = {}): AdaptiveCard {
   const label =
     status === "resolved" ? "✅ Resolved" : status === "dismissed" ? "🚫 Dismissed" : "⏰ Timed out — default action applied";
-  const by = opts.byName ? ` by ${opts.byName}` : "";
+  // byName is a Teams display name — sanitize it (Kody security): the caller's HTML/control strip
+  // does NOT escape Markdown, so an unescaped name could inject links/emphasis into this TextBlock.
+  const by = opts.byName ? ` by ${sanitizeCardText(opts.byName, 120)}` : "";
   return adaptiveCard([
     textBlock(`${label}${status === "timed_out" ? "" : by}`, { size: "Medium", weight: "Bolder", color: status === "resolved" ? "Good" : "Attention" }),
     textBlock(sanitizeCardText(record.reason), { isSubtle: true, wrap: true }),

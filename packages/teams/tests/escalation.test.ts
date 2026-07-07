@@ -184,6 +184,12 @@ describe("buildEscalationResolvedCard", () => {
     expect(JSON.stringify(buildEscalationResolvedCard(rec(), "dismissed", { byName: "Bob" }))).toContain("Dismissed by Bob");
     expect(JSON.stringify(buildEscalationResolvedCard(rec(), "timed_out"))).toMatch(/Timed out/i);
   });
+  it("sanitizes the human display name in the label (Kody security — no Markdown injection)", () => {
+    const json = JSON.stringify(buildEscalationResolvedCard(rec(), "resolved", { byName: "[Evil](http://x) *pwn*" }));
+    expect(json).toContain("\\["); // escaped
+    expect(json).toContain("\\*");
+    expect(json).not.toContain("[Evil](http://x)"); // raw Markdown link broken up
+  });
 });
 
 describe("expiredEscalations + timeoutMsFromMinutes", () => {

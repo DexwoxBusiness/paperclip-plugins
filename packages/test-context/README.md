@@ -7,4 +7,4 @@ Test Context Registry for [Paperclip](https://github.com/paperclipai/paperclip) 
 - Ephemeral per-PR preview env registration webhook for CI
 - Freshness job: env health, credential probes, seed staleness — the tautological-test defense
 
-Backlog: PCLIP-10 … PCLIP-17.
+> **Status:** in development.

@@ -1,4 +1,4 @@
-# Public messaging endpoint (VPS runbook) — T8 / PCLIP-25
+# Public messaging endpoint (VPS runbook)
 
 Teams' Bot Connector delivers every inbound activity by **POSTing to a public HTTPS URL**.
 In Paperclip that URL is the plugin webhook route:
@@ -168,11 +168,11 @@ not allocated per run). Only change it if you change the public host or the plug
 - **Why 502 and not 401/403 on rejection.** The plugin `onWebhook` cannot set the HTTP status
   or return a body (the host returns a fixed `200` on success / `502` on a thrown error). An
   auth rejection therefore surfaces as a clean-message `502` rather than the Bot Framework
-  spec's `403`. This is a host limitation tracked upstream as **PCLIP-41**; it does not affect
-  functionality — the call is still rejected and nothing is processed.
+  spec's `403`. This is a host limitation (a proper `403` would require a change in the Paperclip
+  host); it does not affect functionality — the call is still rejected and nothing is processed.
 - **Replies go via the Bot Connector.** Because the webhook response body is discarded, the bot
   never answers inline; it replies with a proactive/`updateActivity` call. This is why
-  interactive approvals (T7) use `Action.Submit` (a normal message activity) rather than
+  interactive approvals use `Action.Submit` (a normal message activity) rather than
   `Action.Execute` Universal Actions (which require an inline invoke response). Microsoft's docs
   confirm `Action.Submit` posts a `type:"message"` activity that needs no inline response, and
   that Teams drives its client feedback off the bot's HTTP status (host `200` → "Your response

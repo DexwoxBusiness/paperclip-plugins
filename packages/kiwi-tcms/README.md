@@ -9,4 +9,4 @@
 
 Kiwi has no dependable outbound webhooks — the integration surface is the RPC API, and the flow is inverted by design.
 
-Backlog: PCLIP-29 … PCLIP-36.
+> **Status:** in development.

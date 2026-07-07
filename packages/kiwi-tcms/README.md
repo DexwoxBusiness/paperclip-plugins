@@ -1,4 +1,4 @@
-# @dexwox/paperclip-plugin-kiwi-tcms
+# @dexwox-labs/paperclip-plugin-kiwi-tcms
 
 [Kiwi TCMS](https://kiwitcms.org) integration for [Paperclip](https://github.com/paperclipai/paperclip).
 

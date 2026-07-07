@@ -1,4 +1,4 @@
-# @dexwox/paperclip-plugin-teams
+# @dexwox-labs/paperclip-plugin-teams
 
 Microsoft Teams Chat OS for [Paperclip](https://github.com/paperclipai/paperclip).
 

@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a defect in a @dexwox-labs/paperclip-plugin-* package
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. For **security vulnerabilities do not use this form** — see [SECURITY.md](../blob/main/SECURITY.md).
+  - type: dropdown
+    id: package
+    attributes:
+      label: Affected package
+      options:
+        - "@dexwox-labs/paperclip-plugin-plane"
+        - "@dexwox-labs/paperclip-plugin-teams"
+        - "@dexwox-labs/paperclip-plugin-kiwi-tcms"
+        - "@dexwox-labs/paperclip-plugin-test-context"
+        - "other / not sure"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      placeholder: "e.g. 0.3.1"
+    validations:
+      required: true
+  - type: input
+    id: paperclip
+    attributes:
+      label: Paperclip host version
+      placeholder: "e.g. v2026.618.0"
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Configure ...
+        2. Trigger ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste any relevant logs (redact secrets/tokens).
+      render: shell

@@ -1,4 +1,4 @@
-# @dexwox/paperclip-plugin-test-context
+# @dexwox-labs/paperclip-plugin-test-context
 
 Test Context Registry for [Paperclip](https://github.com/paperclipai/paperclip) — the structured, queryable home for everything an agent needs *before* generating tests.
 

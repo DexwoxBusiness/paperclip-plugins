@@ -1,0 +1,17 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@3.0.0/schema.json",
+  "changelog": [
+    "@changesets/changelog-github",
+    { "repo": "DexwoxBusiness/paperclip-plugins" }
+  ],
+  "commit": false,
+  "fixed": [],
+  "linked": [],
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "ignore": [
+    "@dexwox-labs/paperclip-plugin-kiwi-tcms",
+    "@dexwox-labs/paperclip-plugin-test-context"
+  ]
+}

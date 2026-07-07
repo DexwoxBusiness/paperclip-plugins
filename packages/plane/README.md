@@ -1,4 +1,4 @@
-# @dexwox/paperclip-plugin-plane
+# @dexwox-labs/paperclip-plugin-plane
 
 Bidirectional [Plane](https://plane.so) CE sync for [Paperclip](https://github.com/paperclipai/paperclip).
 

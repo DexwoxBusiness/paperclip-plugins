@@ -48,8 +48,12 @@ export interface AskStore {
    * exactly once under a double-submit race.
    */
   answer(id: string, response: Record<string, string>, answeredBy: string, atMs: number): Promise<AskEntry | null>;
-  /** Cancel an OPEN ask (agent no longer needs it). Returns the updated entry or null if not open. */
-  cancel(id: string, atMs: number): Promise<AskEntry | null>;
+  /**
+   * Cancel an OPEN ask (agent no longer needs it). Returns the updated entry or null if not open.
+   * When `owner` is supplied, the cancel only applies if the ask belongs to that agent+company
+   * (ownership checked INSIDE the lock so a caller can't cancel another agent's ask) — Codex P2.
+   */
+  cancel(id: string, atMs: number, owner?: { agentId: string; companyId: string }): Promise<AskEntry | null>;
   /** All still-open ask entries (for the agent's own re-prompt decisions; the plugin never nudges). */
   listOpen(): Promise<AskEntry[]>;
 }
@@ -123,11 +127,14 @@ export function createAskStore(backend: AskStoreBackend, opts: { now?: () => num
         return updated;
       });
     },
-    async cancel(id, atMs) {
+    async cancel(id, atMs, owner) {
       if (!id) return null;
       return withLock(id, async () => {
         const entry = await store.get(id);
         if (!entry || entry.request.status !== "open") return null;
+        // Ownership gate (Codex P2): a caller may only cancel its own agent+company's ask. Return
+        // null for a mismatch — indistinguishable from "unknown", so a leaked id reveals nothing.
+        if (owner && (entry.request.agentId !== owner.agentId || entry.request.companyId !== owner.companyId)) return null;
         const updated: AskEntry = {
           ...entry,
           request: { ...entry.request, status: "cancelled", answeredAtMs: atMs },

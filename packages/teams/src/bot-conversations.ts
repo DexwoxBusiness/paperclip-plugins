@@ -47,6 +47,17 @@ export function conversationKey(ref: ConversationRef): string | null {
   return typeof id === "string" && id.trim() ? id.trim() : null;
 }
 
+/**
+ * True only for a 1:1 personal chat (Teams `conversationType === "personal"`). The generic store
+ * remembers EVERY inbound reference — channels and group chats included — so a feature meant to DM
+ * a specific person (PCLIP-43 ask) must gate on this before posting, or a reused/mistyped
+ * conversation id could leak a private prompt into a channel (Codex P1). Missing/unknown type is
+ * treated as NOT personal (fail closed).
+ */
+export function isPersonalConversationRef(ref: ConversationRef | undefined): boolean {
+  return ref?.conversation?.conversationType === "personal";
+}
+
 function createLock(): <T>(fn: () => Promise<T>) => Promise<T> {
   let tail: Promise<unknown> = Promise.resolve();
   return <T>(fn: () => Promise<T>): Promise<T> => {

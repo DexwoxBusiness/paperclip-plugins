@@ -731,12 +731,18 @@ export default definePlugin({
           },
         },
       },
-      async (params) => {
+      async (params, runCtx) => {
         const p = (params ?? {}) as Record<string, unknown>;
         const prefix = typeof p.correlationPrefix === "string" ? p.correlationPrefix : "";
+        const agentId = typeof runCtx.agentId === "string" ? runCtx.agentId : "";
+        const companyId = typeof runCtx.companyId === "string" ? runCtx.companyId : "";
+        if (!agentId || !companyId) return { content: JSON.stringify({ openAsks: [] }) };
         const open = await askStore.listOpen();
         const openAsks = open
           .map((e) => e.request)
+          // Scope to the CALLER's own asks (Codex P2): never expose another agent/company's
+          // personRef/prompt/correlationId/requestId across a shared plugin instance.
+          .filter((r) => r.agentId === agentId && r.companyId === companyId)
           .filter((r) => !prefix || (r.correlationId ?? "").startsWith(prefix))
           .map((r) => ({ requestId: r.id, personRef: r.personRef, correlationId: r.correlationId, prompt: r.prompt, createdAtMs: r.createdAtMs }));
         return { content: JSON.stringify({ openAsks }) };
@@ -756,11 +762,16 @@ export default definePlugin({
           required: ["requestId"],
         },
       },
-      async (params) => {
+      async (params, runCtx) => {
         const p = (params ?? {}) as Record<string, unknown>;
         const requestId = String(p.requestId ?? "").trim();
         if (!requestId) return { content: JSON.stringify({ cancelled: false, reason: "requestId required" }) };
-        const cancelled = await askStore.cancel(requestId, Date.now());
+        const agentId = typeof runCtx.agentId === "string" ? runCtx.agentId : "";
+        const companyId = typeof runCtx.companyId === "string" ? runCtx.companyId : "";
+        if (!agentId || !companyId) return { content: JSON.stringify({ cancelled: false, reason: "missing agent context" }) };
+        // Ownership-scoped cancel (Codex P2): only the creating agent+company can cancel; a mismatch
+        // returns null → reported as "unknown", so a leaked requestId can't cancel someone else's ask.
+        const cancelled = await askStore.cancel(requestId, Date.now(), { agentId, companyId });
         if (!cancelled) return { content: JSON.stringify({ cancelled: false, reason: "unknown or already closed" }) };
         // Best-effort card update; the state transition already succeeded so a failure never throws.
         if (cancelled.conversationReference && cancelled.activityId) {

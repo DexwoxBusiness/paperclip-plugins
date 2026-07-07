@@ -48,7 +48,7 @@ type Activity = Parameters<TurnContext["updateActivity"]>[0];
 // `express`); derive the exact type CloudAdapter.process expects for our shims.
 type AdapterResponse = Parameters<CloudAdapter["process"]>[1];
 import { assertBotClaims, assertServiceUrl, BotInboundUnauthorizedError, extractBearerToken, type AuthDecision, type BotTokenClaims, type InboundAuthConfig } from "./bot-auth.js";
-import { conversationKey, type ConversationRef, type ConversationStore } from "./bot-conversations.js";
+import { conversationKey, isPersonalConversationRef, type ConversationRef, type ConversationStore } from "./bot-conversations.js";
 import {
   buildApprovalCard,
   buildApprovalErrorCard,
@@ -584,6 +584,16 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       const conv = await deps.conversations.get(personRef);
       if (!conv) {
         deps.log("teams ask skipped: no stored conversation for person (needs install)", { personRef });
+        return null;
+      }
+      // Refuse anything that isn't a 1:1 personal chat — the generic store also remembers channels
+      // and group chats, and an ask is a private DM. Sending it to a channel would leak the prompt
+      // (Codex P1). Fail closed: unknown/missing conversationType is treated as not-personal.
+      if (!isPersonalConversationRef(conv.reference)) {
+        deps.log("teams ask refused: target is not a personal 1:1 chat (would leak to a channel/group)", {
+          personRef,
+          conversationType: conv.reference?.conversation?.conversationType,
+        });
         return null;
       }
       let activityId: string | undefined;

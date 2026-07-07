@@ -56,6 +56,17 @@ describe("createAskStore", () => {
     expect(await store.answer("nope", { answer: "z" }, "u", 1)).toBeNull();
   });
 
+  it("cancel is ownership-scoped when owner is supplied (Codex P2)", async () => {
+    const store = createAskStore(memoryBackend());
+    await store.create(req("a1", { agentId: "agentA", companyId: "co1" }));
+    // A different agent (or company) cannot cancel — returns null, ask stays open.
+    expect(await store.cancel("a1", 1, { agentId: "agentB", companyId: "co1" })).toBeNull();
+    expect(await store.cancel("a1", 1, { agentId: "agentA", companyId: "co2" })).toBeNull();
+    expect((await store.get("a1"))?.request.status).toBe("open");
+    // The owner can.
+    expect((await store.cancel("a1", 2, { agentId: "agentA", companyId: "co1" }))?.request.status).toBe("cancelled");
+  });
+
   it("listOpen returns only still-open asks", async () => {
     const store = createAskStore(memoryBackend());
     await store.create(req("a1"));

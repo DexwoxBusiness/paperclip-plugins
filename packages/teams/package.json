@@ -1,9 +1,15 @@
 {
   "name": "@dexwox-labs/paperclip-plugin-teams",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Microsoft Teams Chat OS for Paperclip: v1 Adaptive Card notifications via Power Automate Workflows webhooks; v2 interactive bot (approvals, commands) on the Microsoft 365 Agents SDK.",
-  "keywords": ["paperclip-plugin", "paperclip", "microsoft-teams", "notifications", "adaptive-cards"],
+  "keywords": [
+    "paperclip-plugin",
+    "paperclip",
+    "microsoft-teams",
+    "notifications",
+    "adaptive-cards"
+  ],
   "main": "./dist/index.js",
   "paperclipPlugin": {
     "manifest": "./dist/manifest.js",
@@ -30,7 +36,9 @@
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
-  "files": ["dist/"],
+  "files": [
+    "dist/"
+  ],
   "publishConfig": {
     "access": "public"
   },

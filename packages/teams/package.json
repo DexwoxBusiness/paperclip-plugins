@@ -1,5 +1,5 @@
 {
-  "name": "@dexwox/paperclip-plugin-teams",
+  "name": "@dexwox-labs/paperclip-plugin-teams",
   "version": "0.1.0",
   "type": "module",
   "description": "Microsoft Teams Chat OS for Paperclip: v1 Adaptive Card notifications via Power Automate Workflows webhooks; v2 interactive bot (approvals, commands) on the Microsoft 365 Agents SDK.",
@@ -31,6 +31,9 @@
     "vitest": "^3.0.0"
   },
   "files": ["dist/"],
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/DexwoxBusiness/paperclip-plugins.git",

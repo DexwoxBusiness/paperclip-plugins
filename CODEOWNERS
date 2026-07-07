@@ -1,0 +1,19 @@
+# Code owners for dexwox-paperclip-plugins.
+# These owners are requested for review automatically when a PR touches matching paths.
+# Order matters — the LAST matching pattern takes precedence.
+
+# Default: the org owns everything not otherwise assigned.
+*                           @DexwoxBusiness
+
+# Per-package ownership (adjust to specific maintainers as the team grows).
+/packages/plane/            @DexwoxBusiness
+/packages/teams/            @DexwoxBusiness
+/packages/kiwi-tcms/        @DexwoxBusiness
+/packages/test-context/     @DexwoxBusiness
+
+# Release + CI + governance config warrants extra scrutiny.
+/.github/                   @DexwoxBusiness
+/.changeset/                @DexwoxBusiness
+/CONTRIBUTING.md            @DexwoxBusiness
+/SECURITY.md                @DexwoxBusiness
+/RELEASING.md               @DexwoxBusiness

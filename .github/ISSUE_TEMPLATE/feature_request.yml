@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest a capability or improvement for a plugin
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: package
+    attributes:
+      label: Which plugin?
+      options:
+        - "@dexwox-labs/paperclip-plugin-plane"
+        - "@dexwox-labs/paperclip-plugin-teams"
+        - "@dexwox-labs/paperclip-plugin-kiwi-tcms"
+        - "@dexwox-labs/paperclip-plugin-test-context"
+        - "cross-cutting / new plugin"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and what's missing today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: If you have Given/When/Then acceptance criteria in mind, include them.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

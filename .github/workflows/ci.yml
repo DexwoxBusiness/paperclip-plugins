@@ -45,7 +45,7 @@ jobs:
       # botbuilder / Bot Framework SDK dependency. This is the explicit CI enforcement of
       # the ban — the no-botbuilder guard test scans the whole workspace.
       - name: Guard — no Bot Framework SDK dependencies
-        run: pnpm --filter @dexwox/paperclip-plugin-teams test -- tests/no-botbuilder.test.ts
+        run: pnpm --filter @dexwox-labs/paperclip-plugin-teams test -- tests/no-botbuilder.test.ts
 
       - name: Typecheck (all packages)
         run: pnpm -r typecheck

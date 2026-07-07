@@ -1,5 +1,5 @@
 {
-  "name": "@dexwox/paperclip-plugin-test-context",
+  "name": "@dexwox-labs/paperclip-plugin-test-context",
   "version": "0.1.0",
   "type": "module",
   "description": "Test Context Registry for Paperclip: per-project environments, seed manifests, stub maps, secret-ref credentials, ephemeral PR preview envs, and freshness checks - everything an agent needs before generating tests, with secrets never entering prompts.",

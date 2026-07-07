@@ -69,6 +69,7 @@ import {
   type EscalationAction,
   type EscalationRecord,
 } from "./escalation.js";
+import { buildAskAnsweredCard, buildAskCard, parseAskSubmit, type AskRequest } from "./ask.js";
 import { type AdaptiveCard } from "./adaptive-card.js";
 
 export interface TeamsBotDeps {
@@ -98,6 +99,18 @@ export interface TeamsBotDeps {
       replyText?: string,
     ): Promise<{ record: EscalationRecord; status: "resolved" | "dismissed"; activityId?: string } | null>;
   };
+  /**
+   * Generic ask surface (PCLIP-43 / T12). `onSubmit` resolves an answer worker-side (ledger +
+   * ctx.agents.invoke route-back) and returns the answered request so the bot updates the card.
+   * Omit to disable ask-card handling.
+   */
+  asks?: {
+    onSubmit(
+      requestId: string,
+      values: Record<string, string>,
+      actor: { actor: string; actorName?: string },
+    ): Promise<{ request: AskRequest; activityId?: string } | null>;
+  };
   log: (message: string, fields?: Record<string, unknown>) => void;
 }
 
@@ -116,6 +129,14 @@ export interface TeamsBot {
   postEscalationCard(conversationKeyId: string, record: EscalationRecord): Promise<{ conversationReference: unknown; activityId: string } | null>;
   /** Proactively update a stored escalation card to its terminal state (timeout job) (PCLIP-28). */
   updateEscalationCard(ref: { conversationReference: unknown; activityId: string }, card: AdaptiveCard): Promise<void>;
+  /**
+   * Post an ask card to a person's stored 1:1 conversation (PCLIP-43). Returns the ref for the
+   * worker to store, or null when the person isn't reachable (no stored reference, or a 403-class
+   * send error — app not installed / blocked / uninstalled) so the tool can no-op cleanly.
+   */
+  postAskCard(personRef: string, request: AskRequest): Promise<{ conversationReference: unknown; activityId: string } | null>;
+  /** Proactively update a stored ask card to its answered/cancelled state (PCLIP-43). */
+  updateAskCard(ref: { conversationReference: unknown; activityId: string }, card: AdaptiveCard): Promise<void>;
 }
 
 /** Build the inbound-auth policy config from deps. */
@@ -263,6 +284,14 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       await next();
       return;
     }
+    // PCLIP-43 (T12): a generic ask-card submit ("Send") arrives as a message activity with our
+    // data + the collected fields in `activity.value`. Route it before commands (no command text).
+    const askSubmit = parseAskSubmit(context.activity.value);
+    if (askSubmit && deps.asks) {
+      await handleAskSubmit(context, askSubmit.requestId, askSubmit.values);
+      await next();
+      return;
+    }
     // PCLIP-27 (T10): an @mention text command. parseCommand strips the <at>…</at> mention
     // span itself (this SDK's ActivityHandler has no removeRecipientMention), and unknown/
     // empty text renders help — so the user is never left in silence.
@@ -385,6 +414,33 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       // The resolution already succeeded (agent invoked + state updated); a failed card render
       // must NOT fail the whole turn (Kody) — log and let the turn complete gracefully.
       deps.log("teams escalation card update failed", { escalationId, error: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  /**
+   * Handle a generic ask-card "Send" (PCLIP-43). The worker-side `onSubmit` atomically records the
+   * answer + routes it back to the requesting agent, and returns the answered request so we edit the
+   * card the button was on to its answered state. Unknown/already-answered asks return null and
+   * leave the card untouched (idempotent, no double route-back).
+   */
+  const handleAskSubmit = async (context: TurnContext, requestId: string, values: Record<string, string>): Promise<void> => {
+    if (!deps.asks) return;
+    const actor = teamsActor(context.activity.from?.aadObjectId);
+    const actorName = sanitizeDisplayName(context.activity.from?.name);
+    const result = await deps.asks.onSubmit(requestId, values, { actor, actorName });
+    if (!result) return;
+    const card = buildAskAnsweredCard(result.request, { byName: actorName });
+    const target = resolveCardUpdateTarget((context.activity as { replyToId?: string }).replyToId, result.activityId);
+    try {
+      if (target.mode === "update") {
+        await context.updateActivity({ ...cardActivity(card), id: target.id } as Activity);
+      } else {
+        await context.sendActivity(cardActivity(card) as Activity);
+      }
+    } catch (e) {
+      // The answer already landed (recorded + agent route-back attempted); a failed card render
+      // must NOT fail the turn — log and continue.
+      deps.log("teams ask card update failed", { requestId, error: e instanceof Error ? e.message : String(e) });
     }
   };
 
@@ -515,6 +571,36 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     // PCLIP-28: proactively edit a stored escalation card to its terminal state (used by the
     // timeout sweep, which runs outside any turn context).
     async updateEscalationCard(ref, card) {
+      await adapter.continueConversation(deps.botAppId, ref.conversationReference as never, async (ctx) => {
+        await ctx.updateActivity({ type: "message", id: ref.activityId, attachments: [CardFactory.adaptiveCard(card)] } as Activity);
+      });
+    },
+    // PCLIP-43: post an ask card to a person's stored 1:1 conversation. Returns null when the
+    // person isn't reachable so the tool no-ops cleanly: either we have no stored reference for
+    // them (never interacted / app not installed), OR the proactive send fails with a 403-class
+    // error (ForbiddenOperationException = not installed, MessageWritesBlocked = blocked/uninstalled
+    // — MS docs). We treat every send failure as "not reachable" rather than throwing into the tool.
+    async postAskCard(personRef, request) {
+      const conv = await deps.conversations.get(personRef);
+      if (!conv) {
+        deps.log("teams ask skipped: no stored conversation for person (needs install)", { personRef });
+        return null;
+      }
+      let activityId: string | undefined;
+      try {
+        await adapter.continueConversation(deps.botAppId, conv.reference as never, async (ctx) => {
+          const res = await ctx.sendActivity(cardActivity(buildAskCard(request)) as Activity);
+          activityId = res?.id;
+        });
+      } catch (e) {
+        deps.log("teams ask post failed (person not reachable)", { personRef, error: e instanceof Error ? e.message : String(e) });
+        return null;
+      }
+      if (!activityId) return null;
+      return { conversationReference: conv.reference, activityId };
+    },
+    // PCLIP-43: proactively edit a stored ask card to its answered/cancelled state.
+    async updateAskCard(ref, card) {
       await adapter.continueConversation(deps.botAppId, ref.conversationReference as never, async (ctx) => {
         await ctx.updateActivity({ type: "message", id: ref.activityId, attachments: [CardFactory.adaptiveCard(card)] } as Activity);
       });

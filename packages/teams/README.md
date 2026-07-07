@@ -127,6 +127,22 @@ A stuck agent calls the **`escalate_to_human`** agent tool (registered via the `
 
 **Grounded in the Microsoft docs:** the card is updated in place with `updateActivity` + the message id, and proactive posts/updates use `CloudAdapter.continueConversation` with a persisted conversation reference. Because Teams may omit `replyToId` when multiple cards share a channel, the resolve path falls back to the **stored** card activity id (captured at post time) rather than relying on `replyToId` alone. Metrics: `teams.escalations.created` / `.resolved{action}` / `.timed_out{action}` / `.reopened{reason}` (a reply that couldn't be delivered — `empty_reply` or `invoke_failed` — so the escalation was kept open) / `.reopen_failed{after}` (the rare double-failure where re-open itself failed, surfaced loudly for manual recovery). Entirely plugin-side; the pure card/parse/timeout/store logic is unit-tested (SDK-decoupled).
 
+## Generic ask surface (T12 / PCLIP-43)
+
+A scrum-agnostic connectivity primitive: an agent can **ask a specific person a question and get the answer routed back**, with no scrum vocabulary in the plugin. This is the foundation the future Scrum-Master agent (daily standup, grooming, planning) sits on — the agent owns the process and cadence; the plugin only carries messages and tracks who answered.
+
+**Tools (all via `agent.tools.register`):**
+
+- `ask_person(personRef, prompt, fields?, correlationId?)` — posts an Adaptive Card with the prompt + editable inputs to the person's stored 1:1 conversation, persists the request in a ledger, and returns `{ requestId }`. No-ops with a clear result (`person not reachable / needs install`) when the person has no stored conversation reference or the proactive send hits a 403-class error — never throws.
+- `list_open_asks(correlationPrefix?)` — returns the still-open asks so the **agent** decides whether to re-ask. The plugin never nudges on its own.
+- `cancel_ask(requestId)` — withdraws an outstanding ask and updates the person's card.
+
+**Reply-back** reuses the T11 round-trip: the person's `Send` submit arrives via the same `onMessage` seam, the ledger's `answer()` atomically claims it (a double-submit routes exactly once), and the response is delivered to the requesting agent via `ctx.agents.invoke`. If the route-back invoke fails, the answer is preserved (recorded in the ledger) and surfaced via `teams.asks.route_failed` — we do **not** re-show the card (the human already answered).
+
+**Grounded in the Microsoft docs** (*Send proactive messages — Teams*): 1:1 proactive messaging requires a stored conversation reference and the app installed in personal scope, else a `403 ForbiddenOperationException` (or `MessageWritesBlocked` if blocked/uninstalled) — which is exactly the "needs install" no-op. `personRef` is a stored 1:1 conversation key (Teams doesn't support proactive by email/UPN; a Plane↔Teams identity map resolving to `aadObjectId` is a separate story). Metrics: `teams.asks.created` / `.answered` / `.cancelled` / `.route_failed`. Pure ledger/card/parse logic is SDK-decoupled and unit-tested.
+
+**Out of scope (separate items):** proactive install via Microsoft Graph + app-manifest personal scope; Plane↔Teams identity mapping; channel broadcast; and the Scrum-Master agent/routine itself (schedule, question set, responder-only nudges, summary rollup) — that's Paperclip-side, not a plugin story.
+
 ## Backlog
 
 PCLIP-18 … PCLIP-28. Pattern credit: [paperclip-plugin-slack](https://github.com/mvanhorn/paperclip-plugin-slack).

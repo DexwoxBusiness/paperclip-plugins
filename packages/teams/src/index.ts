@@ -11,6 +11,8 @@ export * from "./secret-resolve.js";
 export * from "./commands.js";
 export * from "./escalation.js";
 export * from "./escalation-store.js";
+export * from "./ask.js";
+export * from "./ask-store.js";
 export * from "./approvals.js";
 export * from "./approval-store.js";
 export * from "./event-adapters.js";

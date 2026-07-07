@@ -9,6 +9,8 @@ export * from "./bot-conversations.js";
 export * from "./messaging-endpoint.js";
 export * from "./secret-resolve.js";
 export * from "./commands.js";
+export * from "./escalation.js";
+export * from "./escalation-store.js";
 export * from "./approvals.js";
 export * from "./approval-store.js";
 export * from "./event-adapters.js";

@@ -50,6 +50,12 @@ export interface TeamsInstanceConfig extends TeamsUrlConfig {
   paperclipBoardApiKeyRef?: string;
   /** Conversation id the bot posts interactive approval cards to (empty = off). PCLIP-24 */
   botApprovalsConversationId?: string;
+  /** Conversation id the bot posts HITL escalation cards to (empty = escalation disabled). PCLIP-28 */
+  escalationConversationId?: string;
+  /** Minutes an escalation waits for a human before the default action (default 15). PCLIP-28 */
+  escalationTimeoutMinutes?: number;
+  /** Default action on escalation timeout: "defer" | "dismiss" (default "defer"). PCLIP-28 */
+  escalationDefaultAction?: "defer" | "dismiss";
 }
 
 /** Which config field backs each channel. */

@@ -115,6 +115,18 @@ Once the bot is installed in a channel or chat, **@mention it with a command** a
 
 **`approve` authorization (board-key parity).** There is **no per-sender allowlist** — any member of a channel where the bot is installed can approve, exactly like the Slack/Discord plugins; the board API key (`paperclipBoardApiKeyRef`) plus Paperclip's own governance is the security boundary. If approvals aren't reachable (no `paperclipBaseUrl`) the bot replies with a polite "approvals aren't enabled here" card; if the API rejects the id, a polite failure card. To restrict approvals to specific people, a per-user allowlist can be added later (tracked follow-up).
 
+## HITL escalation with suggested replies (T11 / PCLIP-28)
+
+A stuck agent calls the **`escalate_to_human`** agent tool (registered via the `agent.tools.register` capability) with a reason, its reasoning, confidence, conversation history, and a suggested reply. The plugin posts an interactive Adaptive Card to a configured Teams conversation with that context, an **editable reply field prefilled with the suggestion** (so the human reviews/edits before sending), and two buttons: **Send reply** and **Dismiss**. Modeled on the Slack plugin's escalation flow, adapted to Teams-accessible APIs.
+
+**Reply-back is via `ctx.agents.invoke`.** Slack routes the reply into a live ACP agent *session* (`sessions.sendMessage`); Teams has no ACP session bridge, so clicking **Send reply** wakes the escalating agent (its `agentId`, captured from the tool run context) with a new prompt `"Human reply to escalation: …"` — using the human's edited text, falling back to the agent's suggestion when the field is left blank — via the `agents.invoke` capability. The card is then updated in place to its resolved state.
+
+**Timeout.** A `check-escalation-timeouts` job (every minute) applies the configured default action to escalations older than `escalationTimeoutMinutes` (default 15): `escalationDefaultAction` is `defer` (leave it) or `dismiss`. The card updates to "Timed out"; `teams.escalations.timed_out{action}` is emitted.
+
+**Config:** `escalationConversationId` (the bot must be installed there; empty = the tool no-ops with a clear result, never throws), `escalationTimeoutMinutes`, `escalationDefaultAction`.
+
+**Grounded in the Microsoft docs:** the card is updated in place with `updateActivity` + the message id, and proactive posts/updates use `CloudAdapter.continueConversation` with a persisted conversation reference. Because Teams may omit `replyToId` when multiple cards share a channel, the resolve path falls back to the **stored** card activity id (captured at post time) rather than relying on `replyToId` alone. Metrics: `teams.escalations.created` / `.resolved{action}` / `.timed_out{action}` / `.reopened{reason}` (a reply that couldn't be delivered — `empty_reply` or `invoke_failed` — so the escalation was kept open) / `.reopen_failed{after}` (the rare double-failure where re-open itself failed, surfaced loudly for manual recovery). Entirely plugin-side; the pure card/parse/timeout/store logic is unit-tested (SDK-decoupled).
+
 ## Backlog
 
 PCLIP-18 … PCLIP-28. Pattern credit: [paperclip-plugin-slack](https://github.com/mvanhorn/paperclip-plugin-slack).

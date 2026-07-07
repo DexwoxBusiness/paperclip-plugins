@@ -26,6 +26,10 @@ const manifest: PaperclipPluginManifestV1 = {
     "metrics.write",
     "jobs.schedule",
     "events.emit",
+    // PCLIP-28 (T11): register the escalate_to_human agent tool + wake the escalating agent
+    // with the human's reply.
+    "agent.tools.register",
+    "agents.invoke",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
@@ -47,6 +51,14 @@ const manifest: PaperclipPluginManifestV1 = {
       // posts once per day, so the time is adjustable at runtime (a static cron
       // can't read config).
       schedule: "0 * * * *",
+    },
+    {
+      jobKey: JOB_KEYS.checkEscalationTimeouts,
+      displayName: "Escalation timeout sweep",
+      description: "Applies the default action (defer/dismiss) to HITL escalations past their timeout. PCLIP-28",
+      // Every minute — the sweep only touches OPEN escalations (bounded by the index),
+      // and the effective timeout is enforced in the worker against escalationTimeoutMinutes.
+      schedule: "*/1 * * * *",
     },
   ],
   instanceConfigSchema: {
@@ -185,6 +197,28 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "Teams conversation id the bot posts interactive Approve/Reject approval cards to (the bot must already be installed in that conversation). Posted IN ADDITION to the Workflows approval notification. Empty = interactive approvals off. PCLIP-24",
         default: DEFAULT_CONFIG.botApprovalsConversationId,
+      },
+      escalationConversationId: {
+        type: "string",
+        title: "HITL escalation conversation (v2, optional)",
+        description:
+          "Teams conversation id the bot posts HITL escalation cards to (the bot must already be installed there). Empty = escalation disabled: the escalate_to_human tool no-ops. PCLIP-28",
+        default: DEFAULT_CONFIG.escalationConversationId,
+      },
+      escalationTimeoutMinutes: {
+        type: "number",
+        title: "Escalation timeout (minutes)",
+        description:
+          "Minutes an open escalation waits for a human before the default action fires. Default 15. PCLIP-28",
+        default: DEFAULT_CONFIG.escalationTimeoutMinutes,
+      },
+      escalationDefaultAction: {
+        type: "string",
+        enum: ["defer", "dismiss"],
+        title: "Escalation default action on timeout",
+        description:
+          "What happens when an escalation times out with no human action: 'defer' (leave it) or 'dismiss'. Default 'defer'. PCLIP-28",
+        default: DEFAULT_CONFIG.escalationDefaultAction,
       },
     },
     required: ["defaultWorkflowUrl", "paperclipBaseUrl"],

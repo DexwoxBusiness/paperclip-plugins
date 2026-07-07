@@ -61,6 +61,15 @@ import {
 } from "./approvals.js";
 import { type ApprovalStore } from "./approval-store.js";
 import { buildHelpCard, dispatchCommand, parseCommand, type CommandDeps, type CommandName } from "./commands.js";
+import {
+  buildEscalationCard,
+  buildEscalationResolvedCard,
+  parseEscalationSubmit,
+  resolveCardUpdateTarget,
+  type EscalationAction,
+  type EscalationRecord,
+} from "./escalation.js";
+import { type AdaptiveCard } from "./adaptive-card.js";
 
 export interface TeamsBotDeps {
   /** Raw settings-derived auth config; normalized via getAuthConfigWithDefaults internally. */
@@ -76,6 +85,19 @@ export interface TeamsBotDeps {
   commands?: CommandDeps;
   /** Called after a command is handled, for the `teams.commands.handled` metric. */
   onCommand?: (command: CommandName) => void;
+  /**
+   * HITL escalation (PCLIP-28 / T11). `onSubmit` resolves a card click worker-side (state +
+   * ctx.agents.invoke for a reply) and returns the terminal status so the bot updates the card.
+   * Omit to disable escalation-card handling.
+   */
+  escalations?: {
+    onSubmit(
+      escalationId: string,
+      action: EscalationAction,
+      actor: { actor: string; actorName?: string },
+      replyText?: string,
+    ): Promise<{ record: EscalationRecord; status: "resolved" | "dismissed"; activityId?: string } | null>;
+  };
   log: (message: string, fields?: Record<string, unknown>) => void;
 }
 
@@ -90,6 +112,10 @@ export interface TeamsBot {
   postApprovalCard(conversationKeyId: string, input: ApprovalCardInput): Promise<boolean>;
   /** On the approval.decided event, read the outcome and refresh the stored card (PCLIP-24). */
   onApprovalDecided(input: { approvalId: string; byName?: string }): Promise<boolean>;
+  /** Post a HITL escalation card to a conversation; returns its ref for the worker to store (PCLIP-28). */
+  postEscalationCard(conversationKeyId: string, record: EscalationRecord): Promise<{ conversationReference: unknown; activityId: string } | null>;
+  /** Proactively update a stored escalation card to its terminal state (timeout job) (PCLIP-28). */
+  updateEscalationCard(ref: { conversationReference: unknown; activityId: string }, card: AdaptiveCard): Promise<void>;
 }
 
 /** Build the inbound-auth policy config from deps. */
@@ -228,6 +254,15 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       await next();
       return;
     }
+    // PCLIP-28 (T11): a HITL escalation card click ("Send reply" / "Dismiss") arrives as a
+    // message activity with our data in `activity.value` (plus the editable reply field). Route
+    // it before commands (a card submit has no command text).
+    const escalationSubmit = parseEscalationSubmit(context.activity.value);
+    if (escalationSubmit && deps.escalations) {
+      await handleEscalationSubmit(context, escalationSubmit.escalationId, escalationSubmit.action, escalationSubmit.replyText);
+      await next();
+      return;
+    }
     // PCLIP-27 (T10): an @mention text command. parseCommand strips the <at>…</at> mention
     // span itself (this SDK's ActivityHandler has no removeRecipientMention), and unknown/
     // empty text renders help — so the user is never left in silence.
@@ -320,6 +355,37 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     if (!name) return undefined;
     const cleaned = name.replace(/[<>&"'`\r\n\t]/g, "").trim().slice(0, 120);
     return cleaned || undefined;
+  };
+
+  /**
+   * Handle a HITL escalation card click (PCLIP-28). The worker-side `onSubmit` does the state
+   * transition + `ctx.agents.invoke` reply-back and returns the terminal status; we then edit
+   * the card the button was on (`replyToId`) to its resolved/dismissed state. Unknown/already-
+   * resolved escalations return null and leave the card untouched (idempotent, no double-invoke).
+   */
+  const handleEscalationSubmit = async (context: TurnContext, escalationId: string, action: EscalationAction, replyText?: string): Promise<void> => {
+    if (!deps.escalations) return;
+    const actor = teamsActor(context.activity.from?.aadObjectId);
+    const actorName = sanitizeDisplayName(context.activity.from?.name);
+    const result = await deps.escalations.onSubmit(escalationId, action, { actor, actorName }, replyText);
+    if (!result) return;
+    const card = buildEscalationResolvedCard(result.record, result.status, { byName: actorName });
+    // Prefer the activity's own replyToId; fall back to the STORED card activity id, since Teams
+    // may omit replyToId when several Adaptive Cards share a channel (MS docs). If we still have no
+    // id, post a fresh card so the human always sees the outcome (never silent). Decision is the
+    // pure resolveCardUpdateTarget (unit-tested).
+    const target = resolveCardUpdateTarget((context.activity as { replyToId?: string }).replyToId, result.activityId);
+    try {
+      if (target.mode === "update") {
+        await context.updateActivity({ ...cardActivity(card), id: target.id } as Activity);
+      } else {
+        await context.sendActivity(cardActivity(card) as Activity);
+      }
+    } catch (e) {
+      // The resolution already succeeded (agent invoked + state updated); a failed card render
+      // must NOT fail the whole turn (Kody) — log and let the turn complete gracefully.
+      deps.log("teams escalation card update failed", { escalationId, error: e instanceof Error ? e.message : String(e) });
+    }
   };
 
   return {
@@ -428,6 +494,30 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       });
       await deps.approvals.store.forget(input.approvalId);
       return true;
+    },
+    // PCLIP-28: post the escalation card to the configured conversation and return its ref
+    // (conversation reference + posted activity id) so the worker can store it for the timeout
+    // job to edit later. Must be bot-posted (not Workflows) so the card is updatable.
+    async postEscalationCard(conversationKeyId, record) {
+      const conv = await deps.conversations.get(conversationKeyId);
+      if (!conv) {
+        deps.log("teams escalation card skipped: unknown conversation", { conversationKeyId });
+        return null;
+      }
+      let activityId: string | undefined;
+      await adapter.continueConversation(deps.botAppId, conv.reference as never, async (ctx) => {
+        const res = await ctx.sendActivity(cardActivity(buildEscalationCard(record)) as Activity);
+        activityId = res?.id;
+      });
+      if (!activityId) return null;
+      return { conversationReference: conv.reference, activityId };
+    },
+    // PCLIP-28: proactively edit a stored escalation card to its terminal state (used by the
+    // timeout sweep, which runs outside any turn context).
+    async updateEscalationCard(ref, card) {
+      await adapter.continueConversation(deps.botAppId, ref.conversationReference as never, async (ctx) => {
+        await ctx.updateActivity({ type: "message", id: ref.activityId, attachments: [CardFactory.adaptiveCard(card)] } as Activity);
+      });
     },
   };
 }

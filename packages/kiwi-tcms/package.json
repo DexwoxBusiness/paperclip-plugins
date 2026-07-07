@@ -1,6 +1,7 @@
 {
   "name": "@dexwox-labs/paperclip-plugin-kiwi-tcms",
   "version": "0.1.0",
+  "private": true,
   "type": "module",
   "description": "Kiwi TCMS integration for Paperclip: agent tools for test-case authoring over JSON-RPC and one-way CI results ingest (JUnit/Playwright -> TestRun/TestExecutions) with Plane-ID tagging.",
   "keywords": ["paperclip-plugin", "paperclip", "kiwi-tcms", "testing", "tcms"],

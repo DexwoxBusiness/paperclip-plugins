@@ -57,6 +57,21 @@ export function safeErrorClass(e: unknown): string {
   return "unknown";
 }
 
+/** Shape of a host-minted secret-ref: an opaque UUID (8-4-4-4-12 hex). */
+const SECRET_REF_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Whether a stored credential value is a host secret-REF (the opaque UUID minted by the
+ * secret store) versus a raw secret VALUE pasted directly into the field. Real credential
+ * material never has the UUID shape — Entra client secrets are ~40 chars containing `~` and
+ * other non-hex characters; Paperclip board API keys are long opaque tokens — so the UUID
+ * test cleanly distinguishes the two. Used to enable a raw-plaintext path while plugin
+ * secret-refs are kill-switched upstream (PAP-2394); see {@link resolveSecretRef}.
+ */
+export function isSecretRefShaped(value: string): boolean {
+  return SECRET_REF_UUID.test(value.trim());
+}
+
 /**
  * Resolve a secret-ref to its value without ever leaking it.
  *
@@ -73,6 +88,16 @@ export async function resolveSecretRef(
 ): Promise<SecretResolveResult> {
   const trimmed = typeof ref === "string" ? ref.trim() : "";
   if (!trimmed) return { value: "", status: "unset" }; // no ref → intentionally unauthenticated, no log
+  // Raw-plaintext credential path. Plugin secret-refs are kill-switched upstream (PAP-2394):
+  // `resolve` (ctx.secrets.resolve) throws unconditionally on every current host build, so a
+  // value pasted directly into the field is the ONLY way to configure the bot/board
+  // credentials until company-scoped plugin config lands. A raw credential is only ever
+  // presented as the plugin's OWN identity to a fixed endpoint (the Entra token endpoint or
+  // the configured Paperclip API) — never to a caller-controlled destination like a Workflows
+  // URL — so it carries no SSRF/exfiltration risk and needs no separate opt-in flag. Detect it
+  // by shape: a non-UUID value is a raw secret, used as-is and (like a resolved secret) held in
+  // memory only and never logged; a UUID is a real secret-ref and goes through the provider.
+  if (!isSecretRefShaped(trimmed)) return { value: trimmed, status: "resolved" };
   try {
     const value = (await resolve(trimmed)) || "";
     return value ? { value, status: "resolved" } : { value: "", status: "unset" };

@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { resolveSecretRef, safeErrorClass } from "../src/secret-resolve.js";
+import { isSecretRefShaped, resolveSecretRef, safeErrorClass } from "../src/secret-resolve.js";
 
 const SECRET = "super-secret-client-secret-value-9f3a";
-const REF = "ref-uuid-1234";
+// A host secret-ref is an opaque UUID — that shape routes through the provider.
+const REF = "3f6acd0e-be3d-4e44-a643-c0817fb36c9f";
+// A raw pasted credential (e.g. an Entra client secret) is never UUID-shaped.
+const RAW_SECRET = "FqK8Q~aBcD1234efGh5678ijKlMnOpQrStUvWxYz";
 
 /** A logger spy that records every (message, fields) call for leak assertions. */
 function spyLog() {
@@ -23,7 +26,7 @@ describe("resolveSecretRef", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("resolves a non-empty secret; NEVER logs on success", async () => {
+  it("resolves a UUID secret-ref via the provider; NEVER logs on success", async () => {
     const resolve = vi.fn(async () => SECRET);
     const { log, dump } = spyLog();
     const r = await resolveSecretRef(resolve, REF, log, "err");
@@ -32,6 +35,26 @@ describe("resolveSecretRef", () => {
     // No log call at all on success → the value cannot have leaked to logs.
     expect(dump()).not.toContain(SECRET);
     expect(dump()).toBe("[]");
+  });
+
+  it("RAW path (PAP-2394): a non-UUID value is used as-is, NEVER calls the provider, NEVER logs", async () => {
+    const resolve = vi.fn<(ref: string) => Promise<string>>();
+    const { log, calls, dump } = spyLog();
+    const r = await resolveSecretRef(resolve, RAW_SECRET, log, "err");
+    expect(r).toEqual({ value: RAW_SECRET, status: "resolved" });
+    // The provider is kill-switched upstream; the raw path must not touch it.
+    expect(resolve).not.toHaveBeenCalled();
+    // The raw secret is held in memory only — it must never reach the logs.
+    expect(calls).toHaveLength(0);
+    expect(dump()).not.toContain(RAW_SECRET);
+  });
+
+  it("RAW path trims surrounding whitespace from a pasted value", async () => {
+    const resolve = vi.fn<(ref: string) => Promise<string>>();
+    const { log } = spyLog();
+    const r = await resolveSecretRef(resolve, `  ${RAW_SECRET}\n`, log, "err");
+    expect(r).toEqual({ value: RAW_SECRET, status: "resolved" });
+    expect(resolve).not.toHaveBeenCalled();
   });
 
   it("empty resolved value → status unset (no usable secret)", async () => {
@@ -91,5 +114,18 @@ describe("safeErrorClass", () => {
     expect(safeErrorClass("a raw string")).toBe("unknown");
     expect(safeErrorClass(null)).toBe("unknown");
     expect(safeErrorClass(undefined)).toBe("unknown");
+  });
+});
+
+describe("isSecretRefShaped", () => {
+  it("true only for a UUID-shaped secret-ref", () => {
+    expect(isSecretRefShaped("3f6acd0e-be3d-4e44-a643-c0817fb36c9f")).toBe(true);
+    expect(isSecretRefShaped("  3F6ACD0E-BE3D-4E44-A643-C0817FB36C9F  ")).toBe(true); // trims + case-insensitive
+  });
+  it("false for raw credential material and non-UUID strings", () => {
+    expect(isSecretRefShaped(RAW_SECRET)).toBe(false); // Entra client secret (has ~, 40 chars)
+    expect(isSecretRefShaped("")).toBe(false);
+    expect(isSecretRefShaped("ref-uuid-1234")).toBe(false); // not a real UUID
+    expect(isSecretRefShaped("3f6acd0e-be3d-4e44-a643-c0817fb36c9")).toBe(false); // one hex short
   });
 });

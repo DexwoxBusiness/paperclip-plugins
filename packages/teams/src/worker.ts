@@ -1,4 +1,4 @@
-import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
+import { definePlugin, runWorker, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { DEFAULT_CONFIG, JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.js";
 import { createConversationStore } from "./bot-conversations.js";
 import { createTeamsBot, type TeamsBot } from "./bot.js";
@@ -79,7 +79,7 @@ function normalizeTurns(raw: unknown): ConversationTurn[] | undefined {
 /** Plugin-state key: the date (server-local) the digest last posted, for once-a-day throttling. */
 const DIGEST_LAST_RUN_DATE_KEY = "digest:last-run-date";
 
-export default definePlugin({
+const teamsPlugin = definePlugin({
   async setup(ctx: PluginContext) {
     context = ctx;
     ctx.logger.info(`${PLUGIN_ID} starting`);
@@ -1121,3 +1121,10 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
   }
   return botPromise;
 }
+
+export default teamsPlugin;
+// Boot the SDK worker RPC host: the Paperclip host launches the worker with
+// `node dist/worker.js`, so the entrypoint must start the IPC host and keep the
+// process alive to answer the `initialize` handshake. Without this the worker
+// exits (code 0) before initialize and activation fails.
+runWorker(teamsPlugin, import.meta.url);

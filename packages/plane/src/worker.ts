@@ -1,4 +1,4 @@
-import { definePlugin, type PluginContext, type PluginEvent, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
+import { definePlugin, runWorker, type PluginContext, type PluginEvent, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { DEFAULT_CONFIG, ISSUE_ORIGIN_KIND, JOB_KEYS, PLUGIN_ID, TOOL_NAMES, WEBHOOK_KEYS } from "./constants.js";
 import pluginManifest from "./manifest.js";
 import { createAgentTools, registerPlaneTools, type ToolRegistrar } from "./agent-tools.js";
@@ -126,7 +126,7 @@ function adaptCommentEvent(ev: PluginEvent): OutboundEvent {
   };
 }
 
-export default definePlugin({
+const planePlugin = definePlugin({
   async setup(ctx: PluginContext) {
     context = ctx;
     ctx.logger.info(`${PLUGIN_ID} starting`);
@@ -416,3 +416,10 @@ export default definePlugin({
     await handler.handle({ headers: input.headers, rawBody: input.rawBody, requestId: input.requestId });
   },
 });
+
+export default planePlugin;
+// Boot the SDK worker RPC host: the Paperclip host launches the worker with
+// `node dist/worker.js`, so the entrypoint must start the IPC host and keep the
+// process alive to answer the `initialize` handshake. Without this the worker
+// exits (code 0) before initialize and activation fails.
+runWorker(planePlugin, import.meta.url);

@@ -135,12 +135,15 @@ const manifest: PaperclipPluginManifestV1 = {
       planeApiKeyRef: {
         type: "string",
         // AC #1: `format: "secret-ref"` renders the SecretBindingPicker in the
-        // settings UI and stores only a reference — raw API tokens are never
-        // accepted in config. Resolved to the real key at call time (PCLIP-7).
+        // settings UI. Preferred path is a secret reference resolved at call time
+        // (PCLIP-7). While upstream plugin secret-refs are kill-switched (PAP-2394),
+        // a RAW key pasted via "Or paste a raw value" is also accepted and used
+        // directly (see secret-resolve.ts) — a non-UUID value is treated as the raw
+        // key, a UUID as a secret-ref.
         format: "secret-ref",
         title: "Plane API Key (secret reference)",
         description:
-          "Secret reference for the Plane service-account API key (X-API-Key). Never a raw token — the UI uses a secret picker. Requires Paperclip pinned to canary/v2026.509.0-canary.1 while upstream plugin secret-refs are kill-switched (PAP-2394). PCLIP-7",
+          "Plane service-account API key (X-API-Key). Prefer the secret picker; while plugin secret-refs are disabled upstream (PAP-2394), paste the raw key via 'Or paste a raw value' and it will be used directly. PCLIP-7",
         default: DEFAULT_CONFIG.planeApiKeyRef,
       },
       planeBaseUrl: {

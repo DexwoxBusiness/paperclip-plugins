@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "dexwox.plane-sync";
-export const PLUGIN_VERSION = "0.1.0";
+export const PLUGIN_VERSION = "0.4.0";
 
 export const WEBHOOK_KEYS = {
   /** Plane CE webhook deliveries (Issue, Issue Comment). PCLIP-1 */

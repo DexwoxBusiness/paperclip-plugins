@@ -20,6 +20,7 @@ import {
   type PlaneWebhookHandler,
 } from "./webhook-handler.js";
 import { createIdMappingStore, type IdMappingStore } from "./id-mapping.js";
+import { resolveApiKey } from "./secret-resolve.js";
 import {
   createSyncRulesHandler,
   normalizeSyncRules,
@@ -158,7 +159,8 @@ const planePlugin = definePlugin({
         workspaceSlug: authCfg.planeWorkspaceSlug,
         getApiKey: async () => {
           const c = (await ctx.config.get()) as { planeApiKeyRef?: string };
-          return c.planeApiKeyRef ? ctx.secrets.resolve(c.planeApiKeyRef) : "";
+          // Tolerate a raw pasted key OR a secret-ref (PAP-2394 workaround, see secret-resolve.ts).
+          return resolveApiKey((r) => ctx.secrets.resolve(r), c.planeApiKeyRef);
         },
         fetchFn: ((url, init) => fetch(url, init)) as FetchLike,
         timeoutMs: 5000,
@@ -386,7 +388,7 @@ const planePlugin = definePlugin({
       const probe = createPlaneRestClient({
         baseUrl: auth.planeBaseUrl,
         workspaceSlug: auth.planeWorkspaceSlug,
-        getApiKey: () => ctx.secrets.resolve(auth.planeApiKeyRef!),
+        getApiKey: () => resolveApiKey((r) => ctx.secrets.resolve(r), auth.planeApiKeyRef),
         fetchFn: ((url, init) => fetch(url, init)) as FetchLike,
         timeoutMs: 5000,
       });

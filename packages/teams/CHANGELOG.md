@@ -1,5 +1,11 @@
 # @dexwox-labs/paperclip-plugin-teams
 
+## 0.4.0
+
+### Minor Changes
+
+- [#26](https://github.com/DexwoxBusiness/paperclip-plugins/pull/26) [`35a1dba`](https://github.com/DexwoxBusiness/paperclip-plugins/commit/35a1dbaea107fdb509213db7c137d7f6e8f76599) Thanks [@DexwoxBusiness](https://github.com/DexwoxBusiness)! - Fix for worker intiation failure
+
 ## 0.3.0
 
 ### Minor Changes

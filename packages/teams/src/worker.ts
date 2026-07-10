@@ -17,6 +17,8 @@ import {
 import { createEscalationStore, type EscalationStoreBackend } from "./escalation-store.js";
 import { buildAskCancelledCard, formatAskResponse, type AskField, type AskRequest } from "./ask.js";
 import { createAskStore, type AskStoreBackend } from "./ask-store.js";
+import { createChannelStore, type ChannelStoreBackend } from "./channel-store.js";
+import { buildAnnouncementCard, buildChannelClosedCard, buildChannelPromptCard, normalizeMembers, type ChannelPost, type ChannelResponse } from "./channel.js";
 import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
 import { createApprovalStore } from "./approval-store.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
@@ -622,6 +624,8 @@ const teamsPlugin = definePlugin({
 
     // ---- Generic ask surface (PCLIP-43 / T12) ----
     const askStore = createAskStore(state as AskStoreBackend);
+    // ---- Generic channel-post surface (T13) ----
+    const channelStore = createChannelStore(state as ChannelStoreBackend);
 
     // Map an agent-supplied fields array into typed AskFields, dropping id-less entries. Kept
     // permissive (the pure buildAskCard also caps/filters) so a malformed field never throws.
@@ -787,6 +791,177 @@ const teamsPlugin = definePlugin({
         }
         await ctx.metrics.write("teams.asks.cancelled", 1).catch(() => undefined);
         return { content: JSON.stringify({ cancelled: true }) };
+      },
+    );
+
+    // Agent tool: post a message OR an interactive prompt-card to a Teams CHANNEL. Generic
+    // (no scrum vocabulary). collect=true renders inputs + a Send button and gathers replies
+    // (read them with get_channel_responses); otherwise it's a plain announcement (e.g. a report
+    // the agent built). No-ops (never throws) when the channel isn't reachable.
+    ctx.tools.register(
+      "post_to_channel",
+      {
+        displayName: "Post to a channel",
+        description:
+          "Post a message to a Microsoft Teams channel. Set collect:true to render a form and gather each person's reply (read them later with get_channel_responses); otherwise post a plain announcement (e.g. a report you built). The plugin only carries the message and tracks who replied — you decide the audience, cadence, and how to consolidate.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            channelRef: { type: "string", description: "The channel's stored conversation key (the bot must have been added / @mentioned there once)." },
+            text: { type: "string", description: "The message / prompt text." },
+            collect: { type: "boolean", description: "When true, render input field(s) + a Send button and collect replies; when false/omitted, post a plain announcement." },
+            fields: {
+              type: "array",
+              description: "Optional structured inputs to collect when collect=true (each rendered as an editable field). Omit for a single free-text answer.",
+              items: {
+                type: "object",
+                properties: { id: { type: "string" }, label: { type: "string" }, multiline: { type: "boolean" }, placeholder: { type: "string" }, prefill: { type: "string" } },
+                required: ["id"],
+              },
+            },
+            heading: { type: "string", description: "Optional bold heading for a plain announcement (ignored when collect=true)." },
+            correlationId: { type: "string", description: "Your own key to group related posts/responses, e.g. standup:2026-07-10-am." },
+          },
+          required: ["channelRef", "text"],
+        },
+      },
+      async (params, runCtx) => {
+        const p = (params ?? {}) as Record<string, unknown>;
+        const channelRef = String(p.channelRef ?? "").trim();
+        const text = String(p.text ?? "").trim();
+        if (!channelRef) return { content: JSON.stringify({ posted: false, reason: "channelRef required" }) };
+        if (!text) return { content: JSON.stringify({ posted: false, reason: "text required" }) };
+        const agentId = typeof runCtx.agentId === "string" ? runCtx.agentId : "";
+        const companyId = typeof runCtx.companyId === "string" ? runCtx.companyId : "";
+        if (!agentId || !companyId) return { content: JSON.stringify({ posted: false, reason: "missing agent context" }) };
+        const collect = p.collect === true;
+        const post: ChannelPost = {
+          id: `chpost-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+          channelRef,
+          agentId,
+          companyId,
+          prompt: text,
+          fields: collect ? normalizeAskFields(p.fields) : undefined,
+          collect,
+          correlationId: p.correlationId != null ? String(p.correlationId) : undefined,
+          status: "open",
+          createdAtMs: Date.now(),
+          responses: {},
+        };
+        let bot: TeamsBot;
+        try {
+          bot = await getBot(ctx);
+        } catch (e) {
+          log("teams post_to_channel: bot not configured", { error: e instanceof Error ? e.message : String(e) });
+          return { content: JSON.stringify({ posted: false, reason: "bot not configured", postId: post.id }) };
+        }
+        const card = collect ? buildChannelPromptCard(post) : buildAnnouncementCard(text, { heading: typeof p.heading === "string" ? p.heading : undefined });
+        // Post the card FIRST; only persist a collecting post once it actually landed (post-before-create,
+        // like ask/escalation). An announcement has nothing to collect, so it is never persisted.
+        const ref = await bot.postChannelCard(channelRef, card);
+        if (!ref) {
+          log("teams post_to_channel: channel not reachable", { postId: post.id, channelRef });
+          return { content: JSON.stringify({ posted: false, reason: "channel not reachable / bot not added there", postId: post.id }) };
+        }
+        if (collect) {
+          await channelStore.create(post, ref); // record + card ref in one write (no orphan window)
+          await ctx.metrics.write("teams.channel.posts_created", 1).catch(() => undefined);
+        }
+        await ctx.activity
+          .log({ companyId, message: `Posted to a Teams channel${collect ? " (collecting replies)" : ""}`, entityType: "plugin", entityId: post.id })
+          .catch(() => undefined);
+        return { content: JSON.stringify({ posted: true, postId: post.id, collecting: collect }) };
+      },
+    );
+
+    // Agent tool: read back who has responded to a collecting channel post (from post_to_channel),
+    // so the AGENT can consolidate. Optionally close the post so it stops accepting replies. Scoped
+    // to the caller's own posts (never exposes another agent/company's responses).
+    ctx.tools.register(
+      "get_channel_responses",
+      {
+        displayName: "Get channel responses",
+        description:
+          "Read back who has responded to a collecting channel post (from post_to_channel) and what they said, so you can consolidate. Returns each responder's id, display name, and answers. Set close:true to stop collecting and update the card.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            postId: { type: "string", description: "The postId returned by post_to_channel" },
+            close: { type: "boolean", description: "When true, close the post (stops collecting; updates the card to a closed state)." },
+          },
+          required: ["postId"],
+        },
+      },
+      async (params, runCtx) => {
+        const p = (params ?? {}) as Record<string, unknown>;
+        const postId = String(p.postId ?? "").trim();
+        if (!postId) return { content: JSON.stringify({ found: false, reason: "postId required" }) };
+        const agentId = typeof runCtx.agentId === "string" ? runCtx.agentId : "";
+        const companyId = typeof runCtx.companyId === "string" ? runCtx.companyId : "";
+        if (!agentId || !companyId) return { content: JSON.stringify({ found: false, reason: "missing agent context" }) };
+        const entry = await channelStore.get(postId);
+        // Ownership scope: never expose another agent/company's responses.
+        if (!entry || entry.post.agentId !== agentId || entry.post.companyId !== companyId) {
+          return { content: JSON.stringify({ found: false, reason: "unknown post" }) };
+        }
+        // `snapshot` is the post we read responses from. When we close, we swap in the post-close
+        // snapshot below (a submit may land between this read and the close).
+        let snapshot = entry.post;
+        let closed = entry.post.status === "closed";
+        if (p.close === true && !closed) {
+          const done = await channelStore.close(postId, Date.now(), { agentId, companyId });
+          if (done) {
+            closed = true;
+            // close() serializes AFTER any in-flight recordResponse (same per-id lock), so
+            // done.post.responses is the authoritative post-close snapshot — return THAT, not the
+            // pre-close read, or a reply accepted just before closure would be dropped (Codex P2).
+            snapshot = done.post;
+            if (done.conversationReference && done.activityId) {
+              try {
+                const bot = await getBot(ctx);
+                await bot.updateChannelCard({ conversationReference: done.conversationReference, activityId: done.activityId }, buildChannelClosedCard(done.post));
+              } catch (e) {
+                log("teams get_channel_responses: close card update failed", { postId, error: e instanceof Error ? e.message : String(e) });
+              }
+            }
+          }
+        }
+        const responses = Object.values(snapshot.responses).map((r) => ({ by: r.by, byName: r.byName, values: r.values, atMs: r.atMs }));
+        return { content: JSON.stringify({ found: true, postId, collecting: !closed, correlationId: snapshot.correlationId, responseCount: responses.length, responses }) };
+      },
+    );
+
+    // Agent tool: list a channel's members (name + email + id), so the agent can decide who to expect
+    // a reply from or join people to other systems by email. Emails are lowercased. Returns [] when
+    // the bot can't read the channel (not added there / connector error).
+    ctx.tools.register(
+      "list_channel_members",
+      {
+        displayName: "List channel members",
+        description:
+          "List the members of a Microsoft Teams channel (display name, email, and id), so you can decide who to expect a reply from or join people to other systems by email. Emails are lowercased for case-insensitive matching. Returns an empty list if the bot can't read the channel.",
+        parametersSchema: {
+          type: "object",
+          properties: { channelRef: { type: "string", description: "The channel's stored conversation key (the bot must have been added / @mentioned there once)." } },
+          required: ["channelRef"],
+        },
+      },
+      async (params, runCtx) => {
+        const p = (params ?? {}) as Record<string, unknown>;
+        const channelRef = String(p.channelRef ?? "").trim();
+        if (!channelRef) return { content: JSON.stringify({ members: [], reason: "channelRef required" }) };
+        const agentId = typeof runCtx.agentId === "string" ? runCtx.agentId : "";
+        const companyId = typeof runCtx.companyId === "string" ? runCtx.companyId : "";
+        if (!agentId || !companyId) return { content: JSON.stringify({ members: [] }) };
+        let bot: TeamsBot;
+        try {
+          bot = await getBot(ctx);
+        } catch (e) {
+          log("teams list_channel_members: bot not configured", { error: e instanceof Error ? e.message : String(e) });
+          return { content: JSON.stringify({ members: [], reason: "bot not configured" }) };
+        }
+        const members = normalizeMembers(await bot.listChannelMembers(channelRef));
+        return { content: JSON.stringify({ members }) };
       },
     );
   },
@@ -1068,6 +1243,17 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
       // PCLIP-43 (T12): generic ask answer routing. Same instance-state backend as the setup()
       // ask store, so the tool and the bot see the same ledger.
       const askStore = createAskStore(stateBackend as AskStoreBackend);
+      // T13: channel-post response recording. Same instance-state backend as the setup() channel
+      // store, so the tools and the bot see the same ledger.
+      const channelStore = createChannelStore(stateBackend as ChannelStoreBackend);
+      const channels = {
+        onSubmit: async (postId: string, response: ChannelResponse): Promise<void> => {
+          // Record ONE responder's submit (last-write-wins per person). No card update — the post
+          // stays OPEN for others; the agent reads responses and posts the consolidated report.
+          const updated = await channelStore.recordResponse(postId, response);
+          if (updated) await ctx.metrics.write("teams.channel.responses", 1).catch(() => undefined);
+        },
+      };
       const asks = {
         onSubmit: async (
           requestId: string,
@@ -1107,6 +1293,7 @@ function getBot(ctx: PluginContext): Promise<TeamsBot> {
         commands,
         escalations,
         asks,
+        channels,
         onCommand: (command) => {
           // Best-effort metric (parity with Slack's slack.commands.handled); never blocks.
           void ctx.metrics.write("teams.commands.handled", 1, { command }).catch(() => undefined);

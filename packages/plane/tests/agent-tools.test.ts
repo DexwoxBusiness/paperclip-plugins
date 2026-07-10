@@ -18,12 +18,29 @@ function fakeClient(overrides: Partial<PlaneClientPort> = {}): PlaneClientPort {
       state: "Todo",
       priority: "high",
       labels: ["agent"],
+      assignees: [{ id: "usr-1", name: "Alice A", email: "alice@x.com" }],
       comments: [{ id: "c1", bodyHtml: "<p>looks good</p>", author: "alice" }],
       url: "https://plane.example.com/w/PCLIP-12",
     }),
     searchWorkItems: async () => ({
       items: [{ id: "u1", identifier: "PCLIP-1", name: "A", state: "Todo", url: "https://plane.example.com/w/PCLIP-1" }],
       nextCursor: "next-page",
+    }),
+    listMembers: async () => [
+      { id: "usr-1", name: "Alice A", email: "alice@x.com", role: 20 },
+      { id: "usr-2", name: "Bob B", email: "bob@x.com", role: 15 },
+    ],
+    listWorkItems: async () => ({
+      items: [
+        {
+          id: "u1",
+          identifier: "PCLIP-1",
+          name: "A",
+          state: "In Progress",
+          url: "https://plane.example.com/w/PCLIP-1",
+          assignees: [{ id: "usr-1", name: "Alice A", email: "alice@x.com" }],
+        },
+      ],
     }),
     createWorkItem: async () => ({ id: "u2", identifier: "PCLIP-99", url: "https://plane.example.com/w/PCLIP-99" }),
     addComment: async () => ({ id: "cm1", url: "https://plane.example.com/w/PCLIP-12#cm1" }),
@@ -54,6 +71,7 @@ describe("plane_get_work_item (AC #1)", () => {
     expect(res.error).toBeUndefined();
     expect(res.content).toContain("PCLIP-12: Do the thing");
     expect(res.content).toContain("State: Todo");
+    expect(res.content).toContain("Assignees: Alice A");
     expect(res.content).toContain("Labels: agent");
     expect(res.content).toContain("https://plane.example.com/w/PCLIP-12");
     expect(res.content).toContain("Acceptance: x"); // HTML stripped, ACs preserved
@@ -78,6 +96,7 @@ describe("plane_get_work_item (AC #1)", () => {
           descriptionHtml: "&lt;script&gt;alert(&quot;hi&quot;)&lt;/script&gt; &amp; &amp;lt; &#39;q&#39; &#x2764;",
           state: "Todo",
           labels: [],
+          assignees: [],
           comments: [],
           url: "https://plane.example.com/w/PCLIP-7",
         }),
@@ -111,6 +130,42 @@ describe("plane_search_work_items (AC #2)", () => {
     const res = await t.searchWorkItems({ query: "nothing" });
     expect(res.error).toBeUndefined();
     expect(res.content).toContain("0 result(s)");
+  });
+});
+
+describe("plane_list_members (identity join)", () => {
+  it("lists members with name, email, and role; returns them in data", async () => {
+    const t = build(fakeClient());
+    const res = await t.listMembers({});
+    expect(res.error).toBeUndefined();
+    expect(res.content).toContain("2 member(s)");
+    expect(res.content).toContain("Alice A <alice@x.com>");
+    expect(res.content).toContain("role 15");
+    expect(res.data).toMatchObject({ members: [{ id: "usr-1", email: "alice@x.com", role: 20 }, { id: "usr-2", role: 15 }] });
+  });
+
+  it("passes an optional projectId through to the client", async () => {
+    let seen: string | undefined = "unset";
+    const t = build(fakeClient({ listMembers: async (projectId) => { seen = projectId; return []; } }));
+    await t.listMembers({ projectId: "proj-1" });
+    expect(seen).toBe("proj-1");
+  });
+});
+
+describe("plane_list_work_items (work-aware)", () => {
+  it("lists items with their assignees and requires projectId", async () => {
+    const t = build(fakeClient());
+    const res = await t.listWorkItems({ projectId: "proj-1" });
+    expect(res.content).toContain("PCLIP-1 [In Progress] A — Alice A");
+    const missing = await t.listWorkItems({});
+    expect(missing.error).toMatch(/'projectId' is required/);
+  });
+
+  it("passes assigneeId + cursor through to the client", async () => {
+    let seen: { projectId: string; assigneeId?: string; cursor?: string } | undefined;
+    const t = build(fakeClient({ listWorkItems: async (input) => { seen = input; return { items: [] }; } }));
+    await t.listWorkItems({ projectId: "proj-1", assigneeId: "usr-1", cursor: "c1" });
+    expect(seen).toEqual({ projectId: "proj-1", assigneeId: "usr-1", cursor: "c1" });
   });
 });
 

@@ -252,6 +252,85 @@ describe("createPlaneRestClient — work-items mappings & URLs", () => {
   });
 });
 
+describe("createPlaneRestClient — members & assignees", () => {
+  it("lists workspace members from the bare array; lowercases email; display_name→first+last fallback", async () => {
+    const h = makeClient((_m, url) =>
+      /\/members$/.test(url.split("?")[0])
+        ? {
+            status: 200,
+            body: [
+              { id: "m1", first_name: "Diwakar", last_name: "M", display_name: "DMA", email: "Diwakar.MA@Dexwox.com", role: 20 },
+              { id: "m2", first_name: "Ferin", last_name: "C", email: "ferin.c@dexwox.com", role: 15 },
+            ],
+          }
+        : { status: 404, body: {} },
+    );
+    const members = await h.client.listMembers();
+    expect(h.calls[0].url).toContain("/workspaces/acme/members");
+    expect(members).toEqual([
+      { id: "m1", name: "DMA", email: "diwakar.ma@dexwox.com", role: 20 },
+      { id: "m2", name: "Ferin C", email: "ferin.c@dexwox.com", role: 15 },
+    ]);
+  });
+
+  it("lists project members from the project path, resolving a nested `member` + top-level role", async () => {
+    const h = makeClient((_m, url) =>
+      /\/projects\/p1\/members$/.test(url.split("?")[0])
+        ? { status: 200, body: [{ member: { id: "m3", display_name: "Karthik", email: "K@X.com" }, role: 15 }] }
+        : { status: 404, body: {} },
+    );
+    const members = await h.client.listMembers("p1");
+    expect(h.calls[0].url).toContain("/projects/p1/members");
+    expect(members).toEqual([{ id: "m3", name: "Karthik", email: "k@x.com", role: 15 }]);
+  });
+
+  it("expands assignees on get_work_item and maps expanded objects + bare-uuid entries", async () => {
+    const h = makeClient((_m, url) =>
+      /\/work-items\/PCLIP-12/.test(url.split("?")[0])
+        ? {
+            status: 200,
+            body: {
+              id: "i12", name: "T", sequence_id: 12, project__identifier: "PCLIP", state: "Todo", labels: [], comments: [],
+              assignees: [{ id: "usr-1", display_name: "Alice", email: "Alice@X.com" }, "usr-2"],
+            },
+          }
+        : { status: 404, body: {} },
+    );
+    const wi = await h.client.getWorkItem("PCLIP-12");
+    expect(decodeURIComponent(h.calls[0].url)).toContain("expand=labels,state,comments,assignees");
+    expect(wi.assignees).toEqual([
+      { id: "usr-1", name: "Alice", email: "alice@x.com" },
+      { id: "usr-2", name: "", email: "" },
+    ]);
+  });
+
+  it("lists project work items with assignees expanded and filters by assigneeId client-side", async () => {
+    const h = makeClient((_m, url) => {
+      const path = url.split("?")[0];
+      if (/\/projects\/p1$/.test(path)) return { status: 200, body: { identifier: "PCLIP" } };
+      if (/\/projects\/p1\/work-items$/.test(path)) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              { id: "i1", sequence_id: 1, name: "A", state: { name: "In Progress" }, assignees: [{ id: "usr-1", display_name: "Alice", email: "a@x.com" }] },
+              { id: "i2", sequence_id: 2, name: "B", state: { name: "Todo" }, assignees: [{ id: "usr-2", display_name: "Bob", email: "b@x.com" }] },
+            ],
+            next_page_results: false,
+          },
+        };
+      }
+      return { status: 404, body: {} };
+    });
+    const all = await h.client.listWorkItems({ projectId: "p1" });
+    expect(all.items.map((i) => i.identifier)).toEqual(["PCLIP-1", "PCLIP-2"]);
+    expect(all.items[0]).toMatchObject({ state: "In Progress", url: "https://plane.example.com/acme/browse/PCLIP-1/" });
+    expect(all.items[0].assignees).toEqual([{ id: "usr-1", name: "Alice", email: "a@x.com" }]);
+    const mine = await h.client.listWorkItems({ projectId: "p1", assigneeId: "usr-2" });
+    expect(mine.items.map((i) => i.id)).toEqual(["i2"]);
+  });
+});
+
 describe("createPlaneRestClient — testConnection (AC #3)", () => {
   it("returns ok on a successful authenticated read", async () => {
     const h = makeClient(() => ({ status: 200, body: { results: [] } }));

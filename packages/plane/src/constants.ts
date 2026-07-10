@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "dexwox.plane-sync";
-export const PLUGIN_VERSION = "0.4.0";
+export const PLUGIN_VERSION = "0.5.0";
 
 export const WEBHOOK_KEYS = {
   /** Plane CE webhook deliveries (Issue, Issue Comment). PCLIP-1 */
@@ -19,6 +19,8 @@ export const TOOL_NAMES = {
   createWorkItem: "plane_create_work_item",
   addComment: "plane_add_comment",
   updateState: "plane_update_state",
+  listMembers: "plane_list_members",
+  listWorkItems: "plane_list_work_items",
 } as const;
 
 export const DEFAULT_CONFIG = {

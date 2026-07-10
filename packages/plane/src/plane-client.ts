@@ -70,6 +70,26 @@ export interface PlaneComment {
   createdAt?: string;
 }
 
+/** A Plane workspace/project member — the identity join to Teams (and others) by email. */
+export interface PlaneMember {
+  /** Plane user UUID. */
+  id: string;
+  /** Display name: display_name, else first+last, else email/id. */
+  name: string;
+  /** Email, lowercased for case-insensitive joins ("" when Plane doesn't expose it). */
+  email: string;
+  /** Plane role: 20=Admin, 15=Member, 10=Viewer, 5=Guest. */
+  role: number;
+}
+
+/** A work item assignee (a Plane user; email present only when the field was expanded). */
+export interface PlaneAssignee {
+  id: string;
+  name: string;
+  /** Lowercased; "" when the assignee is an id only (not expanded). */
+  email: string;
+}
+
 /** A fully-hydrated Plane work item (AC #1: one response with everything). */
 export interface PlaneWorkItem {
   /** Work item UUID. */
@@ -81,6 +101,8 @@ export interface PlaneWorkItem {
   state: string;
   priority?: string;
   labels: string[];
+  /** Assignees (expanded when available; id-only otherwise). */
+  assignees: PlaneAssignee[];
   comments: PlaneComment[];
   /** Absolute Plane URL to the work item. */
   url: string;
@@ -93,6 +115,8 @@ export interface PlaneWorkItemSummary {
   name: string;
   state: string;
   url: string;
+  /** Assignees, populated by list_work_items (the semantic search endpoint does not expand them). */
+  assignees?: PlaneAssignee[];
 }
 
 export interface PlaneSearchResult {
@@ -136,6 +160,10 @@ export interface PlaneStateResult {
 export interface PlaneClientPort {
   getWorkItem(idOrIdentifier: string): Promise<PlaneWorkItem>;
   searchWorkItems(query: { text?: string; label?: string; state?: string; cursor?: string }): Promise<PlaneSearchResult>;
+  /** Workspace members, or a project's members when `projectId` is given — the identity join. */
+  listMembers(projectId?: string): Promise<PlaneMember[]>;
+  /** List a project's work items (assignees expanded), optionally filtered to one assignee UUID. */
+  listWorkItems(input: { projectId: string; assigneeId?: string; cursor?: string }): Promise<PlaneSearchResult>;
 
   /**
    * Mutation contract (AC #3 — "visible within 5 seconds"). Plane's REST API is
@@ -211,6 +239,8 @@ export function createUnconfiguredPlaneClient(): PlaneClientPort {
   return {
     getWorkItem: async () => fail(),
     searchWorkItems: async () => fail(),
+    listMembers: async () => fail(),
+    listWorkItems: async () => fail(),
     createWorkItem: async () => fail(),
     addComment: async () => fail(),
     updateState: async () => fail(),

@@ -128,6 +128,33 @@ const manifest: PaperclipPluginManifestV1 = {
         required: ["id", "state"],
       },
     },
+    {
+      name: TOOL_NAMES.listMembers,
+      displayName: "List Plane members",
+      description:
+        "List workspace members (or a project's members when projectId is given): id, display name, email, and role. Emails are lowercased. Use this to join Plane users to Teams (or other systems) by email, or to see who is on a project.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          projectId: { type: "string", description: "Optional Plane project UUID — returns that project's members instead of the whole workspace." },
+        },
+      },
+    },
+    {
+      name: TOOL_NAMES.listWorkItems,
+      displayName: "List Plane work items",
+      description:
+        "List a project's work items with their assignees, optionally filtered to one assignee (by Plane user UUID). Returns readable identifiers, state, assignees, and Plane URLs, paginated. Use this to see what a person is working on.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          projectId: { type: "string", description: "Plane project UUID to list work items from" },
+          assigneeId: { type: "string", description: "Optional Plane user UUID — only items assigned to this person" },
+          cursor: { type: "string", description: "Pagination cursor from a previous call" },
+        },
+        required: ["projectId"],
+      },
+    },
   ],
   instanceConfigSchema: {
     type: "object",

@@ -40,6 +40,8 @@ import {
   type AuthConfiguration,
   type Request as AgentsRequest,
 } from "@microsoft/agents-hosting";
+// eslint-disable-next-line import/no-unresolved -- installed at deploy time; not built in this repo (like agents-hosting above)
+import { TeamsInfo } from "@microsoft/agents-hosting-extensions-teams";
 // Derive Activity from the SDK's own method signature so we don't need a direct
 // @microsoft/agents-activity dependency (it's only a transitive dep of agents-hosting).
 type Activity = Parameters<TurnContext["updateActivity"]>[0];
@@ -70,6 +72,7 @@ import {
   type EscalationRecord,
 } from "./escalation.js";
 import { buildAskAnsweredCard, buildAskCard, parseAskSubmit, type AskRequest } from "./ask.js";
+import { parseChannelSubmit, type ChannelResponse } from "./channel.js";
 import { type AdaptiveCard } from "./adaptive-card.js";
 
 export interface TeamsBotDeps {
@@ -111,6 +114,14 @@ export interface TeamsBotDeps {
       actor: { actor: string; actorName?: string },
     ): Promise<{ request: AskRequest; activityId?: string } | null>;
   };
+  /**
+   * Generic channel-post surface (T13). `onSubmit` records ONE responder's submit against a
+   * collecting channel post (the plugin only tracks who answered; the agent consolidates). Omit to
+   * disable channel-submit handling.
+   */
+  channels?: {
+    onSubmit(postId: string, response: ChannelResponse): Promise<void>;
+  };
   log: (message: string, fields?: Record<string, unknown>) => void;
 }
 
@@ -137,6 +148,12 @@ export interface TeamsBot {
   postAskCard(personRef: string, request: AskRequest): Promise<{ conversationReference: unknown; activityId: string } | null>;
   /** Proactively update a stored ask card to its answered/cancelled state (PCLIP-43). */
   updateAskCard(ref: { conversationReference: unknown; activityId: string }, card: AdaptiveCard): Promise<void>;
+  /** Read a channel's roster (paged) via the Teams connector. Returns raw members ([] if unreachable). (T13) */
+  listChannelMembers(channelRef: string): Promise<unknown[]>;
+  /** Post a card to a channel; returns its ref (conversation ref + activity id), or null if unreachable. (T13) */
+  postChannelCard(channelRef: string, card: AdaptiveCard): Promise<{ conversationReference: unknown; activityId: string } | null>;
+  /** Proactively update a stored channel card (e.g. to its closed state). (T13) */
+  updateChannelCard(ref: { conversationReference: unknown; activityId: string }, card: AdaptiveCard): Promise<void>;
 }
 
 /** Build the inbound-auth policy config from deps. */
@@ -292,6 +309,15 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       await next();
       return;
     }
+    // T13: a channel-post card submit ("Send") arrives as a message activity with our data + the
+    // collected fields in `activity.value`. Record the responder silently — the card stays OPEN so
+    // others can still answer, and the agent posts the consolidated report. Route before commands.
+    const channelSubmit = parseChannelSubmit(context.activity.value);
+    if (channelSubmit && deps.channels) {
+      await handleChannelSubmit(context, channelSubmit.postId, channelSubmit.values);
+      await next();
+      return;
+    }
     // PCLIP-27 (T10): an @mention text command. parseCommand strips the <at>…</at> mention
     // span itself (this SDK's ActivityHandler has no removeRecipientMention), and unknown/
     // empty text renders help — so the user is never left in silence.
@@ -441,6 +467,22 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       // The answer already landed (recorded + agent route-back attempted); a failed card render
       // must NOT fail the turn — log and continue.
       deps.log("teams ask card update failed", { requestId, error: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  /**
+   * Handle a channel-post card "Send" (T13). Records ONE responder's submit; does NOT update the
+   * card (it stays OPEN so others can still answer). A record failure is logged, never thrown — a
+   * broken submit must not fail the whole turn.
+   */
+  const handleChannelSubmit = async (context: TurnContext, postId: string, values: Record<string, string>): Promise<void> => {
+    if (!deps.channels) return;
+    const by = teamsActor(context.activity.from?.aadObjectId);
+    const byName = sanitizeDisplayName(context.activity.from?.name);
+    try {
+      await deps.channels.onSubmit(postId, { by, byName, values, atMs: Date.now() });
+    } catch (e) {
+      deps.log("teams channel submit record failed", { postId, error: e instanceof Error ? e.message : String(e) });
     }
   };
 
@@ -611,6 +653,58 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     },
     // PCLIP-43: proactively edit a stored ask card to its answered/cancelled state.
     async updateAskCard(ref, card) {
+      await adapter.continueConversation(deps.botAppId, ref.conversationReference as never, async (ctx) => {
+        await ctx.updateActivity({ type: "message", id: ref.activityId, attachments: [CardFactory.adaptiveCard(card)] } as Activity);
+      });
+    },
+    // T13: read a channel roster via the Teams connector (TeamsInfo.getPagedMembers), paging the
+    // FULL list via the continuation token. Returns raw members for the caller to normalize; [] when
+    // the channel is unknown or the read fails (never throws — the tool no-ops cleanly).
+    async listChannelMembers(channelRef) {
+      const conv = await deps.conversations.get(channelRef);
+      if (!conv) {
+        deps.log("teams list-members skipped: unknown conversation", { channelRef });
+        return [];
+      }
+      const members: unknown[] = [];
+      try {
+        await adapter.continueConversation(deps.botAppId, conv.reference as never, async (ctx) => {
+          let token: string | undefined;
+          do {
+            const page = (await TeamsInfo.getPagedMembers(ctx, undefined, token)) as { members?: unknown[]; continuationToken?: string };
+            if (Array.isArray(page?.members)) members.push(...page.members);
+            token = page?.continuationToken || undefined;
+          } while (token);
+        });
+      } catch (e) {
+        deps.log("teams list-members failed", { channelRef, error: e instanceof Error ? e.message : String(e) });
+        return [];
+      }
+      return members;
+    },
+    // T13: post a card to a channel (proactive continueConversation) and return its ref so the worker
+    // can store it for a later close. null when the channel is unknown or the send fails.
+    async postChannelCard(channelRef, card) {
+      const conv = await deps.conversations.get(channelRef);
+      if (!conv) {
+        deps.log("teams channel post skipped: unknown conversation", { channelRef });
+        return null;
+      }
+      let activityId: string | undefined;
+      try {
+        await adapter.continueConversation(deps.botAppId, conv.reference as never, async (ctx) => {
+          const res = await ctx.sendActivity(cardActivity(card) as Activity);
+          activityId = res?.id;
+        });
+      } catch (e) {
+        deps.log("teams channel post failed", { channelRef, error: e instanceof Error ? e.message : String(e) });
+        return null;
+      }
+      if (!activityId) return null;
+      return { conversationReference: conv.reference, activityId };
+    },
+    // T13: proactively edit a stored channel card (e.g. to its closed state). Mirrors updateAskCard.
+    async updateChannelCard(ref, card) {
       await adapter.continueConversation(deps.botAppId, ref.conversationReference as never, async (ctx) => {
         await ctx.updateActivity({ type: "message", id: ref.activityId, attachments: [CardFactory.adaptiveCard(card)] } as Activity);
       });

@@ -1,5 +1,11 @@
 # @dexwox-labs/paperclip-plugin-plane
 
+## 0.5.0
+
+### Minor Changes
+
+- [#30](https://github.com/DexwoxBusiness/paperclip-plugins/pull/30) [`141fbb6`](https://github.com/DexwoxBusiness/paperclip-plugins/commit/141fbb6818a944bf18caa40f70064ef2cb61533b) Thanks [@DexwoxBusiness](https://github.com/DexwoxBusiness)! - changeset made to accept raw text values rather than secrets due paperclip's temporary turn off
+
 ## 0.3.0
 
 ### Minor Changes

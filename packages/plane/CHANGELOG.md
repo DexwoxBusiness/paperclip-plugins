@@ -1,5 +1,11 @@
 # @dexwox-labs/paperclip-plugin-plane
 
+## 0.5.1
+
+### Patch Changes
+
+- [#36](https://github.com/DexwoxBusiness/paperclip-plugins/pull/36) [`4e0cda0`](https://github.com/DexwoxBusiness/paperclip-plugins/commit/4e0cda0951b90b7d9170c50b419294854c3f481c) Thanks [@DexwoxBusiness](https://github.com/DexwoxBusiness)! - "Added capabality to get the assignee details from plane at all level:
+
 ## 0.5.0
 
 ### Minor Changes

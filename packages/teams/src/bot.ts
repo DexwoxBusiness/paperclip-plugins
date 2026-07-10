@@ -477,8 +477,13 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
    */
   const handleChannelSubmit = async (context: TurnContext, postId: string, values: Record<string, string>): Promise<void> => {
     if (!deps.channels) return;
-    const by = teamsActor(context.activity.from?.aadObjectId);
-    const byName = sanitizeDisplayName(context.activity.from?.name);
+    const from = context.activity.from;
+    // Prefer the Entra object id, but fall back to the channel-scoped Teams user id (`from.id`) when
+    // the tenant omits aadObjectId (guest / federated users). Without the fallback every such
+    // responder collapses to "teams:unknown", and because the ledger keys responses by `by`, each
+    // later submit overwrites the previous one — losing all but the last answer (Codex P1).
+    const by = teamsActor(from?.aadObjectId || from?.id);
+    const byName = sanitizeDisplayName(from?.name);
     try {
       await deps.channels.onSubmit(postId, { by, byName, values, atMs: Date.now() });
     } catch (e) {

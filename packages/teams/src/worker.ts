@@ -900,16 +900,22 @@ const teamsPlugin = definePlugin({
         const companyId = typeof runCtx.companyId === "string" ? runCtx.companyId : "";
         if (!agentId || !companyId) return { content: JSON.stringify({ found: false, reason: "missing agent context" }) };
         const entry = await channelStore.get(postId);
-        // Ownership scope (Codex P2 parity): never expose another agent/company's responses.
+        // Ownership scope: never expose another agent/company's responses.
         if (!entry || entry.post.agentId !== agentId || entry.post.companyId !== companyId) {
           return { content: JSON.stringify({ found: false, reason: "unknown post" }) };
         }
-        const responses = Object.values(entry.post.responses).map((r) => ({ by: r.by, byName: r.byName, values: r.values, atMs: r.atMs }));
+        // `snapshot` is the post we read responses from. When we close, we swap in the post-close
+        // snapshot below (a submit may land between this read and the close).
+        let snapshot = entry.post;
         let closed = entry.post.status === "closed";
         if (p.close === true && !closed) {
           const done = await channelStore.close(postId, Date.now(), { agentId, companyId });
           if (done) {
             closed = true;
+            // close() serializes AFTER any in-flight recordResponse (same per-id lock), so
+            // done.post.responses is the authoritative post-close snapshot — return THAT, not the
+            // pre-close read, or a reply accepted just before closure would be dropped (Codex P2).
+            snapshot = done.post;
             if (done.conversationReference && done.activityId) {
               try {
                 const bot = await getBot(ctx);
@@ -920,7 +926,8 @@ const teamsPlugin = definePlugin({
             }
           }
         }
-        return { content: JSON.stringify({ found: true, postId, collecting: !closed, correlationId: entry.post.correlationId, responseCount: responses.length, responses }) };
+        const responses = Object.values(snapshot.responses).map((r) => ({ by: r.by, byName: r.byName, values: r.values, atMs: r.atMs }));
+        return { content: JSON.stringify({ found: true, postId, collecting: !closed, correlationId: snapshot.correlationId, responseCount: responses.length, responses }) };
       },
     );
 

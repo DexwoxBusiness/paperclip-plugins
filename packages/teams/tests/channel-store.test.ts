@@ -78,6 +78,18 @@ describe("channel-store", () => {
     expect(await store.close("chpost-1", 300)).toBeNull(); // already closed
   });
 
+  it("close returns the post-close snapshot INCLUDING responses (what get_channel_responses reports — Codex P2)", async () => {
+    const store = createChannelStore(backend);
+    await store.create(post());
+    await store.recordResponse("chpost-1", resp("teams:a1", "morning"));
+    const done = await store.close("chpost-1", 200);
+    // The returned entry must carry the responses recorded up to close, so the tool can report the
+    // final set rather than a stale pre-close read.
+    expect(Object.keys(done!.post.responses)).toEqual(["teams:a1"]);
+    expect(done!.post.responses["teams:a1"].values.answer).toBe("morning");
+    expect(done!.post.status).toBe("closed");
+  });
+
   it("close enforces ownership: a non-owner can't close another agent/company's post", async () => {
     const store = createChannelStore(backend);
     await store.create(post({ agentId: "owner", companyId: "co-1" }));

@@ -102,12 +102,14 @@ function stripHtml(html: string): string {
 
 function formatWorkItem(wi: PlaneWorkItem): string {
   const labels = wi.labels.length ? wi.labels.join(", ") : "(none)";
+  const assignees = wi.assignees.length ? wi.assignees.map((a) => a.name || a.email || a.id).join(", ") : "(unassigned)";
   const comments = wi.comments.length
     ? wi.comments.map((c) => `- ${c.author ?? "unknown"}: ${stripHtml(c.bodyHtml)}`).join("\n")
     : "(no comments)";
   return [
     `${wi.identifier}: ${wi.name}`,
     `State: ${wi.state}${wi.priority ? ` | Priority: ${wi.priority}` : ""}`,
+    `Assignees: ${assignees}`,
     `Labels: ${labels}`,
     `URL: ${wi.url}`,
     "",
@@ -172,6 +174,8 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
 export interface PlaneAgentTools {
   getWorkItem(params: unknown): Promise<ToolResultShape>;
   searchWorkItems(params: unknown): Promise<ToolResultShape>;
+  listMembers(params: unknown): Promise<ToolResultShape>;
+  listWorkItems(params: unknown): Promise<ToolResultShape>;
   createWorkItem(params: unknown): Promise<ToolResultShape>;
   addComment(params: unknown): Promise<ToolResultShape>;
   updateState(params: unknown): Promise<ToolResultShape>;
@@ -209,6 +213,30 @@ export function createAgentTools(getClient: () => PlaneClientPort, options: Agen
         );
         const lines = res.items.map((i) => `${i.identifier} [${i.state}] ${i.name} — ${i.url}`);
         const header = `${res.items.length} result(s)${res.nextCursor ? " (more available; pass cursor to page)" : ""}`;
+        return { content: [header, ...lines].join("\n"), data: res };
+      }),
+
+    listMembers: (params) =>
+      runTool(async () => {
+        const members = await call(getClient().listMembers(optString(params, "projectId")));
+        const lines = members.map((m) => `${m.name} <${m.email || "no-email"}> — role ${m.role} — ${m.id}`);
+        return { content: [`${members.length} member(s)`, ...lines].join("\n"), data: { members } };
+      }),
+
+    listWorkItems: (params) =>
+      runTool(async () => {
+        const res = await call(
+          getClient().listWorkItems({
+            projectId: requireString(params, "projectId"),
+            assigneeId: optString(params, "assigneeId"),
+            cursor: optString(params, "cursor"),
+          }),
+        );
+        const lines = res.items.map((i) => {
+          const who = (i.assignees ?? []).map((a) => a.name || a.email || a.id).join(", ") || "unassigned";
+          return `${i.identifier} [${i.state}] ${i.name} — ${who} — ${i.url}`;
+        });
+        const header = `${res.items.length} work item(s)${res.nextCursor ? " (more; pass cursor to page)" : ""}`;
         return { content: [header, ...lines].join("\n"), data: res };
       }),
 
@@ -258,6 +286,8 @@ export interface ToolDeclarationSource {
 export interface ToolNameMap {
   getWorkItem: string;
   searchWorkItems: string;
+  listMembers: string;
+  listWorkItems: string;
   createWorkItem: string;
   addComment: string;
   updateState: string;
@@ -291,6 +321,8 @@ export function registerPlaneTools(
   };
   wire(toolNames.getWorkItem, tools.getWorkItem);
   wire(toolNames.searchWorkItems, tools.searchWorkItems);
+  wire(toolNames.listMembers, tools.listMembers);
+  wire(toolNames.listWorkItems, tools.listWorkItems);
   wire(toolNames.createWorkItem, tools.createWorkItem);
   wire(toolNames.addComment, tools.addComment);
   wire(toolNames.updateState, tools.updateState);

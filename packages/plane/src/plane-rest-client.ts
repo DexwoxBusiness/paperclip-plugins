@@ -34,6 +34,8 @@ import {
   type PlaneCommentResult,
   type PlaneCreateInput,
   type PlaneListWorkItemsInput,
+  type PlaneAssignee,
+  type PlaneMember,
   type PlaneMutationResult,
   type PlaneReconcilePort,
   type PlaneSearchResult,
@@ -219,6 +221,43 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
     });
   }
 
+  /** Display name for a user-like object (member or expanded assignee): display_name → first+last → email → id. */
+  function personName(o: Record<string, unknown>): string {
+    const dn = typeof o.display_name === "string" ? o.display_name.trim() : "";
+    if (dn) return dn;
+    const fl = [o.first_name, o.last_name].filter((x) => typeof x === "string" && (x as string).trim()).join(" ").trim();
+    if (fl) return fl;
+    const email = typeof o.email === "string" ? o.email.trim() : "";
+    return email || String(o.id ?? "");
+  }
+
+  /**
+   * Normalize `expand=assignees` output. Each element may be an expanded user object
+   * ({id, display_name, email, ...}) OR a bare UUID string (not expanded) — both handled. Drops
+   * anything without an id.
+   */
+  function assigneesOf(raw: Record<string, unknown>): PlaneAssignee[] {
+    const arr = Array.isArray(raw.assignees) ? raw.assignees : [];
+    return arr
+      .map((a): PlaneAssignee => {
+        if (typeof a === "string") return { id: a, name: "", email: "" };
+        const o = (a ?? {}) as Record<string, unknown>;
+        return { id: String(o.id ?? ""), name: personName(o), email: String(o.email ?? "").trim().toLowerCase() };
+      })
+      .filter((a) => a.id);
+  }
+
+  /**
+   * Map a members-endpoint record to {id,name,email,role}. Workspace members are flat
+   * ({id, display_name, email, role}); project members may nest the user under `member` with `role`
+   * at the top level — merge so either shape resolves.
+   */
+  function toMember(raw: Record<string, unknown>): PlaneMember {
+    const user = raw.member && typeof raw.member === "object" ? (raw.member as Record<string, unknown>) : raw;
+    const role = typeof raw.role === "number" ? raw.role : typeof user.role === "number" ? user.role : 0;
+    return { id: String(user.id ?? ""), name: personName(user), email: String(user.email ?? "").trim().toLowerCase(), role };
+  }
+
   /**
    * Resolve a work item's readable identifier. Prefers what we already know — the
    * input identifier, or `project__identifier` in the response — and only falls
@@ -248,6 +287,7 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
       state: String(raw.state ?? ""),
       priority: typeof raw.priority === "string" ? raw.priority : undefined,
       labels: labelsOf(raw),
+      assignees: assigneesOf(raw),
       comments: commentsOf(raw),
       url: browseUrl(identifier),
     };
@@ -272,7 +312,7 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
       // input is a readable identifier we already know it, so no lookup is needed.
       const known = READABLE_ID_RE.test(idOrIdentifier) ? idOrIdentifier : undefined;
       const raw = await request<Record<string, unknown>>("GET", `work-items/${idOrIdentifier}`, {
-        query: { expand: "labels,state,comments" },
+        query: { expand: "labels,state,comments,assignees" },
       });
       return toWorkItem(raw, known);
     },
@@ -300,6 +340,53 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
       });
       // The search endpoint returns up to `limit` best matches (no cursor).
       return { items };
+    },
+
+    async listMembers(projectId?: string): Promise<PlaneMember[]> {
+      // Doc-grounded (developers.plane.so): GET workspaces/{slug}/members/ returns a bare ARRAY of
+      // {id, first_name, last_name, display_name, email, role}; project members live under
+      // projects/{id}/members/. Tolerate both a bare array and a {results} envelope.
+      const path = projectId ? `projects/${projectId}/members` : "members";
+      const raw = await request<unknown>("GET", path);
+      const arr = Array.isArray(raw)
+        ? raw
+        : raw && typeof raw === "object" && Array.isArray((raw as { results?: unknown[] }).results)
+          ? (raw as { results: unknown[] }).results
+          : [];
+      return arr.map((m) => toMember((m ?? {}) as Record<string, unknown>)).filter((m) => m.id);
+    },
+
+    async listWorkItems(input: { projectId: string; assigneeId?: string; cursor?: string }): Promise<PlaneSearchResult> {
+      // Project work-item list with assignees expanded (doc-grounded expand=assignees,state). The
+      // assignee FILTER is applied CLIENT-SIDE on the expanded assignees — Plane's server-side
+      // assignee filter param isn't doc-confirmed, so we filter on data we KNOW is present rather
+      // than risk a 400 from an unverified query param.
+      const raw = await request<{ results?: unknown[]; next_cursor?: unknown; next_page_results?: unknown }>(
+        "GET",
+        `projects/${input.projectId}/work-items`,
+        { query: { expand: "assignees,state", cursor: input.cursor, per_page: "100", order_by: "-updated_at" } },
+      );
+      const projIdent = await projectIdentifier(input.projectId); // one cached lookup for all rows
+      const results = Array.isArray(raw.results) ? raw.results : [];
+      let items: PlaneWorkItemSummary[] = results.map((r) => {
+        const o = (r ?? {}) as Record<string, unknown>;
+        const seq = o.sequence_id;
+        const identifier = projIdent && seq !== undefined ? `${projIdent}-${seq}` : String(o.id ?? "");
+        const state =
+          typeof o.state === "string"
+            ? o.state
+            : o.state && typeof o.state === "object"
+              ? String((o.state as Record<string, unknown>).name ?? (o.state as Record<string, unknown>).id ?? "")
+              : "";
+        return { id: String(o.id ?? ""), identifier, name: String(o.name ?? ""), state, url: browseUrl(identifier), assignees: assigneesOf(o) };
+      });
+      if (input.assigneeId) {
+        const aid = input.assigneeId;
+        items = items.filter((i) => (i.assignees ?? []).some((a) => a.id === aid));
+      }
+      const nextCursor = typeof raw.next_cursor === "string" && raw.next_cursor ? raw.next_cursor : undefined;
+      const hasMore = raw.next_page_results === true && nextCursor !== undefined;
+      return { items, nextCursor: hasMore ? nextCursor : undefined };
     },
 
     async createWorkItem(input: PlaneCreateInput): Promise<PlaneMutationResult> {

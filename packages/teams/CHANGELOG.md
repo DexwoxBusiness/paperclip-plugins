@@ -1,5 +1,11 @@
 # @dexwox-labs/paperclip-plugin-teams
 
+## 0.7.0
+
+### Minor Changes
+
+- [#33](https://github.com/DexwoxBusiness/paperclip-plugins/pull/33) [`652a6f4`](https://github.com/DexwoxBusiness/paperclip-plugins/commit/652a6f4c0f6bade078ee2cbc1149e9e4456f9033) Thanks [@DexwoxBusiness](https://github.com/DexwoxBusiness)! - Teams bot capabality to message in channels with mentioning the user
+
 ## 0.6.0
 
 ### Minor Changes

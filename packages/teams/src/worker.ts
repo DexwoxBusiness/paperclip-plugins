@@ -778,6 +778,7 @@ const teamsPlugin = definePlugin({
         let mentions: ChannelMention[] = [];
         let unresolvedMentions: string[] = [];
         let skippedMentions: string[] = [];
+        let duplicateMentions: string[] = [];
         const requestedMentions = Array.isArray(p.mentions) ? (p.mentions as unknown[]).map((x) => String(x ?? "").trim()).filter(Boolean) : [];
         if (requestedMentions.length > 0) {
           try {
@@ -786,6 +787,7 @@ const teamsPlugin = definePlugin({
             mentions = resolvedMentions.resolved;
             unresolvedMentions = resolvedMentions.unresolved;
             skippedMentions = resolvedMentions.skipped;
+            duplicateMentions = resolvedMentions.duplicate;
           } catch (e) {
             log("teams post_to_channel: mention resolve failed", { error: e instanceof Error ? e.message : String(e) });
             unresolvedMentions = requestedMentions; // couldn't read the roster → nothing resolved (still post)
@@ -816,6 +818,7 @@ const teamsPlugin = definePlugin({
             mentioned: mentions.map((m) => m.name),
             ...(unresolvedMentions.length ? { unresolvedMentions } : {}),
             ...(skippedMentions.length ? { skippedMentions } : {}),
+            ...(duplicateMentions.length ? { duplicateMentions } : {}),
           }),
         };
       },

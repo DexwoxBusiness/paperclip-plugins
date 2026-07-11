@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   conversationKey,
   createConversationStore,
   isPersonalConversationRef,
+  resolveInboundChannelData,
   type ConversationRef,
   type ConversationStoreBackend,
 } from "../src/bot-conversations.js";
@@ -27,6 +28,36 @@ const ref = (id: string, over: Partial<ConversationRef> = {}): ConversationRef =
   serviceUrl: "https://smba.trafficmanager.net/amer/",
   conversation: { id, conversationType: "channel" },
   ...over,
+});
+
+describe("resolveInboundChannelData (T13 — resolve team.aadGroupId on the inbound turn)", () => {
+  it("fetches aadGroupId via getTeamDetails when a team turn lacks it, and merges it in", async () => {
+    const fetch = vi.fn().mockResolvedValue("group-guid");
+    const out = await resolveInboundChannelData({ team: { id: "19:team@thread.tacv2" } }, fetch);
+    expect(out?.team?.aadGroupId).toBe("group-guid");
+    expect(fetch).toHaveBeenCalledWith("19:team@thread.tacv2"); // the stored team thread id keys getTeamDetails
+  });
+
+  it("does NOT call getTeamDetails when aadGroupId is already present (no redundant Connector call)", async () => {
+    const fetch = vi.fn();
+    const out = await resolveInboundChannelData({ team: { id: "19:t", aadGroupId: "already" } }, fetch);
+    expect(out?.team?.aadGroupId).toBe("already");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does nothing for a non-team turn (personal chat / no team.id)", async () => {
+    const fetch = vi.fn();
+    expect(await resolveInboundChannelData(undefined, fetch)).toBeUndefined();
+    expect(await resolveInboundChannelData({ tenant: { id: "t" } }, fetch)).toEqual({ tenant: { id: "t" } });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("leaves channelData unchanged when the lookup fails or returns nothing (retried next turn, never throws)", async () => {
+    const boom = vi.fn().mockRejectedValue(new Error("connector 500"));
+    expect(await resolveInboundChannelData({ team: { id: "19:t" } }, boom)).toEqual({ team: { id: "19:t" } });
+    const empty = vi.fn().mockResolvedValue("   ");
+    expect((await resolveInboundChannelData({ team: { id: "19:t" } }, empty))?.team?.aadGroupId).toBeUndefined();
+  });
 });
 
 describe("conversationKey", () => {

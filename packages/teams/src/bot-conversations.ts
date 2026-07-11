@@ -25,8 +25,42 @@ export interface ConversationRef {
   /** Teams routing hints, when present. `team.aadGroupId` is the team's AAD group id — required to
    * read the roster via Microsoft Graph (GET /teams/{aadGroupId}/members). Captured on inbound turns
    * (getConversationReference alone does NOT include channelData). */
-  channelData?: { teamId?: string; channelId?: string; tenant?: { id?: string }; team?: { id?: string; aadGroupId?: string } };
+  channelData?: TeamsChannelData;
   [k: string]: unknown;
+}
+
+/** The subset of Teams channelData we persist for routing + Graph roster reads. */
+export type TeamsChannelData = { teamId?: string; channelId?: string; tenant?: { id?: string }; team?: { id?: string; aadGroupId?: string } };
+
+/**
+ * Enrich an inbound channelData with the team's AAD **group id** (the key the Graph roster read
+ * needs), resolving it on the REAL inbound turn.
+ *
+ * WHY this exists: a channel *message* activity's `channelData` does NOT reliably carry
+ * `team.aadGroupId` — only `conversationUpdate` does, and even then the typed `TeamInfo` omits it
+ * (botframework-sdk#5870). The sanctioned way to obtain it is `TeamsInfo.getTeamDetails`, which makes
+ * a Bot Connector HTTP call and therefore needs a live TurnContext. Doing it in the
+ * `list_channel_members` tool path fails (a tool invocation has no TurnContext), which is exactly the
+ * empty-roster symptom. So we resolve it here, on the inbound turn, and merge it into channelData so
+ * the stored conversation reference carries it for the later proactive roster read.
+ *
+ * Pure + injectable (`fetchTeamAadGroupId`) so the branch logic is unit-tested without the SDK. Never
+ * throws: a failed/blocked lookup leaves channelData unchanged (the next inbound turn retries).
+ */
+export async function resolveInboundChannelData(
+  incomingCd: TeamsChannelData | undefined,
+  fetchTeamAadGroupId: (teamId: string) => Promise<string | undefined>,
+): Promise<TeamsChannelData | undefined> {
+  const teamId = incomingCd?.team?.id?.trim();
+  // Nothing to do when this isn't a team turn, or the group id is already present.
+  if (!teamId || incomingCd?.team?.aadGroupId?.trim()) return incomingCd;
+  let aadGroupId: string | undefined;
+  try {
+    aadGroupId = (await fetchTeamAadGroupId(teamId))?.trim() || undefined;
+  } catch {
+    aadGroupId = undefined; // leave channelData as-is; a later turn retries
+  }
+  return aadGroupId ? { ...incomingCd, team: { ...incomingCd.team, aadGroupId } } : incomingCd;
 }
 
 /** A stored reference plus bookkeeping. */

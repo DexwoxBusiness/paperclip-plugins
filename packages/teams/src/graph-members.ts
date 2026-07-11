@@ -228,7 +228,9 @@ export async function resolveGraphUsers(
   input: { tenantId: string; clientId: string; clientSecret: string; keys: readonly string[]; timeoutMs?: number },
   fetchImpl: GraphFetch = defaultGraphFetch,
 ): Promise<Map<string, GraphUser>> {
-  const keys = Array.from(new Set((input.keys ?? []).map((k) => String(k ?? "").trim()).filter(Boolean)));
+  // Dedupe by LOWERCASED key: emails/UPNs are case-insensitive, so "A@x.com" and "a@x.com" are the
+  // same person — one Graph call, and the map keys match the lowercased lookup in resolveMentionsFromLookup.
+  const keys = Array.from(new Set((input.keys ?? []).map((k) => String(k ?? "").trim().toLowerCase()).filter(Boolean)));
   const out = new Map<string, GraphUser>();
   if (keys.length === 0) return out;
   const runOnce = async (): Promise<void> => {
@@ -236,7 +238,7 @@ export async function resolveGraphUsers(
     const token = await getAppToken(input, fetchImpl);
     for (const key of keys) {
       const user = await fetchUserByUpnOrId({ token, upnOrId: key, timeoutMs: input.timeoutMs }, fetchImpl);
-      if (user) out.set(key.toLowerCase(), user);
+      if (user) out.set(key, user); // key already lowercased
     }
   };
   try {

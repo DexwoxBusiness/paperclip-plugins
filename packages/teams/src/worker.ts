@@ -19,6 +19,7 @@ import { buildAskCancelledCard, formatAskResponse, type AskField, type AskReques
 import { createAskStore, type AskStoreBackend } from "./ask-store.js";
 import { createChannelStore, type ChannelStoreBackend } from "./channel-store.js";
 import { TEAMS_AGENT_TOOLS, toolRuntimeDecl } from "./agent-tool-declarations.js";
+import { createRosterCache } from "./roster-cache.js";
 import { buildAnnouncementCard, buildChannelClosedCard, buildChannelPromptCard, normalizeMembers, resolveChannelMentions, type ChannelMention, type ChannelPost, type ChannelResponse } from "./channel.js";
 import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
 import { createApprovalStore } from "./approval-store.js";
@@ -39,6 +40,10 @@ import {
   extractCostCents,
   type RawPluginEvent,
 } from "./event-adapters.js";
+
+// Worker-lifetime roster cache (one out-of-process worker per plugin), shared by post_to_channel's
+// @-mention resolution and the list_channel_members tool so a channel isn't re-paged on every post.
+const rosterCache = createRosterCache();
 
 /**
  * Microsoft Teams Chat OS worker.
@@ -772,12 +777,15 @@ const teamsPlugin = definePlugin({
         // and unresolved names are reported back so the agent knows who it couldn't ping.
         let mentions: ChannelMention[] = [];
         let unresolvedMentions: string[] = [];
+        let skippedMentions: string[] = [];
         const requestedMentions = Array.isArray(p.mentions) ? (p.mentions as unknown[]).map((x) => String(x ?? "").trim()).filter(Boolean) : [];
         if (requestedMentions.length > 0) {
           try {
-            const resolvedMentions = resolveChannelMentions(await bot.listChannelMembers(channelRef), requestedMentions);
+            const roster = await rosterCache.get(channelRef, () => bot.listChannelMembers(channelRef));
+            const resolvedMentions = resolveChannelMentions(roster, requestedMentions);
             mentions = resolvedMentions.resolved;
             unresolvedMentions = resolvedMentions.unresolved;
+            skippedMentions = resolvedMentions.skipped;
           } catch (e) {
             log("teams post_to_channel: mention resolve failed", { error: e instanceof Error ? e.message : String(e) });
             unresolvedMentions = requestedMentions; // couldn't read the roster → nothing resolved (still post)
@@ -807,6 +815,7 @@ const teamsPlugin = definePlugin({
             collecting: collect,
             mentioned: mentions.map((m) => m.name),
             ...(unresolvedMentions.length ? { unresolvedMentions } : {}),
+            ...(skippedMentions.length ? { skippedMentions } : {}),
           }),
         };
       },
@@ -877,7 +886,7 @@ const teamsPlugin = definePlugin({
           log("teams list_channel_members: bot not configured", { error: e instanceof Error ? e.message : String(e) });
           return { content: JSON.stringify({ members: [], reason: "bot not configured" }) };
         }
-        const members = normalizeMembers(await bot.listChannelMembers(channelRef));
+        const members = normalizeMembers(await rosterCache.get(channelRef, () => bot.listChannelMembers(channelRef)));
         return { content: JSON.stringify({ members }) };
       },
     );

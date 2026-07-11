@@ -145,14 +145,21 @@ describe("resolveChannelMentions", () => {
   });
 
   it("returns everything unresolved when the roster is unreadable (non-array)", () => {
-    expect(resolveChannelMentions(null, ["x@y.com"])).toEqual({ resolved: [], unresolved: ["x@y.com"] });
-    expect(resolveChannelMentions(undefined, [])).toEqual({ resolved: [], unresolved: [] });
+    expect(resolveChannelMentions(null, ["x@y.com"])).toEqual({ resolved: [], unresolved: ["x@y.com"], skipped: [] });
+    expect(resolveChannelMentions(undefined, [])).toEqual({ resolved: [], unresolved: [], skipped: [] });
   });
 
-  it("caps the number of mentions at MAX_MENTIONS", () => {
+  it("caps at MAX_MENTIONS and surfaces the overflow as skipped (never silently dropped)", () => {
     const big = Array.from({ length: MAX_MENTIONS + 5 }, (_, i) => ({ id: `29:u${i}`, email: `u${i}@x.com`, name: `U${i}` }));
     const req = big.map((m) => m.email);
-    expect(resolveChannelMentions(big, req).resolved).toHaveLength(MAX_MENTIONS);
+    const { resolved, unresolved, skipped } = resolveChannelMentions(big, req);
+    expect(resolved).toHaveLength(MAX_MENTIONS);
+    expect(skipped).toHaveLength(5);
+    expect(unresolved).toEqual([]);
+    // Every requested valid member is accounted for — pinged or skipped, none dropped.
+    expect(resolved.length + skipped.length).toBe(req.length);
+    // The skipped entries are exactly the overflow requests (the last 5).
+    expect(skipped).toEqual(req.slice(MAX_MENTIONS));
   });
 });
 

@@ -142,11 +142,18 @@ function atName(name: string): string {
  *
  * Matching is case-insensitive against a member's email/UPN, their Entra Object ID, and their `29:`
  * member id. The mention id itself prefers the `29:` member id (universally accepted), falling back
- * to the Entra Object ID. Deduped by mention id; capped at {@link MAX_MENTIONS}. Anything that
- * doesn't match a current member is returned in `unresolved` (never guessed, never fabricated) so
- * the agent can see who it couldn't ping.
+ * to the Entra Object ID. Deduped by mention id.
+ *
+ * No requested entry is ever silently dropped (Codex P2): each ends up in exactly one bucket —
+ *  - `resolved`   — matched a current member and within the {@link MAX_MENTIONS} cap (actually pinged),
+ *  - `unresolved` — didn't match any current member (never guessed / fabricated),
+ *  - `skipped`    — matched a real member but beyond the cap, so NOT pinged.
+ * The caller surfaces `unresolved` + `skipped` so a `posted:true` never hides an un-pinged person.
  */
-export function resolveChannelMentions(rawMembers: unknown, requested: readonly string[]): { resolved: ChannelMention[]; unresolved: string[] } {
+export function resolveChannelMentions(
+  rawMembers: unknown,
+  requested: readonly string[],
+): { resolved: ChannelMention[]; unresolved: string[]; skipped: string[] } {
   const members = Array.isArray(rawMembers) ? rawMembers : [];
   const byKey = new Map<string, { id: string; name: string }>();
   for (const m of members) {
@@ -164,6 +171,7 @@ export function resolveChannelMentions(rawMembers: unknown, requested: readonly 
   }
   const resolved: ChannelMention[] = [];
   const unresolved: string[] = [];
+  const skipped: string[] = [];
   const seen = new Set<string>();
   for (const req of requested) {
     const key = String(req ?? "").trim().toLowerCase();
@@ -173,12 +181,15 @@ export function resolveChannelMentions(rawMembers: unknown, requested: readonly 
       unresolved.push(String(req));
       continue;
     }
-    if (seen.has(hit.id)) continue; // same person requested twice (e.g. email + id)
-    if (resolved.length >= MAX_MENTIONS) continue;
+    if (seen.has(hit.id)) continue; // same person requested twice (e.g. email + id) — count once
     seen.add(hit.id);
+    if (resolved.length >= MAX_MENTIONS) {
+      skipped.push(String(req)); // valid member, but over the cap — surfaced, never silently dropped
+      continue;
+    }
     resolved.push({ id: hit.id, name: atName(hit.name) });
   }
-  return { resolved, unresolved };
+  return { resolved, unresolved, skipped };
 }
 
 /**

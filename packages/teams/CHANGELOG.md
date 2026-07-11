@@ -1,5 +1,11 @@
 # @dexwox-labs/paperclip-plugin-teams
 
+## 0.10.0
+
+### Minor Changes
+
+- [#45](https://github.com/DexwoxBusiness/paperclip-plugins/pull/45) [`327afb1`](https://github.com/DexwoxBusiness/paperclip-plugins/commit/327afb1ff015ec5752d985890263284619d9444d) Thanks [@DexwoxBusiness](https://github.com/DexwoxBusiness)! - Added missed graph permission fix for @-mentions of the user in the channel
+
 ## 0.9.0
 
 ### Minor Changes

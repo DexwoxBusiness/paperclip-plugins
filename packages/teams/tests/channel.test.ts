@@ -139,14 +139,21 @@ describe("resolveChannelMentions", () => {
     expect(unresolved).toEqual(["nobody@dexwox.com"]);
   });
 
-  it("dedupes when the same person is requested twice (email + id)", () => {
-    const { resolved } = resolveChannelMentions(roster, ["diwakar.ma@dexwox.com", "aad-diwakar", "29:diwakar"]);
-    expect(resolved).toEqual([{ id: "29:diwakar", name: "Diwakar MA" }]);
+  it("collapses duplicate requests (email + id) into one mention and surfaces the repeats", () => {
+    const { resolved, duplicate } = resolveChannelMentions(roster, ["diwakar.ma@dexwox.com", "aad-diwakar", "29:diwakar"]);
+    expect(resolved).toEqual([{ id: "29:diwakar", name: "Diwakar MA" }]); // pinged once
+    expect(duplicate).toEqual(["aad-diwakar", "29:diwakar"]); // the 2nd + 3rd requests for the same person, accounted not dropped
   });
 
   it("returns everything unresolved when the roster is unreadable (non-array)", () => {
-    expect(resolveChannelMentions(null, ["x@y.com"])).toEqual({ resolved: [], unresolved: ["x@y.com"], skipped: [] });
-    expect(resolveChannelMentions(undefined, [])).toEqual({ resolved: [], unresolved: [], skipped: [] });
+    expect(resolveChannelMentions(null, ["x@y.com"])).toEqual({ resolved: [], unresolved: ["x@y.com"], skipped: [], duplicate: [] });
+    expect(resolveChannelMentions(undefined, [])).toEqual({ resolved: [], unresolved: [], skipped: [], duplicate: [] });
+  });
+
+  it("every requested entry lands in exactly one bucket (resolved | unresolved | skipped | duplicate)", () => {
+    const req = ["diwakar.ma@dexwox.com", "29:diwakar", "nobody@x.com", "ferin.c@dexwox.com"];
+    const { resolved, unresolved, skipped, duplicate } = resolveChannelMentions(roster, req);
+    expect(resolved.length + unresolved.length + skipped.length + duplicate.length).toBe(req.length);
   });
 
   it("caps at MAX_MENTIONS and surfaces the overflow as skipped (never silently dropped)", () => {

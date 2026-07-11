@@ -144,16 +144,19 @@ function atName(name: string): string {
  * member id. The mention id itself prefers the `29:` member id (universally accepted), falling back
  * to the Entra Object ID. Deduped by mention id.
  *
- * No requested entry is ever silently dropped (Codex P2): each ends up in exactly one bucket —
+ * No requested (non-blank) entry is ever silently dropped: each lands in exactly one bucket —
  *  - `resolved`   — matched a current member and within the {@link MAX_MENTIONS} cap (actually pinged),
  *  - `unresolved` — didn't match any current member (never guessed / fabricated),
- *  - `skipped`    — matched a real member but beyond the cap, so NOT pinged.
+ *  - `skipped`    — matched a real member but beyond the cap, so NOT pinged,
+ *  - `duplicate`  — a repeat of a person already counted above (e.g. the same person by email AND id);
+ *                   collapsed to one mention, so this entry did not add another (their ping status is
+ *                   whatever their FIRST occurrence got — resolved or skipped).
  * The caller surfaces `unresolved` + `skipped` so a `posted:true` never hides an un-pinged person.
  */
 export function resolveChannelMentions(
   rawMembers: unknown,
   requested: readonly string[],
-): { resolved: ChannelMention[]; unresolved: string[]; skipped: string[] } {
+): { resolved: ChannelMention[]; unresolved: string[]; skipped: string[]; duplicate: string[] } {
   const members = Array.isArray(rawMembers) ? rawMembers : [];
   const byKey = new Map<string, { id: string; name: string }>();
   for (const m of members) {
@@ -172,16 +175,20 @@ export function resolveChannelMentions(
   const resolved: ChannelMention[] = [];
   const unresolved: string[] = [];
   const skipped: string[] = [];
+  const duplicate: string[] = [];
   const seen = new Set<string>();
   for (const req of requested) {
     const key = String(req ?? "").trim().toLowerCase();
-    if (!key) continue;
+    if (!key) continue; // blank input is not an addressable request (the tool also pre-filters these)
     const hit = byKey.get(key);
     if (!hit) {
       unresolved.push(String(req));
       continue;
     }
-    if (seen.has(hit.id)) continue; // same person requested twice (e.g. email + id) — count once
+    if (seen.has(hit.id)) {
+      duplicate.push(String(req)); // repeat of an already-counted person — surfaced, never silently dropped
+      continue;
+    }
     seen.add(hit.id);
     if (resolved.length >= MAX_MENTIONS) {
       skipped.push(String(req)); // valid member, but over the cap — surfaced, never silently dropped
@@ -189,7 +196,7 @@ export function resolveChannelMentions(
     }
     resolved.push({ id: hit.id, name: atName(hit.name) });
   }
-  return { resolved, unresolved, skipped };
+  return { resolved, unresolved, skipped, duplicate };
 }
 
 /**

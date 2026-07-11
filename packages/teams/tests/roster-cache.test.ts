@@ -16,6 +16,16 @@ describe("createRosterCache", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("re-fetches on a backward wall-clock jump instead of pinning stale data (negative age)", async () => {
+    let clock = 10_000;
+    const cache = createRosterCache({ ttlMs: 60_000, now: () => clock });
+    const fetch = vi.fn().mockResolvedValueOnce(["v1"]).mockResolvedValueOnce(["v2"]);
+    expect(await cache.get("ch", fetch)).toEqual(["v1"]);
+    clock = 5_000; // clock stepped BACKWARDS (NTP/leap/thaw) → age is negative, must NOT read as fresh
+    expect(await cache.get("ch", fetch)).toEqual(["v2"]);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
   it("re-fetches after the TTL expires", async () => {
     let clock = 0;
     const cache = createRosterCache({ ttlMs: 1000, now: () => clock });

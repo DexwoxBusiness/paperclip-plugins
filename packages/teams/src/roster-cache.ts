@@ -35,7 +35,13 @@ export function createRosterCache(opts: { ttlMs?: number; now?: () => number; ma
   return {
     async get(key, fetch) {
       const hit = store.get(key);
-      if (hit && now() - hit.at < ttlMs) return hit.members;
+      if (hit) {
+        // Guard against a BACKWARD wall-clock jump (NTP step, leap second, container freeze/thaw):
+        // a negative age must NOT read as "fresh", or a stale roster would be pinned indefinitely.
+        // Treat only a non-negative age within the TTL as fresh; anything else re-fetches.
+        const age = now() - hit.at;
+        if (age >= 0 && age < ttlMs) return hit.members;
+      }
       const members = await fetch();
       if (store.size >= maxEntries && !store.has(key)) store.clear();
       store.set(key, { at: now(), members });

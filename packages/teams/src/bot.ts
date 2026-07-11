@@ -275,14 +275,25 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
   const rememberFrom = async (context: TurnContext): Promise<void> => {
     // getConversationReference() is an instance method on the ACTIVITY (agents-activity).
     const reference = context.activity.getConversationReference() as unknown as ConversationRef;
-    // Capture Teams channelData (esp. team.aadGroupId) onto the stored ref — getConversationReference
-    // does NOT include it, but the Graph roster read (GET /teams/{aadGroupId}/members) needs it. The
-    // bot Connector's getPagedMembers can't return member emails, so channel @-mentions resolve via
-    // Graph, which is keyed by the team's AAD group id available only on an inbound activity.
-    const channelData = (context.activity as { channelData?: unknown }).channelData;
-    if (channelData && typeof channelData === "object") reference.channelData = channelData as ConversationRef["channelData"];
     const key = conversationKey(reference);
-    if (key) await deps.conversations.remember(reference);
+    if (!key) return;
+    // Capture Teams channelData (esp. team.aadGroupId) onto the stored ref — getConversationReference
+    // does NOT include it, but the Graph roster read (GET /teams/{aadGroupId}/members) needs it (the
+    // bot Connector's getPagedMembers can't return member emails). MERGE with any previously-captured
+    // channelData so a later turn whose channelData lacks team.aadGroupId (e.g. a card submit) doesn't
+    // wipe the id — the group id captured from an earlier @mention survives.
+    const incoming = (context.activity as { channelData?: unknown }).channelData;
+    const incomingCd = incoming && typeof incoming === "object" ? (incoming as ConversationRef["channelData"]) : undefined;
+    const priorCd = (await deps.conversations.get(key))?.reference.channelData;
+    if (incomingCd || priorCd) {
+      reference.channelData = {
+        ...priorCd,
+        ...incomingCd,
+        team: { ...priorCd?.team, ...incomingCd?.team },
+        tenant: { ...priorCd?.tenant, ...incomingCd?.tenant },
+      } as ConversationRef["channelData"];
+    }
+    await deps.conversations.remember(reference);
   };
 
   handler.onConversationUpdate(async (context: TurnContext, next: () => Promise<void>) => {
@@ -706,15 +717,17 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
         return [];
       }
       const auth = deps.authConfig as { tenantId?: string; clientSecret?: string };
+      // Multi-tenant bots leave botTenantId blank on purpose; the customer tenant that hosts this
+      // channel lives on the stored conversation reference (conversation.tenantId / channelData.tenant.id).
+      // Use the config tenant when set, else fall back to the conversation's tenant so mentions still work.
+      const tenantId =
+        (auth.tenantId ?? "").trim() ||
+        (conv.reference.conversation?.tenantId ?? "").trim() ||
+        (conv.reference.channelData?.tenant?.id ?? "").trim();
       try {
         // Native global fetch (readTeamRoster's default), same outbound path the workflows/approval
         // clients use. Returns {id,name,email} already shaped for normalizeMembers/resolveChannelMentions.
-        return await readTeamRoster({
-          tenantId: (auth.tenantId ?? "").trim(),
-          clientId: deps.botAppId,
-          clientSecret: auth.clientSecret ?? "",
-          groupId,
-        });
+        return await readTeamRoster({ tenantId, clientId: deps.botAppId, clientSecret: auth.clientSecret ?? "", groupId });
       } catch (e) {
         deps.log("teams list-members failed (graph)", { channelRef, error: e instanceof Error ? e.message : String(e) });
         return [];

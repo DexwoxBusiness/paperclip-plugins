@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { fetchGraphAppToken, fetchTeamMembers, readTeamRoster, type GraphFetch } from "../src/graph-members.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { _resetGraphTokenCache, fetchGraphAppToken, fetchTeamMembers, readTeamRoster, type GraphFetch } from "../src/graph-members.js";
 
 const ok = (json: unknown) => ({ ok: true, status: 200, json: async () => json, text: async () => JSON.stringify(json) });
 const err = (status: number, body: unknown) => ({
@@ -9,17 +9,21 @@ const err = (status: number, body: unknown) => ({
   text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
 });
 
+beforeEach(() => _resetGraphTokenCache());
+
 describe("fetchGraphAppToken", () => {
-  it("mints a client-credentials token for graph .default", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(ok({ access_token: "tok-123" }));
-    const token = await fetchGraphAppToken({ tenantId: "TENANT", clientId: "CID", clientSecret: "SECRET" }, fetchImpl as unknown as GraphFetch);
+  it("mints a client-credentials token (with lifetime) for graph .default", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(ok({ access_token: "tok-123", expires_in: 3600 }));
+    const { token, expiresInSec } = await fetchGraphAppToken({ tenantId: "TENANT", clientId: "CID", clientSecret: "SECRET" }, fetchImpl as unknown as GraphFetch);
     expect(token).toBe("tok-123");
+    expect(expiresInSec).toBe(3600);
     const [url, init] = fetchImpl.mock.calls[0];
     expect(url).toContain("login.microsoftonline.com/TENANT/oauth2/v2.0/token");
     expect(init.method).toBe("POST");
     expect(init.body).toContain("grant_type=client_credentials");
     expect(init.body).toContain("scope=https%3A%2F%2Fgraph.microsoft.com%2F.default");
     expect(init.body).toContain("client_secret=SECRET");
+    expect(init.signal).toBeDefined(); // per-request timeout
   });
 
   it("throws a secret-free error on a token failure", async () => {
@@ -54,6 +58,7 @@ describe("fetchTeamMembers", () => {
     const [url, init] = fetchImpl.mock.calls[0];
     expect(url).toContain("graph.microsoft.com/v1.0/teams/GID/members");
     expect(init.headers.authorization).toBe("Bearer T");
+    expect(init.signal).toBeDefined();
   });
 
   it("follows @odata.nextLink for the whole roster and dedupes by AAD id", async () => {
@@ -67,9 +72,7 @@ describe("fetchTeamMembers", () => {
   });
 
   it("skips members with no userId (app/bot members); keeps email '' when Graph omits it", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(
-      ok({ value: [{ displayName: "App Bot" }, { userId: "aad-3", displayName: "Guest" }] }),
-    );
+    const fetchImpl = vi.fn().mockResolvedValue(ok({ value: [{ displayName: "App Bot" }, { userId: "aad-3", displayName: "Guest" }] }));
     const members = await fetchTeamMembers({ groupId: "g", token: "t" }, fetchImpl as unknown as GraphFetch);
     expect(members).toEqual([{ aadObjectId: "aad-3", id: "aad-3", name: "Guest", email: "" }]);
   });
@@ -86,10 +89,37 @@ describe("readTeamRoster", () => {
   it("mints a token then reads members with it", async () => {
     const fetchImpl = vi
       .fn()
-      .mockResolvedValueOnce(ok({ access_token: "TT" }))
+      .mockResolvedValueOnce(ok({ access_token: "TT", expires_in: 3600 }))
       .mockResolvedValueOnce(ok({ value: [{ userId: "u1", displayName: "U1", email: "u1@x.com" }] }));
     const members = await readTeamRoster({ tenantId: "t", clientId: "c", clientSecret: "s", groupId: "g" }, fetchImpl as unknown as GraphFetch);
     expect(members).toEqual([{ aadObjectId: "u1", id: "u1", name: "U1", email: "u1@x.com" }]);
     expect(fetchImpl.mock.calls[1][1].headers.authorization).toBe("Bearer TT");
+  });
+
+  it("caches the app token and reuses it across roster reads (no second token round-trip)", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(ok({ access_token: "TT", expires_in: 3600 })) // token (once)
+      .mockResolvedValueOnce(ok({ value: [{ userId: "u1", displayName: "U1", email: "u1@x.com" }] })) // members read #1
+      .mockResolvedValueOnce(ok({ value: [{ userId: "u1", displayName: "U1", email: "u1@x.com" }] })); // members read #2
+    const input = { tenantId: "t", clientId: "c", clientSecret: "s", groupId: "g" };
+    await readTeamRoster(input, fetchImpl as unknown as GraphFetch);
+    await readTeamRoster(input, fetchImpl as unknown as GraphFetch);
+    expect(fetchImpl).toHaveBeenCalledTimes(3); // 1 token + 2 members, NOT 4
+    const tokenCalls = fetchImpl.mock.calls.filter(([u]) => String(u).includes("/oauth2/v2.0/token"));
+    expect(tokenCalls).toHaveLength(1);
+  });
+
+  it("on a 401 members response, drops the cached token and retries once with a fresh one", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(ok({ access_token: "T1", expires_in: 3600 })) // token 1
+      .mockResolvedValueOnce(err(401, "token expired")) // members → 401
+      .mockResolvedValueOnce(ok({ access_token: "T2", expires_in: 3600 })) // token 2 (re-mint)
+      .mockResolvedValueOnce(ok({ value: [{ userId: "u", displayName: "U", email: "u@x.com" }] })); // members OK
+    const members = await readTeamRoster({ tenantId: "t", clientId: "c", clientSecret: "s", groupId: "g" }, fetchImpl as unknown as GraphFetch);
+    expect(members.map((m) => m.id)).toEqual(["u"]);
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+    expect(fetchImpl.mock.calls[3][1].headers.authorization).toBe("Bearer T2"); // retried with the fresh token
   });
 });

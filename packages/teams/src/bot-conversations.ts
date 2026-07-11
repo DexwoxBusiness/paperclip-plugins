@@ -60,7 +60,7 @@ export async function resolveInboundChannelData(
   } catch {
     aadGroupId = undefined; // leave channelData as-is; a later turn retries
   }
-  return aadGroupId ? { ...incomingCd, team: { ...incomingCd.team, aadGroupId } } : incomingCd;
+  return aadGroupId ? { ...incomingCd, team: { ...incomingCd?.team, aadGroupId } } : incomingCd;
 }
 
 /** A stored reference plus bookkeeping. */

@@ -18,6 +18,7 @@ import { createEscalationStore, type EscalationStoreBackend } from "./escalation
 import { buildAskCancelledCard, formatAskResponse, type AskField, type AskRequest } from "./ask.js";
 import { createAskStore, type AskStoreBackend } from "./ask-store.js";
 import { createChannelStore, type ChannelStoreBackend } from "./channel-store.js";
+import { TEAMS_AGENT_TOOLS, toolRuntimeDecl } from "./agent-tool-declarations.js";
 import { buildAnnouncementCard, buildChannelClosedCard, buildChannelPromptCard, normalizeMembers, type ChannelPost, type ChannelResponse } from "./channel.js";
 import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
 import { createApprovalStore } from "./approval-store.js";
@@ -498,28 +499,8 @@ const teamsPlugin = definePlugin({
     // configured Teams conversation. No-ops (does NOT throw) when escalation/bot isn't
     // configured, returning a clear result to the agent (AC #4).
     ctx.tools.register(
-      "escalate_to_human",
-      {
-        displayName: "Escalate to human",
-        description:
-          "Escalate the current conversation to a human via the configured Microsoft Teams channel, with a suggested reply they can send back with one click.",
-        parametersSchema: {
-          type: "object",
-          properties: {
-            reason: { type: "string", description: "Why the agent is escalating" },
-            confidence: { type: "number", description: "Agent confidence in [0,1]" },
-            agentName: { type: "string", description: "Name of the escalating agent" },
-            agentReasoning: { type: "string", description: "The agent's reasoning for escalating" },
-            suggestedReply: { type: "string", description: "A reply the human can send back with one click" },
-            conversationHistory: {
-              type: "array",
-              description: "Recent conversation turns for context",
-              items: { type: "object", properties: { role: { type: "string" }, text: { type: "string" } } },
-            },
-          },
-          required: ["reason"],
-        },
-      },
+      TEAMS_AGENT_TOOLS.escalateToHuman.name,
+      toolRuntimeDecl(TEAMS_AGENT_TOOLS.escalateToHuman),
       async (params, runCtx) => {
         const cfg = (await ctx.config.get()) as TeamsInstanceConfig;
         const conversationId = (cfg.escalationConversationId ?? "").trim();
@@ -648,36 +629,8 @@ const teamsPlugin = definePlugin({
     // (no scrum vocabulary) — the agent decides what a question means and when to re-ask. No-ops
     // (never throws) when the person isn't reachable or the input is invalid.
     ctx.tools.register(
-      "ask_person",
-      {
-        displayName: "Ask a person",
-        description:
-          "Ask a specific person a question in Microsoft Teams and have their answer delivered back to you. The plugin only carries the message and tracks who answered; you decide whether and when to ask again.",
-        parametersSchema: {
-          type: "object",
-          properties: {
-            personRef: { type: "string", description: "The person's stored 1:1 conversation key (they must have interacted with the bot). Plane/Teams identity mapping is a separate capability." },
-            prompt: { type: "string", description: "The question to ask" },
-            fields: {
-              type: "array",
-              description: "Optional structured inputs to collect (each rendered as an editable field)",
-              items: {
-                type: "object",
-                properties: {
-                  id: { type: "string" },
-                  label: { type: "string" },
-                  multiline: { type: "boolean" },
-                  placeholder: { type: "string" },
-                  prefill: { type: "string" },
-                },
-                required: ["id"],
-              },
-            },
-            correlationId: { type: "string", description: "Your own key to tie the answer to a work item, e.g. plane:<id>" },
-          },
-          required: ["personRef", "prompt"],
-        },
-      },
+      TEAMS_AGENT_TOOLS.askPerson.name,
+      toolRuntimeDecl(TEAMS_AGENT_TOOLS.askPerson),
       async (params, runCtx) => {
         const p = (params ?? {}) as Record<string, unknown>;
         const personRef = String(p.personRef ?? "").trim();
@@ -723,18 +676,8 @@ const teamsPlugin = definePlugin({
 
     // Agent tool: list the still-open asks so the AGENT (not the plugin) decides whether to re-ask.
     ctx.tools.register(
-      "list_open_asks",
-      {
-        displayName: "List open asks",
-        description:
-          "List the questions this plugin is still waiting on answers for, so you can decide whether to re-ask or follow up. The plugin never nudges people on its own.",
-        parametersSchema: {
-          type: "object",
-          properties: {
-            correlationPrefix: { type: "string", description: "Optional: only asks whose correlationId starts with this (e.g. plane:)" },
-          },
-        },
-      },
+      TEAMS_AGENT_TOOLS.listOpenAsks.name,
+      toolRuntimeDecl(TEAMS_AGENT_TOOLS.listOpenAsks),
       async (params, runCtx) => {
         const p = (params ?? {}) as Record<string, unknown>;
         const prefix = typeof p.correlationPrefix === "string" ? p.correlationPrefix : "";
@@ -756,16 +699,8 @@ const teamsPlugin = definePlugin({
     // Agent tool: cancel an outstanding ask (no longer needed). Updates the person's card so they
     // don't answer a dead question. Idempotent — a second cancel / already-answered returns false.
     ctx.tools.register(
-      "cancel_ask",
-      {
-        displayName: "Cancel an ask",
-        description: "Withdraw a question you previously asked a person (e.g. it's no longer relevant). Their card updates to show it's no longer needed.",
-        parametersSchema: {
-          type: "object",
-          properties: { requestId: { type: "string", description: "The requestId returned by ask_person" } },
-          required: ["requestId"],
-        },
-      },
+      TEAMS_AGENT_TOOLS.cancelAsk.name,
+      toolRuntimeDecl(TEAMS_AGENT_TOOLS.cancelAsk),
       async (params, runCtx) => {
         const p = (params ?? {}) as Record<string, unknown>;
         const requestId = String(p.requestId ?? "").trim();
@@ -799,32 +734,8 @@ const teamsPlugin = definePlugin({
     // (read them with get_channel_responses); otherwise it's a plain announcement (e.g. a report
     // the agent built). No-ops (never throws) when the channel isn't reachable.
     ctx.tools.register(
-      "post_to_channel",
-      {
-        displayName: "Post to a channel",
-        description:
-          "Post a message to a Microsoft Teams channel. Set collect:true to render a form and gather each person's reply (read them later with get_channel_responses); otherwise post a plain announcement (e.g. a report you built). The plugin only carries the message and tracks who replied — you decide the audience, cadence, and how to consolidate.",
-        parametersSchema: {
-          type: "object",
-          properties: {
-            channelRef: { type: "string", description: "The channel's stored conversation key (the bot must have been added / @mentioned there once)." },
-            text: { type: "string", description: "The message / prompt text." },
-            collect: { type: "boolean", description: "When true, render input field(s) + a Send button and collect replies; when false/omitted, post a plain announcement." },
-            fields: {
-              type: "array",
-              description: "Optional structured inputs to collect when collect=true (each rendered as an editable field). Omit for a single free-text answer.",
-              items: {
-                type: "object",
-                properties: { id: { type: "string" }, label: { type: "string" }, multiline: { type: "boolean" }, placeholder: { type: "string" }, prefill: { type: "string" } },
-                required: ["id"],
-              },
-            },
-            heading: { type: "string", description: "Optional bold heading for a plain announcement (ignored when collect=true)." },
-            correlationId: { type: "string", description: "Your own key to group related posts/responses, e.g. standup:2026-07-10-am." },
-          },
-          required: ["channelRef", "text"],
-        },
-      },
+      TEAMS_AGENT_TOOLS.postToChannel.name,
+      toolRuntimeDecl(TEAMS_AGENT_TOOLS.postToChannel),
       async (params, runCtx) => {
         const p = (params ?? {}) as Record<string, unknown>;
         const channelRef = String(p.channelRef ?? "").trim();
@@ -878,20 +789,8 @@ const teamsPlugin = definePlugin({
     // so the AGENT can consolidate. Optionally close the post so it stops accepting replies. Scoped
     // to the caller's own posts (never exposes another agent/company's responses).
     ctx.tools.register(
-      "get_channel_responses",
-      {
-        displayName: "Get channel responses",
-        description:
-          "Read back who has responded to a collecting channel post (from post_to_channel) and what they said, so you can consolidate. Returns each responder's id, display name, and answers. Set close:true to stop collecting and update the card.",
-        parametersSchema: {
-          type: "object",
-          properties: {
-            postId: { type: "string", description: "The postId returned by post_to_channel" },
-            close: { type: "boolean", description: "When true, close the post (stops collecting; updates the card to a closed state)." },
-          },
-          required: ["postId"],
-        },
-      },
+      TEAMS_AGENT_TOOLS.getChannelResponses.name,
+      toolRuntimeDecl(TEAMS_AGENT_TOOLS.getChannelResponses),
       async (params, runCtx) => {
         const p = (params ?? {}) as Record<string, unknown>;
         const postId = String(p.postId ?? "").trim();
@@ -935,17 +834,8 @@ const teamsPlugin = definePlugin({
     // a reply from or join people to other systems by email. Emails are lowercased. Returns [] when
     // the bot can't read the channel (not added there / connector error).
     ctx.tools.register(
-      "list_channel_members",
-      {
-        displayName: "List channel members",
-        description:
-          "List the members of a Microsoft Teams channel (display name, email, and id), so you can decide who to expect a reply from or join people to other systems by email. Emails are lowercased for case-insensitive matching. Returns an empty list if the bot can't read the channel.",
-        parametersSchema: {
-          type: "object",
-          properties: { channelRef: { type: "string", description: "The channel's stored conversation key (the bot must have been added / @mentioned there once)." } },
-          required: ["channelRef"],
-        },
-      },
+      TEAMS_AGENT_TOOLS.listChannelMembers.name,
+      toolRuntimeDecl(TEAMS_AGENT_TOOLS.listChannelMembers),
       async (params, runCtx) => {
         const p = (params ?? {}) as Record<string, unknown>;
         const channelRef = String(p.channelRef ?? "").trim();

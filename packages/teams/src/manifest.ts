@@ -1,4 +1,5 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
+import { TEAMS_AGENT_TOOL_DECLARATIONS } from "./agent-tool-declarations.js";
 import { DEFAULT_CONFIG, JOB_KEYS, PLUGIN_ID, PLUGIN_VERSION, WEBHOOK_KEYS } from "./constants.js";
 
 const manifest: PaperclipPluginManifestV1 = {
@@ -61,6 +62,11 @@ const manifest: PaperclipPluginManifestV1 = {
       schedule: "*/1 * * * *",
     },
   ],
+  // Agent-callable tools MUST be declared here to be advertised to agents — the host
+  // registers agent tools only from `manifest.tools` (a worker-side `ctx.tools.register`
+  // installs the handler but does not advertise the tool). Declared from the single source
+  // of truth reused by worker.ts so the declaration and the runtime handler cannot drift.
+  tools: TEAMS_AGENT_TOOL_DECLARATIONS,
   instanceConfigSchema: {
     type: "object",
     properties: {

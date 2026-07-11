@@ -77,6 +77,34 @@ describe("conversation store (PCLIP-23 proactive)", () => {
     expect((await store.list()).map((c) => c.key)).toEqual(["a"]);
   });
 
+  it("merge callback computes the stored ref from the existing entry (atomic read-modify-write)", async () => {
+    let t = 1;
+    const store = createConversationStore(makeBackend(), { now: () => t });
+    // Turn 1: capture the team's AAD group id.
+    await store.remember(ref("19:c", { channelData: { team: { id: "19:c", aadGroupId: "group-1" } } }));
+    // Turn 2: a channelData WITHOUT team.aadGroupId — the merge must preserve the earlier capture.
+    t = 2;
+    await store.remember(ref("19:c", { serviceUrl: "https://new/" }), (existing) => {
+      const priorCd = existing?.reference.channelData;
+      return { ...ref("19:c", { serviceUrl: "https://new/" }), channelData: { ...priorCd, team: { ...priorCd?.team } } };
+    });
+    const got = await store.get("19:c");
+    expect(got?.reference.channelData?.team?.aadGroupId).toBe("group-1"); // preserved across the turn
+    expect(got?.reference.serviceUrl).toBe("https://new/"); // other fields refreshed
+    expect(got?.updatedAt).toBe(2);
+  });
+
+  it("merge receives undefined when there is no prior entry", async () => {
+    const store = createConversationStore(makeBackend(), { now: () => 5 });
+    let sawExisting: unknown = "sentinel";
+    await store.remember(ref("19:new"), (existing) => {
+      sawExisting = existing;
+      return ref("19:new", { channelData: { team: { aadGroupId: "g" } } });
+    });
+    expect(sawExisting).toBeUndefined();
+    expect((await store.get("19:new"))?.reference.channelData?.team?.aadGroupId).toBe("g");
+  });
+
   it("serializes concurrent remembers without losing entries", async () => {
     const store = createConversationStore(makeBackend());
     await Promise.all(Array.from({ length: 15 }, (_, i) => store.remember(ref(`c-${i}`))));

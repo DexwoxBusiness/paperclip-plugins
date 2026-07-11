@@ -56,6 +56,9 @@ interface CachedToken {
 }
 const tokenCache = new Map<string, CachedToken>();
 const tokenKey = (tenantId: string, clientId: string): string => `${tenantId}|${clientId}`;
+/** Only sweep the whole map once it has grown past this — keeps the common token miss O(1). A single
+ * worker sees a bounded set of tenants; this caps memory without an event-loop-blocking sweep per call. */
+const TOKEN_CACHE_SWEEP_AT = 256;
 
 /** Test hook: drop all cached tokens so each test starts clean. */
 export function _resetGraphTokenCache(): void {
@@ -93,8 +96,9 @@ export async function fetchGraphAppToken(
   return { token: json.access_token, expiresInSec: typeof json.expires_in === "number" ? json.expires_in : 3600 };
 }
 
-/** Drop every expired entry — keeps the cache bounded to tenants with a currently-valid token, so a
- * long-running multi-tenant worker doesn't accumulate stale entries for tenants it never revisits. */
+/** Drop every expired entry. Runs only when the cache has grown past {@link TOKEN_CACHE_SWEEP_AT}
+ * (not per call), so it never blocks the hot path; it exists to bound memory for a long-running
+ * multi-tenant worker that would otherwise retain stale entries for tenants it never revisits. */
 function purgeExpiredTokens(now: number): void {
   for (const [k, v] of tokenCache) if (now >= v.expiresAtMs) tokenCache.delete(k);
 }
@@ -104,8 +108,11 @@ async function getAppToken(input: { tenantId: string; clientId: string; clientSe
   const now = Date.now();
   const key = tokenKey((input.tenantId ?? "").trim(), input.clientId);
   const hit = tokenCache.get(key);
-  if (hit && now < hit.expiresAtMs) return hit.token;
-  purgeExpiredTokens(now); // bound memory: evict this stale entry + any never-revisited expired tenants
+  if (hit && now < hit.expiresAtMs) return hit.token; // hit path: O(1), no sweep
+  if (hit) tokenCache.delete(key); // O(1): drop this one stale entry
+  // Full O(N) sweep ONLY when the map has actually grown large — the common miss stays O(1), so a
+  // background timer (persistent side effect) isn't needed to keep getAppToken non-blocking.
+  if (tokenCache.size >= TOKEN_CACHE_SWEEP_AT) purgeExpiredTokens(now);
   const { token, expiresInSec } = await fetchGraphAppToken(input, fetchImpl);
   tokenCache.set(key, { token, expiresAtMs: now + Math.max(0, expiresInSec * 1000 - TOKEN_EXPIRY_SKEW_MS) });
   return token;

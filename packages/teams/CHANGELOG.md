@@ -1,5 +1,11 @@
 # @dexwox-labs/paperclip-plugin-teams
 
+## 0.9.0
+
+### Minor Changes
+
+- [#42](https://github.com/DexwoxBusiness/paperclip-plugins/pull/42) [`0b558c6`](https://github.com/DexwoxBusiness/paperclip-plugins/commit/0b558c6f2d8df8f94cbe6b187e815b04e8e29a2a) Thanks [@DexwoxBusiness](https://github.com/DexwoxBusiness)! - Fix to filter the users via email and have mentions in the teams channel
+
 ## 0.8.1
 
 ### Patch Changes

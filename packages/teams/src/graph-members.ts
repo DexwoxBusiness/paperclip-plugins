@@ -99,10 +99,19 @@ export async function fetchTeamMembers(
   return out;
 }
 
+/** Native global fetch adapted to {@link GraphFetch} (typed const → `url`/`init` infer, no implicit any). */
+const defaultGraphFetch: GraphFetch = (url, init) =>
+  (
+    globalThis.fetch as unknown as (
+      u: string,
+      i: { method: string; headers: Record<string, string>; body?: string },
+    ) => Promise<{ ok: boolean; status: number; json(): Promise<unknown>; text(): Promise<string> }>
+  )(url, init);
+
 /** Token + members in one call. `fetchImpl` defaults to native fetch (present in the Node worker). */
 export async function readTeamRoster(
   input: { tenantId: string; clientId: string; clientSecret: string; groupId: string },
-  fetchImpl: GraphFetch = ((url, init) => (globalThis.fetch as unknown as (u: string, i: unknown) => Promise<Response>)(url, init)) as unknown as GraphFetch,
+  fetchImpl: GraphFetch = defaultGraphFetch,
 ): Promise<GraphMember[]> {
   const token = await fetchGraphAppToken(input, fetchImpl);
   return fetchTeamMembers({ groupId: input.groupId, token }, fetchImpl);

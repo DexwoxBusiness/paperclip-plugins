@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { _resetGraphTokenCache, fetchGraphAppToken, fetchTeamMembers, fetchUserByUpnOrId, readTeamRoster, resolveGraphUsers, type GraphFetch } from "../src/graph-members.js";
+import { _resetGraphTokenCache, fetchGraphAppToken, fetchTeamMembers, fetchUsersByKeys, readTeamRoster, resolveGraphUsers, type GraphFetch } from "../src/graph-members.js";
 
 const ok = (json: unknown) => ({ ok: true, status: 200, json: async () => json, text: async () => JSON.stringify(json) });
 const err = (status: number, body: unknown) => ({
@@ -85,49 +85,88 @@ describe("fetchTeamMembers", () => {
   });
 });
 
-describe("fetchUserByUpnOrId (email/UPN → Entra object id for @-mentions)", () => {
-  it("maps id/displayName/mail/upn and lowercases email; selects only the needed props", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(ok({ id: "obj-1", displayName: "Business Dexwox", mail: "Business@Dexwox.com", userPrincipalName: "business@dexwox.com" }));
-    const u = await fetchUserByUpnOrId({ token: "T", upnOrId: "business@dexwox.com" }, fetchImpl as unknown as GraphFetch);
-    expect(u).toEqual({ id: "obj-1", name: "Business Dexwox", email: "business@dexwox.com", upn: "business@dexwox.com" });
+describe("fetchUsersByKeys (ONE batched filter request; matches mail OR userPrincipalName)", () => {
+  it("filters by mail in (...) or userPrincipalName in (...) with the advanced-query header + $count", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      ok({
+        value: [
+          { id: "o1", displayName: "One", mail: "one@x.com", userPrincipalName: "one.upn@x.com" },
+          { id: "o2", displayName: "Two", mail: null, userPrincipalName: "two@x.com" },
+        ],
+      }),
+    );
+    const users = await fetchUsersByKeys({ token: "T", keys: ["one@x.com", "two@x.com"] }, fetchImpl as unknown as GraphFetch);
+    expect(users).toEqual([
+      { id: "o1", name: "One", email: "one@x.com", upn: "one.upn@x.com" },
+      { id: "o2", name: "Two", email: "two@x.com", upn: "two@x.com" }, // no mail → email falls back to upn
+    ]);
     const [url, init] = fetchImpl.mock.calls[0];
-    expect(url).toContain("graph.microsoft.com/v1.0/users/business%40dexwox.com");
-    expect(url).toContain("$select=id,displayName,mail,userPrincipalName");
+    expect(url).toContain("graph.microsoft.com/v1.0/users?");
+    expect(url).toContain("$count=true"); // required for the `in` operator on mail (advanced query)
+    expect(decodeURIComponent(url)).toContain("mail in ('one@x.com','two@x.com') or userPrincipalName in ('one@x.com','two@x.com')");
+    expect(init.headers.ConsistencyLevel).toBe("eventual"); // required for advanced queries
     expect(init.headers.authorization).toBe("Bearer T");
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // ONE request for the whole batch (no N+1)
   });
 
-  it("returns null on 404 (no such user) — caller buckets it as unresolved, not an error", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(err(404, { error: { code: "Request_ResourceNotFound" } }));
-    expect(await fetchUserByUpnOrId({ token: "T", upnOrId: "ghost@x.com" }, fetchImpl as unknown as GraphFetch)).toBeNull();
+  it("follows @odata.nextLink and dedupes by object id", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(ok({ value: [{ id: "a", displayName: "A", mail: "a@x.com", userPrincipalName: "a@x.com" }], "@odata.nextLink": "https://graph.microsoft.com/next" }))
+      .mockResolvedValueOnce(ok({ value: [{ id: "b", displayName: "B", mail: "b@x.com", userPrincipalName: "b@x.com" }, { id: "a", displayName: "A dup", mail: "a@x.com", userPrincipalName: "a@x.com" }] }));
+    const users = await fetchUsersByKeys({ token: "t", keys: ["a@x.com", "b@x.com"] }, fetchImpl as unknown as GraphFetch);
+    expect(users.map((u) => u.id)).toEqual(["a", "b"]);
   });
 
-  it("throws on a non-404 error (e.g. 403 missing User.Read.All) so the caller can fall back", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(err(403, "Authorization_RequestDenied"));
-    await expect(fetchUserByUpnOrId({ token: "T", upnOrId: "a@x.com" }, fetchImpl as unknown as GraphFetch)).rejects.toThrow(/graph user failed \(403\)/);
+  it("escapes single quotes in keys (OData) and throws on a non-ok response", async () => {
+    const okFetch = vi.fn().mockResolvedValue(ok({ value: [] }));
+    await fetchUsersByKeys({ token: "t", keys: ["o'brien@x.com"] }, okFetch as unknown as GraphFetch);
+    expect(decodeURIComponent(String(okFetch.mock.calls[0][0]))).toContain("'o''brien@x.com'");
+    const bad = vi.fn().mockResolvedValue(err(403, "Authorization_RequestDenied"));
+    await expect(fetchUsersByKeys({ token: "t", keys: ["a@x.com"] }, bad as unknown as GraphFetch)).rejects.toThrow(/graph users filter failed \(403\)/);
   });
 });
 
-describe("resolveGraphUsers (batch email → object id, keyed by lowercased request)", () => {
-  it("mints one token, resolves each email, dedupes keys, and skips 404s", async () => {
+describe("resolveGraphUsers (one batched request for misses, keyed by lowercased request, cached)", () => {
+  it("mints one token + ONE batched request, keys the map by lowercased request, dedupes case-insensitively", async () => {
     const fetchImpl = vi
       .fn()
       .mockResolvedValueOnce(ok({ access_token: "TT", expires_in: 3600 })) // token (once)
-      .mockResolvedValueOnce(ok({ id: "o1", displayName: "One", mail: "one@x.com", userPrincipalName: "one@x.com" }))
-      .mockResolvedValueOnce(err(404, "not found")); // second email → no user
+      .mockResolvedValueOnce(ok({ value: [{ id: "o1", displayName: "One", mail: "one@x.com", userPrincipalName: "one@x.com" }] })); // batch (once)
     const map = await resolveGraphUsers({ tenantId: "t", clientId: "c", clientSecret: "s", keys: ["One@x.com", "one@x.com", "ghost@x.com"] }, fetchImpl as unknown as GraphFetch);
     expect(map.get("one@x.com")?.id).toBe("o1");
-    expect(map.has("ghost@x.com")).toBe(false);
-    const tokenCalls = fetchImpl.mock.calls.filter(([u]) => String(u).includes("/oauth2/v2.0/token"));
-    expect(tokenCalls).toHaveLength(1); // one token for the whole batch
+    expect(map.has("ghost@x.com")).toBe(false); // no match in the batch → left unresolved (not fabricated)
+    expect(fetchImpl).toHaveBeenCalledTimes(2); // 1 token + 1 batched users request (NOT N+1)
   });
 
-  it("on a 401 mid-batch, drops the token and retries the batch once with a fresh one", async () => {
+  it("resolves a key by mail even when it differs from the UPN (the /users/{email} 404 bug)", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(ok({ access_token: "TT", expires_in: 3600 }))
+      .mockResolvedValueOnce(ok({ value: [{ id: "ox", displayName: "Biz", mail: "business@dexwox.com", userPrincipalName: "b.yuvaraj@dexwox.com" }] }));
+    const map = await resolveGraphUsers({ tenantId: "t", clientId: "c", clientSecret: "s", keys: ["business@dexwox.com"] }, fetchImpl as unknown as GraphFetch);
+    expect(map.get("business@dexwox.com")?.id).toBe("ox"); // matched by mail, not UPN
+  });
+
+  it("serves a repeat request from the per-tenant cache (no second token or Graph call)", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(ok({ access_token: "TT", expires_in: 3600 }))
+      .mockResolvedValueOnce(ok({ value: [{ id: "o1", displayName: "One", mail: "one@x.com", userPrincipalName: "one@x.com" }] }));
+    const input = { tenantId: "t", clientId: "c", clientSecret: "s", keys: ["one@x.com"] };
+    await resolveGraphUsers(input, fetchImpl as unknown as GraphFetch);
+    const again = await resolveGraphUsers(input, fetchImpl as unknown as GraphFetch);
+    expect(again.get("one@x.com")?.id).toBe("o1");
+    expect(fetchImpl).toHaveBeenCalledTimes(2); // still just the first run's 2 calls — second served from cache
+  });
+
+  it("on a 401 from the batch, drops the token and retries once with a fresh one", async () => {
     const fetchImpl = vi
       .fn()
       .mockResolvedValueOnce(ok({ access_token: "T1", expires_in: 3600 })) // token 1
-      .mockResolvedValueOnce(err(401, "expired")) // user read → 401
+      .mockResolvedValueOnce(err(401, "expired")) // batch → 401
       .mockResolvedValueOnce(ok({ access_token: "T2", expires_in: 3600 })) // token 2
-      .mockResolvedValueOnce(ok({ id: "o", displayName: "U", mail: "u@x.com", userPrincipalName: "u@x.com" }));
+      .mockResolvedValueOnce(ok({ value: [{ id: "o", displayName: "U", mail: "u@x.com", userPrincipalName: "u@x.com" }] }));
     const map = await resolveGraphUsers({ tenantId: "t", clientId: "c", clientSecret: "s", keys: ["u@x.com"] }, fetchImpl as unknown as GraphFetch);
     expect(map.get("u@x.com")?.id).toBe("o");
     expect(fetchImpl.mock.calls[3][1].headers.authorization).toBe("Bearer T2");

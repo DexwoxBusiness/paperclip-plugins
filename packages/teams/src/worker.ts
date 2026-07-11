@@ -19,7 +19,8 @@ import { buildAskCancelledCard, formatAskResponse, type AskField, type AskReques
 import { createAskStore, type AskStoreBackend } from "./ask-store.js";
 import { createChannelStore, type ChannelStoreBackend } from "./channel-store.js";
 import { TEAMS_AGENT_TOOLS, toolRuntimeDecl } from "./agent-tool-declarations.js";
-import { buildAnnouncementCard, buildChannelClosedCard, buildChannelPromptCard, normalizeMembers, type ChannelPost, type ChannelResponse } from "./channel.js";
+import { createRosterCache } from "./roster-cache.js";
+import { buildAnnouncementCard, buildChannelClosedCard, buildChannelPromptCard, normalizeMembers, resolveChannelMentions, type ChannelMention, type ChannelPost, type ChannelResponse } from "./channel.js";
 import { createApprovalsClient, extractDecidedApprovalRef, type ApprovalFetch } from "./approvals.js";
 import { createApprovalStore } from "./approval-store.js";
 import { toWorkflowsMessage } from "./adaptive-card.js";
@@ -39,6 +40,10 @@ import {
   extractCostCents,
   type RawPluginEvent,
 } from "./event-adapters.js";
+
+// Worker-lifetime roster cache (one out-of-process worker per plugin), shared by post_to_channel's
+// @-mention resolution and the list_channel_members tool so a channel isn't re-paged on every post.
+const rosterCache = createRosterCache();
 
 /**
  * Microsoft Teams Chat OS worker.
@@ -766,7 +771,31 @@ const teamsPlugin = definePlugin({
           log("teams post_to_channel: bot not configured", { error: e instanceof Error ? e.message : String(e) });
           return { content: JSON.stringify({ posted: false, reason: "bot not configured", postId: post.id }) };
         }
-        const card = collect ? buildChannelPromptCard(post) : buildAnnouncementCard(text, { heading: typeof p.heading === "string" ? p.heading : undefined });
+        // Optional real @-mentions: resolve the requested people (emails or member ids) against the
+        // live channel roster so Teams actually notifies them. Only reads the roster when mentions are
+        // requested; a roster-read failure degrades to posting WITHOUT mentions (never blocks the post),
+        // and unresolved names are reported back so the agent knows who it couldn't ping.
+        let mentions: ChannelMention[] = [];
+        let unresolvedMentions: string[] = [];
+        let skippedMentions: string[] = [];
+        let duplicateMentions: string[] = [];
+        const requestedMentions = Array.isArray(p.mentions) ? (p.mentions as unknown[]).map((x) => String(x ?? "").trim()).filter(Boolean) : [];
+        if (requestedMentions.length > 0) {
+          try {
+            const roster = await rosterCache.get(channelRef, () => bot.listChannelMembers(channelRef));
+            const resolvedMentions = resolveChannelMentions(roster, requestedMentions);
+            mentions = resolvedMentions.resolved;
+            unresolvedMentions = resolvedMentions.unresolved;
+            skippedMentions = resolvedMentions.skipped;
+            duplicateMentions = resolvedMentions.duplicate;
+          } catch (e) {
+            log("teams post_to_channel: mention resolve failed", { error: e instanceof Error ? e.message : String(e) });
+            unresolvedMentions = requestedMentions; // couldn't read the roster → nothing resolved (still post)
+          }
+        }
+        const card = collect
+          ? buildChannelPromptCard(post, { mentions })
+          : buildAnnouncementCard(text, { heading: typeof p.heading === "string" ? p.heading : undefined, mentions });
         // Post the card FIRST; only persist a collecting post once it actually landed (post-before-create,
         // like ask/escalation). An announcement has nothing to collect, so it is never persisted.
         const ref = await bot.postChannelCard(channelRef, card);
@@ -781,7 +810,17 @@ const teamsPlugin = definePlugin({
         await ctx.activity
           .log({ companyId, message: `Posted to a Teams channel${collect ? " (collecting replies)" : ""}`, entityType: "plugin", entityId: post.id })
           .catch(() => undefined);
-        return { content: JSON.stringify({ posted: true, postId: post.id, collecting: collect }) };
+        return {
+          content: JSON.stringify({
+            posted: true,
+            postId: post.id,
+            collecting: collect,
+            mentioned: mentions.map((m) => m.name),
+            ...(unresolvedMentions.length ? { unresolvedMentions } : {}),
+            ...(skippedMentions.length ? { skippedMentions } : {}),
+            ...(duplicateMentions.length ? { duplicateMentions } : {}),
+          }),
+        };
       },
     );
 
@@ -850,7 +889,7 @@ const teamsPlugin = definePlugin({
           log("teams list_channel_members: bot not configured", { error: e instanceof Error ? e.message : String(e) });
           return { content: JSON.stringify({ members: [], reason: "bot not configured" }) };
         }
-        const members = normalizeMembers(await bot.listChannelMembers(channelRef));
+        const members = normalizeMembers(await rosterCache.get(channelRef, () => bot.listChannelMembers(channelRef)));
         return { content: JSON.stringify({ members }) };
       },
     );

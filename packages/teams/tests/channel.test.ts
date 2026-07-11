@@ -7,8 +7,10 @@ import {
   CHANNEL_DEFAULT_FIELD_ID,
   effectiveChannelFields,
   MAX_CHANNEL_FIELDS,
+  MAX_MENTIONS,
   normalizeMembers,
   parseChannelSubmit,
+  resolveChannelMentions,
   type ChannelPost,
 } from "../src/channel.js";
 
@@ -108,5 +110,102 @@ describe("parseChannelSubmit", () => {
     expect(parseChannelSubmit({ pcAction: "chpost", postId: "chpost-1", f_a: "   " })).toBeNull(); // nothing non-empty
     expect(parseChannelSubmit(null)).toBeNull();
     expect(parseChannelSubmit("nope")).toBeNull();
+  });
+});
+
+// A roster row as the Teams connector returns it: a 29: member id + an Entra id + email.
+const roster = [
+  { id: "29:diwakar", aadObjectId: "aad-diwakar", name: "Diwakar MA", email: "Diwakar.MA@dexwox.com" },
+  { id: "29:ferin", aadObjectId: "aad-ferin", name: "Ferin C", userPrincipalName: "ferin.c@dexwox.com" },
+  { id: "29:guest", name: "External Guest" }, // no email / aad — still mentionable by 29: id
+];
+
+describe("resolveChannelMentions", () => {
+  it("matches by email case-insensitively and mentions by the 29: member id", () => {
+    const { resolved, unresolved } = resolveChannelMentions(roster, ["diwakar.ma@DEXWOX.com"]);
+    expect(unresolved).toEqual([]);
+    expect(resolved).toEqual([{ id: "29:diwakar", name: "Diwakar MA" }]);
+  });
+
+  it("matches by UPN, by Entra object id, and by the 29: id", () => {
+    expect(resolveChannelMentions(roster, ["ferin.c@dexwox.com"]).resolved[0].id).toBe("29:ferin");
+    expect(resolveChannelMentions(roster, ["aad-diwakar"]).resolved[0].id).toBe("29:diwakar");
+    expect(resolveChannelMentions(roster, ["29:guest"]).resolved[0]).toEqual({ id: "29:guest", name: "External Guest" });
+  });
+
+  it("reports unknown people as unresolved (never fabricates a mention)", () => {
+    const { resolved, unresolved } = resolveChannelMentions(roster, ["nobody@dexwox.com", "ferin.c@dexwox.com"]);
+    expect(resolved.map((m) => m.id)).toEqual(["29:ferin"]);
+    expect(unresolved).toEqual(["nobody@dexwox.com"]);
+  });
+
+  it("collapses duplicate requests (email + id) into one mention and surfaces the repeats", () => {
+    const { resolved, duplicate } = resolveChannelMentions(roster, ["diwakar.ma@dexwox.com", "aad-diwakar", "29:diwakar"]);
+    expect(resolved).toEqual([{ id: "29:diwakar", name: "Diwakar MA" }]); // pinged once
+    expect(duplicate).toEqual(["aad-diwakar", "29:diwakar"]); // the 2nd + 3rd requests for the same person, accounted not dropped
+  });
+
+  it("returns everything unresolved when the roster is unreadable (non-array)", () => {
+    expect(resolveChannelMentions(null, ["x@y.com"])).toEqual({ resolved: [], unresolved: ["x@y.com"], skipped: [], duplicate: [] });
+    expect(resolveChannelMentions(undefined, [])).toEqual({ resolved: [], unresolved: [], skipped: [], duplicate: [] });
+  });
+
+  it("every requested entry lands in exactly one bucket (resolved | unresolved | skipped | duplicate)", () => {
+    const req = ["diwakar.ma@dexwox.com", "29:diwakar", "nobody@x.com", "ferin.c@dexwox.com"];
+    const { resolved, unresolved, skipped, duplicate } = resolveChannelMentions(roster, req);
+    expect(resolved.length + unresolved.length + skipped.length + duplicate.length).toBe(req.length);
+  });
+
+  it("caps at MAX_MENTIONS and surfaces the overflow as skipped (never silently dropped)", () => {
+    const big = Array.from({ length: MAX_MENTIONS + 5 }, (_, i) => ({ id: `29:u${i}`, email: `u${i}@x.com`, name: `U${i}` }));
+    const req = big.map((m) => m.email);
+    const { resolved, unresolved, skipped } = resolveChannelMentions(big, req);
+    expect(resolved).toHaveLength(MAX_MENTIONS);
+    expect(skipped).toHaveLength(5);
+    expect(unresolved).toEqual([]);
+    // Every requested valid member is accounted for — pinged or skipped, none dropped.
+    expect(resolved.length + skipped.length).toBe(req.length);
+    // The skipped entries are exactly the overflow requests (the last 5).
+    expect(skipped).toEqual(req.slice(MAX_MENTIONS));
+  });
+});
+
+describe("channel cards with @-mentions", () => {
+  const mentions = [
+    { id: "29:diwakar", name: "Diwakar MA" },
+    { id: "29:ferin", name: "Ferin C" },
+  ];
+
+  it("announcement card renders <at> runs + matching msteams.entities and stays valid", () => {
+    const card = buildAnnouncementCard("Hi team", { mentions });
+    expect(validateAdaptiveCard(card).ok).toBe(true);
+    // one entity per mention, each mentioning the correct id
+    expect(card.msteams?.entities).toEqual([
+      { type: "mention", text: "<at>Diwakar MA</at>", mentioned: { id: "29:diwakar", name: "Diwakar MA" } },
+      { type: "mention", text: "<at>Ferin C</at>", mentioned: { id: "29:ferin", name: "Ferin C" } },
+    ]);
+    // the entity.text must appear byte-identical in a body TextBlock (Teams requires the exact match)
+    const cc = card.body.find((b) => typeof b.text === "string" && (b.text as string).startsWith("cc:"));
+    expect(cc?.text).toBe("cc: <at>Diwakar MA</at> <at>Ferin C</at>");
+  });
+
+  it("prompt card keeps its inputs + Send and adds the mention line + entities", () => {
+    const card = buildChannelPromptCard(post(), { mentions });
+    expect(validateAdaptiveCard(card).ok).toBe(true);
+    expect(card.actions?.[0]).toMatchObject({ type: "Action.Submit", title: "Send" });
+    expect(card.body.some((b) => b.type === "Input.Text")).toBe(true);
+    expect(card.msteams?.entities).toHaveLength(2);
+  });
+
+  it("no mentions → no entities (unchanged, backward-compatible card)", () => {
+    expect(buildAnnouncementCard("Hi", {}).msteams?.entities).toBeUndefined();
+    expect(buildChannelPromptCard(post()).msteams?.entities).toBeUndefined();
+    expect(buildAnnouncementCard("Hi", { mentions: [] }).msteams?.entities).toBeUndefined();
+  });
+
+  it("strips angle brackets from a display name so a crafted name can't break the <at> tag", () => {
+    const card = buildAnnouncementCard("hi", { mentions: [{ id: "29:x", name: "Ev<il>Name" }] });
+    expect(card.msteams?.entities?.[0]).toEqual({ type: "mention", text: "<at>EvilName</at>", mentioned: { id: "29:x", name: "EvilName" } });
+    expect(validateAdaptiveCard(card).ok).toBe(true);
   });
 });

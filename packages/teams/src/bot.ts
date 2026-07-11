@@ -50,7 +50,7 @@ type Activity = Parameters<TurnContext["updateActivity"]>[0];
 // `express`); derive the exact type CloudAdapter.process expects for our shims.
 type AdapterResponse = Parameters<CloudAdapter["process"]>[1];
 import { assertBotClaims, assertServiceUrl, BotInboundUnauthorizedError, extractBearerToken, type AuthDecision, type BotTokenClaims, type InboundAuthConfig } from "./bot-auth.js";
-import { conversationKey, isPersonalConversationRef, type ConversationRef, type ConversationStore } from "./bot-conversations.js";
+import { conversationKey, isPersonalConversationRef, resolveInboundChannelData, type ConversationRef, type ConversationStore } from "./bot-conversations.js";
 import { readTeamRoster } from "./graph-members.js";
 import {
   buildApprovalCard,
@@ -284,7 +284,23 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     // wipe the id. The merge runs INSIDE the store's lock (atomic read-modify-write, single blob read)
     // so concurrent inbound turns can't lose the earlier capture.
     const incoming = (context.activity as { channelData?: unknown }).channelData;
-    const incomingCd = incoming && typeof incoming === "object" ? (incoming as ConversationRef["channelData"]) : undefined;
+    const rawCd = incoming && typeof incoming === "object" ? (incoming as ConversationRef["channelData"]) : undefined;
+    // Resolve the team's AAD group id on the real inbound turn: a channel message activity's channelData
+    // does not reliably include team.aadGroupId (botframework-sdk#5870), and getTeamDetails needs a live
+    // TurnContext (a Connector HTTP call) — so it cannot run from the tool path. See resolveInboundChannelData.
+    // Only resolve when it's an as-yet-uncaptured team turn: skip the Connector call when the incoming
+    // channelData already carries the id OR a PRIOR turn already captured it onto the stored ref, so
+    // steady-state message/submit handling isn't slowed by an HTTP round-trip on every turn (Codex P2).
+    // The stored-ref check is a single cheap state-blob read; the merge below still preserves the id.
+    let incomingCd = rawCd;
+    const needsGroupId = !!rawCd?.team?.id?.trim() && !rawCd?.team?.aadGroupId?.trim();
+    if (needsGroupId && !(await deps.conversations.get(key))?.reference.channelData?.team?.aadGroupId?.trim()) {
+      incomingCd = await resolveInboundChannelData(rawCd, async (teamId) => {
+        const teamsInfo = TeamsInfo as unknown as { getTeamDetails(c: TurnContext, teamId?: string): Promise<{ aadGroupId?: string } | undefined> };
+        const details = await teamsInfo.getTeamDetails(context, teamId);
+        return details?.aadGroupId;
+      });
+    }
     await deps.conversations.remember(reference, (existing) => {
       const priorCd = existing?.reference.channelData;
       if (!incomingCd && !priorCd) return reference;
@@ -702,11 +718,16 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
       // is not blocked). A missing id → the ref predates channelData capture; a fresh @mention re-adds it.
       let groupId = conv.reference.channelData?.team?.aadGroupId?.trim();
       if (!groupId) {
+        // Fallback for refs captured before aadGroupId resolution: retry getTeamDetails proactively,
+        // passing the stored team id explicitly (a continueConversation context has no team info on its
+        // synthetic activity, so getTeamDetails(ctx) with no teamId resolves nothing). The primary path
+        // is resolveInboundChannelData on the inbound turn; this only heals older stored refs.
+        const storedTeamId = conv.reference.channelData?.team?.id?.trim();
         let fetched: string | undefined;
         try {
           await adapter.continueConversation(deps.botAppId, conv.reference as never, async (ctx) => {
-            const teamsInfo = TeamsInfo as unknown as { getTeamDetails(c: typeof ctx): Promise<{ aadGroupId?: string } | undefined> };
-            const details = await teamsInfo.getTeamDetails(ctx);
+            const teamsInfo = TeamsInfo as unknown as { getTeamDetails(c: typeof ctx, teamId?: string): Promise<{ aadGroupId?: string } | undefined> };
+            const details = await teamsInfo.getTeamDetails(ctx, storedTeamId);
             fetched = details?.aadGroupId?.trim();
           });
         } catch (e) {

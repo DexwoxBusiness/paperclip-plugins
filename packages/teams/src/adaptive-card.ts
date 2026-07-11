@@ -36,13 +36,25 @@ export interface CardAction {
   [key: string]: unknown;
 }
 
+/**
+ * A Teams user-mention entity carried in an Adaptive Card's `msteams.entities` (the documented way
+ * to @-mention inside a bot-posted Adaptive Card). `text` MUST exactly equal the `<at>…</at>` run in
+ * a TextBlock, and `mentioned.id` is the user's Teams id — the `29:…` member id, or (now supported
+ * for bots) their Entra Object ID / UPN.
+ */
+export interface MsTeamsMentionEntity {
+  type: "mention";
+  text: string;
+  mentioned: { id: string; name: string };
+}
+
 export interface AdaptiveCard {
   $schema: string;
   type: "AdaptiveCard";
   version: string;
   body: CardElement[];
   actions?: CardAction[];
-  msteams?: { width?: string };
+  msteams?: { width?: string; entities?: MsTeamsMentionEntity[] };
 }
 
 /** The Workflows webhook message envelope (bare cards are 400'd). */

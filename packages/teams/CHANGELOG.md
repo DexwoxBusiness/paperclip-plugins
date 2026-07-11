@@ -1,5 +1,11 @@
 # @dexwox-labs/paperclip-plugin-teams
 
+## 0.8.1
+
+### Patch Changes
+
+- [#39](https://github.com/DexwoxBusiness/paperclip-plugins/pull/39) [`c03ea85`](https://github.com/DexwoxBusiness/paperclip-plugins/commit/c03ea85fa5bf6d50786488a6918b86f05447ac3f) Thanks [@DexwoxBusiness](https://github.com/DexwoxBusiness)! - Changeset contains exposure of teams plugin commands to the agents for HITL
+
 ## 0.7.0
 
 ### Minor Changes

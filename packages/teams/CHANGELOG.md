@@ -1,5 +1,11 @@
 # @dexwox-labs/paperclip-plugin-teams
 
+## 0.11.0
+
+### Minor Changes
+
+- [#48](https://github.com/DexwoxBusiness/paperclip-plugins/pull/48) [`db94a32`](https://github.com/DexwoxBusiness/paperclip-plugins/commit/db94a32df947c7df13a6c2a827f40d3fbcce5cbd) Thanks [@DexwoxBusiness](https://github.com/DexwoxBusiness)! - Fixes for @-mentions in teams
+
 ## 0.10.0
 
 ### Minor Changes

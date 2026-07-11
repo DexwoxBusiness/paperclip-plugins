@@ -51,7 +51,7 @@ type Activity = Parameters<TurnContext["updateActivity"]>[0];
 type AdapterResponse = Parameters<CloudAdapter["process"]>[1];
 import { assertBotClaims, assertServiceUrl, BotInboundUnauthorizedError, extractBearerToken, type AuthDecision, type BotTokenClaims, type InboundAuthConfig } from "./bot-auth.js";
 import { conversationKey, isPersonalConversationRef, resolveInboundChannelData, type ConversationRef, type ConversationStore } from "./bot-conversations.js";
-import { readTeamRoster } from "./graph-members.js";
+import { readTeamRoster, resolveGraphUsers } from "./graph-members.js";
 import {
   buildApprovalCard,
   buildApprovalErrorCard,
@@ -73,7 +73,7 @@ import {
   type EscalationRecord,
 } from "./escalation.js";
 import { buildAskAnsweredCard, buildAskCard, parseAskSubmit, type AskRequest } from "./ask.js";
-import { parseChannelSubmit, type ChannelResponse } from "./channel.js";
+import { parseChannelSubmit, resolveMentionsFromLookup, type ChannelMention, type ChannelResponse } from "./channel.js";
 import { type AdaptiveCard } from "./adaptive-card.js";
 
 export interface TeamsBotDeps {
@@ -151,6 +151,14 @@ export interface TeamsBot {
   updateAskCard(ref: { conversationReference: unknown; activityId: string }, card: AdaptiveCard): Promise<void>;
   /** Read a channel's roster (paged) via the Teams connector. Returns raw members ([] if unreachable). (T13) */
   listChannelMembers(channelRef: string): Promise<unknown[]>;
+  /**
+   * Resolve requested people (emails/UPNs or ids) to real Teams @-mentions. Emails resolve via Graph
+   * `GET /users/{email}` → Entra object id — the DIRECT path that needs no team roster / aadGroupId.
+   * When Graph is unavailable (no User.Read.All grant / lookup error) an email falls back to a UPN
+   * mention (bots support UPN mention ids); a non-email token is used as a literal id. Returns the
+   * resolved/unresolved/skipped/duplicate buckets so the caller never hides an un-pinged person. (T13)
+   */
+  resolveMentions(requested: readonly string[]): Promise<{ resolved: ChannelMention[]; unresolved: string[]; skipped: string[]; duplicate: string[] }>;
   /** Post a card to a channel; returns its ref (conversation ref + activity id), or null if unreachable. (T13) */
   postChannelCard(channelRef: string, card: AdaptiveCard): Promise<{ conversationReference: unknown; activityId: string } | null>;
   /** Proactively update a stored channel card (e.g. to its closed state). (T13) */
@@ -755,6 +763,38 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
         deps.log("teams list-members failed (graph)", { channelRef, error: e instanceof Error ? e.message : String(e) });
         return [];
       }
+    },
+    // T13: resolve requested people to @-mentions WITHOUT the team roster/aadGroupId. Emails resolve via
+    // Graph GET /users/{email} → Entra object id; that object id is a valid bot mention id. When Graph
+    // can't run (no User.Read.All grant, or a lookup error), an email falls back to a UPN mention (bots
+    // accept the UPN as a mention id) so mentions still work; a non-email token is used as a literal id.
+    async resolveMentions(requested) {
+      const cleaned = Array.from(requested, (r) => String(r ?? "").trim()).filter(Boolean);
+      if (cleaned.length === 0) return { resolved: [], unresolved: [], skipped: [], duplicate: [] };
+      const auth = deps.authConfig as { tenantId?: string; clientSecret?: string };
+      const tenantId = (auth.tenantId ?? "").trim();
+      const emails = cleaned.filter((r) => r.includes("@"));
+      const canGraph = emails.length > 0 && !!tenantId && !!deps.botAppId && !!(auth.clientSecret ?? "").trim();
+      let found = new Map<string, { id: string; name: string; email: string; upn: string }>();
+      let graphAttempted = false;
+      if (canGraph) {
+        try {
+          found = await resolveGraphUsers({ tenantId, clientId: deps.botAppId, clientSecret: auth.clientSecret ?? "", keys: emails });
+          graphAttempted = true; // Graph answered — an email miss is a genuine "no such user" (→ unresolved)
+        } catch (e) {
+          // e.g. 403 (User.Read.All not yet consented) or a transient error → fall back to UPN mentions.
+          deps.log("teams resolveMentions: graph user lookup failed (falling back to UPN)", { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      return resolveMentionsFromLookup(cleaned, (key) => {
+        const hit = found.get(key);
+        if (hit) return { id: hit.id, name: hit.name };
+        if (key.includes("@")) {
+          if (graphAttempted) return undefined; // Graph ran and didn't find them → honest "unresolved"
+          return { id: key, name: key.split("@")[0] || key }; // no Graph → UPN mention (best effort)
+        }
+        return { id: key, name: key }; // literal id (Entra object id / 29:) passthrough
+      });
     },
     // T13: post a card to a channel (proactive continueConversation) and return its ref so the worker
     // can store it for a later close. null when the channel is unknown or the send fails.

@@ -173,6 +173,83 @@ const defaultGraphFetch: GraphFetch = (url, init) =>
     ) => Promise<{ ok: boolean; status: number; json(): Promise<unknown>; text(): Promise<string> }>
   )(url, init);
 
+// -------------------------------------------------------------------------------------------------
+// Resolve people by email/UPN → their Entra object id (for @-mentions). This is the DIRECT path that
+// makes the team-roster read (and thus team.aadGroupId) unnecessary for mentions: Microsoft documents
+// that a bot can @-mention by Entra Object ID or UPN in an Adaptive Card, and Graph GET /users/{email}
+// returns that object id in the default property set. Authorized by the app-only Graph permission
+// User.Read.All (or User.ReadBasic.All) — a tenant grant, not the RSC/roster path.
+//   https://learn.microsoft.com/graph/api/user-get
+// -------------------------------------------------------------------------------------------------
+
+/** A person resolved from Graph: their Entra object id + display name + email/UPN (lowercased email). */
+export interface GraphUser {
+  /** Entra object id — a valid Adaptive Card mention id for bots. */
+  id: string;
+  name: string;
+  /** Lowercased mail (falls back to UPN); "" when Graph omits both. */
+  email: string;
+  /** userPrincipalName (also a valid bot mention id). */
+  upn: string;
+}
+
+/** Look up ONE user by email/UPN or object id. Returns null on 404 (no such user → caller buckets it
+ * as unresolved); throws GraphMembersError on other non-ok (e.g. 403 missing permission) so the caller
+ * can fall back. */
+export async function fetchUserByUpnOrId(
+  input: { token: string; upnOrId: string; timeoutMs?: number },
+  fetchImpl: GraphFetch,
+): Promise<GraphUser | null> {
+  const key = (input.upnOrId ?? "").trim();
+  if (!key) return null;
+  const url = `${GRAPH}/users/${encodeURIComponent(key)}?$select=id,displayName,mail,userPrincipalName`;
+  const res = await fetchImpl(url, { method: "GET", headers: { authorization: `Bearer ${input.token}` }, signal: timeoutSignal(input.timeoutMs) });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const detail = (await res.text().catch(() => "")).slice(0, 300);
+    throw new GraphMembersError(`graph user failed (${res.status}) for ${key}: ${detail}`, res.status);
+  }
+  const u = (await res.json()) as { id?: unknown; displayName?: unknown; mail?: unknown; userPrincipalName?: unknown };
+  const id = String(u.id ?? "").trim();
+  if (!id) return null;
+  const upn = String(u.userPrincipalName ?? "").trim();
+  const email = String(u.mail ?? upn ?? "").trim().toLowerCase();
+  const name = String(u.displayName ?? "").trim() || email || upn || id;
+  return { id, name, email, upn };
+}
+
+/**
+ * Resolve a batch of email/UPN keys to {@link GraphUser}s, keyed by the LOWERCASED requested key. Mints
+ * the app token once (cached), dedupes keys, skips 404s. On a 401 the token is dropped and the batch
+ * retried once with a fresh one (a token that expired mid-batch). A non-401 failure (e.g. 403 missing
+ * User.Read.All) throws so the caller can fall back to a UPN mention.
+ */
+export async function resolveGraphUsers(
+  input: { tenantId: string; clientId: string; clientSecret: string; keys: readonly string[]; timeoutMs?: number },
+  fetchImpl: GraphFetch = defaultGraphFetch,
+): Promise<Map<string, GraphUser>> {
+  const keys = Array.from(new Set((input.keys ?? []).map((k) => String(k ?? "").trim()).filter(Boolean)));
+  const out = new Map<string, GraphUser>();
+  if (keys.length === 0) return out;
+  const runOnce = async (): Promise<void> => {
+    out.clear();
+    const token = await getAppToken(input, fetchImpl);
+    for (const key of keys) {
+      const user = await fetchUserByUpnOrId({ token, upnOrId: key, timeoutMs: input.timeoutMs }, fetchImpl);
+      if (user) out.set(key.toLowerCase(), user);
+    }
+  };
+  try {
+    await runOnce();
+  } catch (e) {
+    if (e instanceof GraphMembersError && e.status === 401) {
+      tokenCache.delete(tokenKey((input.tenantId ?? "").trim(), input.clientId));
+      await runOnce();
+    } else throw e;
+  }
+  return out;
+}
+
 /**
  * Token (cached) + members in one call. `fetchImpl` defaults to native fetch (present in the Node
  * worker). On a 401 from the member read, the cached token is dropped and the read retried once with

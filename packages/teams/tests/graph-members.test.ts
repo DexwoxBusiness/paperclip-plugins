@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { _resetGraphTokenCache, fetchGraphAppToken, fetchTeamMembers, readTeamRoster, type GraphFetch } from "../src/graph-members.js";
+import { _resetGraphTokenCache, fetchGraphAppToken, fetchTeamMembers, fetchUserByUpnOrId, readTeamRoster, resolveGraphUsers, type GraphFetch } from "../src/graph-members.js";
 
 const ok = (json: unknown) => ({ ok: true, status: 200, json: async () => json, text: async () => JSON.stringify(json) });
 const err = (status: number, body: unknown) => ({
@@ -82,6 +82,61 @@ describe("fetchTeamMembers", () => {
     await expect(fetchTeamMembers({ groupId: "g", token: "t" }, fetchImpl as unknown as GraphFetch)).rejects.toThrow(
       /graph members failed \(403\).*Forbidden/,
     );
+  });
+});
+
+describe("fetchUserByUpnOrId (email/UPN → Entra object id for @-mentions)", () => {
+  it("maps id/displayName/mail/upn and lowercases email; selects only the needed props", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(ok({ id: "obj-1", displayName: "Business Dexwox", mail: "Business@Dexwox.com", userPrincipalName: "business@dexwox.com" }));
+    const u = await fetchUserByUpnOrId({ token: "T", upnOrId: "business@dexwox.com" }, fetchImpl as unknown as GraphFetch);
+    expect(u).toEqual({ id: "obj-1", name: "Business Dexwox", email: "business@dexwox.com", upn: "business@dexwox.com" });
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toContain("graph.microsoft.com/v1.0/users/business%40dexwox.com");
+    expect(url).toContain("$select=id,displayName,mail,userPrincipalName");
+    expect(init.headers.authorization).toBe("Bearer T");
+  });
+
+  it("returns null on 404 (no such user) — caller buckets it as unresolved, not an error", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(err(404, { error: { code: "Request_ResourceNotFound" } }));
+    expect(await fetchUserByUpnOrId({ token: "T", upnOrId: "ghost@x.com" }, fetchImpl as unknown as GraphFetch)).toBeNull();
+  });
+
+  it("throws on a non-404 error (e.g. 403 missing User.Read.All) so the caller can fall back", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(err(403, "Authorization_RequestDenied"));
+    await expect(fetchUserByUpnOrId({ token: "T", upnOrId: "a@x.com" }, fetchImpl as unknown as GraphFetch)).rejects.toThrow(/graph user failed \(403\)/);
+  });
+});
+
+describe("resolveGraphUsers (batch email → object id, keyed by lowercased request)", () => {
+  it("mints one token, resolves each email, dedupes keys, and skips 404s", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(ok({ access_token: "TT", expires_in: 3600 })) // token (once)
+      .mockResolvedValueOnce(ok({ id: "o1", displayName: "One", mail: "one@x.com", userPrincipalName: "one@x.com" }))
+      .mockResolvedValueOnce(err(404, "not found")); // second email → no user
+    const map = await resolveGraphUsers({ tenantId: "t", clientId: "c", clientSecret: "s", keys: ["One@x.com", "one@x.com", "ghost@x.com"] }, fetchImpl as unknown as GraphFetch);
+    expect(map.get("one@x.com")?.id).toBe("o1");
+    expect(map.has("ghost@x.com")).toBe(false);
+    const tokenCalls = fetchImpl.mock.calls.filter(([u]) => String(u).includes("/oauth2/v2.0/token"));
+    expect(tokenCalls).toHaveLength(1); // one token for the whole batch
+  });
+
+  it("on a 401 mid-batch, drops the token and retries the batch once with a fresh one", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(ok({ access_token: "T1", expires_in: 3600 })) // token 1
+      .mockResolvedValueOnce(err(401, "expired")) // user read → 401
+      .mockResolvedValueOnce(ok({ access_token: "T2", expires_in: 3600 })) // token 2
+      .mockResolvedValueOnce(ok({ id: "o", displayName: "U", mail: "u@x.com", userPrincipalName: "u@x.com" }));
+    const map = await resolveGraphUsers({ tenantId: "t", clientId: "c", clientSecret: "s", keys: ["u@x.com"] }, fetchImpl as unknown as GraphFetch);
+    expect(map.get("u@x.com")?.id).toBe("o");
+    expect(fetchImpl.mock.calls[3][1].headers.authorization).toBe("Bearer T2");
+  });
+
+  it("returns an empty map for no keys (no token round-trip)", async () => {
+    const fetchImpl = vi.fn();
+    expect((await resolveGraphUsers({ tenantId: "t", clientId: "c", clientSecret: "s", keys: [] }, fetchImpl as unknown as GraphFetch)).size).toBe(0);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 

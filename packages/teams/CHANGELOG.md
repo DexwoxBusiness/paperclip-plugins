@@ -1,5 +1,11 @@
 # @dexwox-labs/paperclip-plugin-teams
 
+## 0.12.0
+
+### Minor Changes
+
+- [#51](https://github.com/DexwoxBusiness/paperclip-plugins/pull/51) [`29ad2cc`](https://github.com/DexwoxBusiness/paperclip-plugins/commit/29ad2cc47a4d8b7b4c1aee80f33fa1caac1fd3a7) Thanks [@DexwoxBusiness](https://github.com/DexwoxBusiness)! - Using graph for fetching @-mention users
+
 ## 0.11.0
 
 ### Minor Changes

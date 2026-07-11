@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "dexwox.teams-chatos";
-export const PLUGIN_VERSION = "0.5.0";
+export const PLUGIN_VERSION = "0.8.0";
 
 export const WEBHOOK_KEYS = {
   /** v2 bot messaging endpoint (Teams activities). PCLIP-25 */

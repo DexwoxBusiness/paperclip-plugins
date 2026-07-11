@@ -285,15 +285,22 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     // so concurrent inbound turns can't lose the earlier capture.
     const incoming = (context.activity as { channelData?: unknown }).channelData;
     const rawCd = incoming && typeof incoming === "object" ? (incoming as ConversationRef["channelData"]) : undefined;
-    // Resolve the team's AAD group id NOW, on the real inbound turn: a channel message activity's
-    // channelData does not reliably include team.aadGroupId (botframework-sdk#5870), and getTeamDetails
-    // needs a live TurnContext (Connector HTTP call) — so it cannot run from the tool path. See
-    // resolveInboundChannelData. Failures leave channelData unchanged (retried next turn).
-    const incomingCd = await resolveInboundChannelData(rawCd, async (teamId) => {
-      const teamsInfo = TeamsInfo as unknown as { getTeamDetails(c: TurnContext, teamId?: string): Promise<{ aadGroupId?: string } | undefined> };
-      const details = await teamsInfo.getTeamDetails(context, teamId);
-      return details?.aadGroupId;
-    });
+    // Resolve the team's AAD group id on the real inbound turn: a channel message activity's channelData
+    // does not reliably include team.aadGroupId (botframework-sdk#5870), and getTeamDetails needs a live
+    // TurnContext (a Connector HTTP call) — so it cannot run from the tool path. See resolveInboundChannelData.
+    // Only resolve when it's an as-yet-uncaptured team turn: skip the Connector call when the incoming
+    // channelData already carries the id OR a PRIOR turn already captured it onto the stored ref, so
+    // steady-state message/submit handling isn't slowed by an HTTP round-trip on every turn (Codex P2).
+    // The stored-ref check is a single cheap state-blob read; the merge below still preserves the id.
+    let incomingCd = rawCd;
+    const needsGroupId = !!rawCd?.team?.id?.trim() && !rawCd?.team?.aadGroupId?.trim();
+    if (needsGroupId && !(await deps.conversations.get(key))?.reference.channelData?.team?.aadGroupId?.trim()) {
+      incomingCd = await resolveInboundChannelData(rawCd, async (teamId) => {
+        const teamsInfo = TeamsInfo as unknown as { getTeamDetails(c: TurnContext, teamId?: string): Promise<{ aadGroupId?: string } | undefined> };
+        const details = await teamsInfo.getTeamDetails(context, teamId);
+        return details?.aadGroupId;
+      });
+    }
     await deps.conversations.remember(reference, (existing) => {
       const priorCd = existing?.reference.channelData;
       if (!incomingCd && !priorCd) return reference;

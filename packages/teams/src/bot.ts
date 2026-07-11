@@ -51,6 +51,7 @@ type Activity = Parameters<TurnContext["updateActivity"]>[0];
 type AdapterResponse = Parameters<CloudAdapter["process"]>[1];
 import { assertBotClaims, assertServiceUrl, BotInboundUnauthorizedError, extractBearerToken, type AuthDecision, type BotTokenClaims, type InboundAuthConfig } from "./bot-auth.js";
 import { conversationKey, isPersonalConversationRef, type ConversationRef, type ConversationStore } from "./bot-conversations.js";
+import { readTeamRoster } from "./graph-members.js";
 import {
   buildApprovalCard,
   buildApprovalErrorCard,
@@ -274,6 +275,12 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
   const rememberFrom = async (context: TurnContext): Promise<void> => {
     // getConversationReference() is an instance method on the ACTIVITY (agents-activity).
     const reference = context.activity.getConversationReference() as unknown as ConversationRef;
+    // Capture Teams channelData (esp. team.aadGroupId) onto the stored ref — getConversationReference
+    // does NOT include it, but the Graph roster read (GET /teams/{aadGroupId}/members) needs it. The
+    // bot Connector's getPagedMembers can't return member emails, so channel @-mentions resolve via
+    // Graph, which is keyed by the team's AAD group id available only on an inbound activity.
+    const channelData = (context.activity as { channelData?: unknown }).channelData;
+    if (channelData && typeof channelData === "object") reference.channelData = channelData as ConversationRef["channelData"];
     const key = conversationKey(reference);
     if (key) await deps.conversations.remember(reference);
   };
@@ -662,30 +669,56 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
         await ctx.updateActivity({ type: "message", id: ref.activityId, attachments: [CardFactory.adaptiveCard(card)] } as Activity);
       });
     },
-    // T13: read a channel roster via the Teams connector (TeamsInfo.getPagedMembers), paging the
-    // FULL list via the continuation token. Returns raw members for the caller to normalize; [] when
-    // the channel is unknown or the read fails (never throws — the tool no-ops cleanly).
+    // T13: read a channel roster via Microsoft Graph (GET /teams/{aadGroupId}/members), paging the
+    // FULL list via @odata.nextLink. Graph is required because the Bot Connector's getPagedMembers
+    // omits member email/UPN. Returns raw members ({id,name,email}) for the caller to normalize; []
+    // when the channel/team is unknown or the read fails (never throws — the tool no-ops cleanly).
     async listChannelMembers(channelRef) {
       const conv = await deps.conversations.get(channelRef);
       if (!conv) {
         deps.log("teams list-members skipped: unknown conversation", { channelRef });
         return [];
       }
-      const members: unknown[] = [];
-      try {
-        await adapter.continueConversation(deps.botAppId, conv.reference as never, async (ctx) => {
-          let token: string | undefined;
-          do {
-            const page = (await TeamsInfo.getPagedMembers(ctx, undefined, token)) as { members?: unknown[]; continuationToken?: string };
-            if (Array.isArray(page?.members)) members.push(...page.members);
-            token = page?.continuationToken || undefined;
-          } while (token);
-        });
-      } catch (e) {
-        deps.log("teams list-members failed", { channelRef, error: e instanceof Error ? e.message : String(e) });
+      // Roster read goes through Microsoft GRAPH, not the Bot Connector's getPagedMembers: the
+      // Connector roster omits member email/UPN (documented, and being retired), so email→@mention
+      // resolution is impossible via getPagedMembers. Graph GET /teams/{aadGroupId}/members returns
+      // email + displayName + id, authorized by the RSC TeamMember.Read.Group grant.
+      //
+      // The team's AAD group id keys that call. Prefer the value captured onto the stored ref during
+      // an inbound turn; fall back to getTeamDetails proactively (team metadata, unlike member email,
+      // is not blocked). A missing id → the ref predates channelData capture; a fresh @mention re-adds it.
+      let groupId = conv.reference.channelData?.team?.aadGroupId?.trim();
+      if (!groupId) {
+        let fetched: string | undefined;
+        try {
+          await adapter.continueConversation(deps.botAppId, conv.reference as never, async (ctx) => {
+            const teamsInfo = TeamsInfo as unknown as { getTeamDetails(c: typeof ctx): Promise<{ aadGroupId?: string } | undefined> };
+            const details = await teamsInfo.getTeamDetails(ctx);
+            fetched = details?.aadGroupId?.trim();
+          });
+        } catch (e) {
+          deps.log("teams list-members: getTeamDetails failed", { channelRef, error: e instanceof Error ? e.message : String(e) });
+        }
+        groupId = fetched; // assigned OUTSIDE the closure so the guard below narrows groupId to string
+      }
+      if (!groupId) {
+        deps.log("teams list-members: no team aadGroupId (re-@mention the bot in the channel so it can capture it)", { channelRef });
         return [];
       }
-      return members;
+      const auth = deps.authConfig as { tenantId?: string; clientSecret?: string };
+      try {
+        // Native global fetch (readTeamRoster's default), same outbound path the workflows/approval
+        // clients use. Returns {id,name,email} already shaped for normalizeMembers/resolveChannelMentions.
+        return await readTeamRoster({
+          tenantId: (auth.tenantId ?? "").trim(),
+          clientId: deps.botAppId,
+          clientSecret: auth.clientSecret ?? "",
+          groupId,
+        });
+      } catch (e) {
+        deps.log("teams list-members failed (graph)", { channelRef, error: e instanceof Error ? e.message : String(e) });
+        return [];
+      }
     },
     // T13: post a card to a channel (proactive continueConversation) and return its ref so the worker
     // can store it for a later close. null when the channel is unknown or the send fails.

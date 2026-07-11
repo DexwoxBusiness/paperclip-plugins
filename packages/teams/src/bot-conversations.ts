@@ -22,8 +22,10 @@ export interface ConversationRef {
   serviceUrl?: string;
   /** The conversation — its `id` is our storage key. */
   conversation?: { id?: string; conversationType?: string; name?: string; tenantId?: string };
-  /** Teams routing hints, when present. */
-  channelData?: { teamId?: string; channelId?: string; tenant?: { id?: string } };
+  /** Teams routing hints, when present. `team.aadGroupId` is the team's AAD group id — required to
+   * read the roster via Microsoft Graph (GET /teams/{aadGroupId}/members). Captured on inbound turns
+   * (getConversationReference alone does NOT include channelData). */
+  channelData?: { teamId?: string; channelId?: string; tenant?: { id?: string }; team?: { id?: string; aadGroupId?: string } };
   [k: string]: unknown;
 }
 

@@ -93,13 +93,21 @@ export async function fetchGraphAppToken(
   return { token: json.access_token, expiresInSec: typeof json.expires_in === "number" ? json.expires_in : 3600 };
 }
 
+/** Drop every expired entry — keeps the cache bounded to tenants with a currently-valid token, so a
+ * long-running multi-tenant worker doesn't accumulate stale entries for tenants it never revisits. */
+function purgeExpiredTokens(now: number): void {
+  for (const [k, v] of tokenCache) if (now >= v.expiresAtMs) tokenCache.delete(k);
+}
+
 /** Return a cached token if still fresh, else mint one and cache it. */
 async function getAppToken(input: { tenantId: string; clientId: string; clientSecret: string; timeoutMs?: number }, fetchImpl: GraphFetch): Promise<string> {
+  const now = Date.now();
   const key = tokenKey((input.tenantId ?? "").trim(), input.clientId);
   const hit = tokenCache.get(key);
-  if (hit && Date.now() < hit.expiresAtMs) return hit.token;
+  if (hit && now < hit.expiresAtMs) return hit.token;
+  purgeExpiredTokens(now); // bound memory: evict this stale entry + any never-revisited expired tenants
   const { token, expiresInSec } = await fetchGraphAppToken(input, fetchImpl);
-  tokenCache.set(key, { token, expiresAtMs: Date.now() + Math.max(0, expiresInSec * 1000 - TOKEN_EXPIRY_SKEW_MS) });
+  tokenCache.set(key, { token, expiresAtMs: now + Math.max(0, expiresInSec * 1000 - TOKEN_EXPIRY_SKEW_MS) });
   return token;
 }
 

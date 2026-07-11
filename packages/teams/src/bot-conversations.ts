@@ -86,8 +86,15 @@ function coerce(raw: unknown): ConversationMap {
 }
 
 export interface ConversationStore {
-  /** Persist (or refresh) a reference. Returns the key, or null if the ref lacks a conversation id. */
-  remember(reference: ConversationRef): Promise<string | null>;
+  /**
+   * Persist (or refresh) a reference. Returns the key, or null if the ref lacks a conversation id.
+   *
+   * Pass `merge` to compute the stored reference ATOMICALLY inside the lock from the EXISTING entry —
+   * a read-modify-write with no lost-update race and no extra backend read (the blob is loaded once).
+   * Used to preserve previously-captured channelData/team.aadGroupId when a later turn's channelData
+   * is missing it. `merge(existing)` runs under the lock and returns the reference to store.
+   */
+  remember(reference: ConversationRef, merge?: (existing: StoredConversation | undefined) => ConversationRef): Promise<string | null>;
   get(key: string): Promise<StoredConversation | undefined>;
   list(): Promise<StoredConversation[]>;
   forget(key: string): Promise<void>;
@@ -114,12 +121,15 @@ export function createConversationStore(backend: ConversationStoreBackend, opts:
   const load = async (): Promise<ConversationMap> => coerce(await backend.get(CONVERSATIONS_KEY));
 
   return {
-    remember(reference) {
+    remember(reference, merge) {
       return lock(async () => {
         const key = conversationKey(reference);
         if (!key) return null;
         const map = await load();
-        map[key] = { key, reference, updatedAt: now() };
+        // `merge` sees the current entry and returns the ref to store — all within the lock, so
+        // concurrent inbound turns can't clobber each other's channelData/team-id capture.
+        const finalRef = merge ? merge(map[key]) : reference;
+        map[key] = { key, reference: finalRef, updatedAt: now() };
         await backend.set(CONVERSATIONS_KEY, map);
         return key;
       });

@@ -281,19 +281,21 @@ export function createTeamsBot(deps: TeamsBotDeps): TeamsBot {
     // does NOT include it, but the Graph roster read (GET /teams/{aadGroupId}/members) needs it (the
     // bot Connector's getPagedMembers can't return member emails). MERGE with any previously-captured
     // channelData so a later turn whose channelData lacks team.aadGroupId (e.g. a card submit) doesn't
-    // wipe the id — the group id captured from an earlier @mention survives.
+    // wipe the id. The merge runs INSIDE the store's lock (atomic read-modify-write, single blob read)
+    // so concurrent inbound turns can't lose the earlier capture.
     const incoming = (context.activity as { channelData?: unknown }).channelData;
     const incomingCd = incoming && typeof incoming === "object" ? (incoming as ConversationRef["channelData"]) : undefined;
-    const priorCd = (await deps.conversations.get(key))?.reference.channelData;
-    if (incomingCd || priorCd) {
+    await deps.conversations.remember(reference, (existing) => {
+      const priorCd = existing?.reference.channelData;
+      if (!incomingCd && !priorCd) return reference;
       reference.channelData = {
         ...priorCd,
         ...incomingCd,
         team: { ...priorCd?.team, ...incomingCd?.team },
         tenant: { ...priorCd?.tenant, ...incomingCd?.tenant },
       } as ConversationRef["channelData"];
-    }
-    await deps.conversations.remember(reference);
+      return reference;
+    });
   };
 
   handler.onConversationUpdate(async (context: TurnContext, next: () => Promise<void>) => {

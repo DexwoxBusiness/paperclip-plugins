@@ -136,7 +136,7 @@ export const TEAMS_AGENT_TOOLS = {
         mentions: {
           type: "array",
           description:
-            "Optional people to actually @-mention (real Teams notification). Each entry is an email or a member id from list_channel_members; resolved against the live channel roster. Entries that match no current member are returned in `unresolvedMentions`; up to 20 people are pinged and any beyond that cap are returned in `skippedMentions` — nothing is silently dropped. Plain text like an email in `text` does NOT notify — use this to ping people.",
+            "Optional people to actually @-mention (real Teams notification). Each entry is an email/UPN (preferred) or an Entra object id; an email is resolved to the person via the directory. Emails that match no user are returned in `unresolvedMentions`; up to 20 people are pinged and any beyond that cap are returned in `skippedMentions` — nothing is silently dropped. Plain text like an email in `text` does NOT notify — use this to ping people.",
           items: { type: "string" },
         },
         correlationId: { type: "string", description: "Your own key to group related posts/responses, e.g. standup:2026-07-10-am." },

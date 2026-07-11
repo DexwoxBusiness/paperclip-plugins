@@ -11,6 +11,7 @@ import {
   normalizeMembers,
   parseChannelSubmit,
   resolveChannelMentions,
+  resolveMentionsFromLookup,
   type ChannelPost,
 } from "../src/channel.js";
 
@@ -167,6 +168,37 @@ describe("resolveChannelMentions", () => {
     expect(resolved.length + skipped.length).toBe(req.length);
     // The skipped entries are exactly the overflow requests (the last 5).
     expect(skipped).toEqual(req.slice(MAX_MENTIONS));
+  });
+});
+
+describe("resolveMentionsFromLookup (shared bucketing over the Graph email→object-id path)", () => {
+  // lookup mimics the bot: emails resolve to an object id; an unknown email → undefined (unresolved).
+  const lookup = (k: string): { id: string; name: string } | undefined => {
+    if (k === "business@dexwox.com") return { id: "obj-biz", name: "Business Dexwox" };
+    if (k === "ferin.c@dexwox.com") return { id: "obj-ferin", name: "Ferin C" };
+    if (k.startsWith("29:") || k.startsWith("obj-")) return { id: k, name: k }; // literal id passthrough
+    return undefined;
+  };
+
+  it("resolves emails to their object id and mentions by it", () => {
+    const { resolved, unresolved } = resolveMentionsFromLookup(["Business@Dexwox.com"], lookup);
+    expect(resolved).toEqual([{ id: "obj-biz", name: "Business Dexwox" }]);
+    expect(unresolved).toEqual([]);
+  });
+
+  it("buckets an unknown email as unresolved (never fabricated) and dedupes email+id for one person", () => {
+    const { resolved, unresolved, duplicate } = resolveMentionsFromLookup(["ghost@x.com", "business@dexwox.com", "obj-biz"], lookup);
+    expect(resolved).toEqual([{ id: "obj-biz", name: "Business Dexwox" }]);
+    expect(unresolved).toEqual(["ghost@x.com"]);
+    expect(duplicate).toEqual(["obj-biz"]); // same person as the email — collapsed, surfaced
+  });
+
+  it("caps at MAX_MENTIONS, overflow → skipped; a lookup with a blank id is unresolved", () => {
+    const many = Array.from({ length: MAX_MENTIONS + 3 }, (_, i) => `obj-${i}`);
+    const { resolved, skipped } = resolveMentionsFromLookup(many, lookup);
+    expect(resolved).toHaveLength(MAX_MENTIONS);
+    expect(skipped).toEqual(many.slice(MAX_MENTIONS));
+    expect(resolveMentionsFromLookup(["x@y.com"], () => ({ id: "  ", name: "blank" })).unresolved).toEqual(["x@y.com"]);
   });
 });
 

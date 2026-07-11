@@ -172,6 +172,20 @@ export function resolveChannelMentions(
       if (k) byKey.set(k, entry);
     }
   }
+  return resolveMentionsFromLookup(requested, (k) => byKey.get(k));
+}
+
+/**
+ * The shared bucketing core (dedupe + {@link MAX_MENTIONS} cap + resolved/unresolved/skipped/duplicate),
+ * decoupled from HOW a key resolves. `lookup(loweredKey)` returns the mention target for a requested
+ * email/UPN/id or undefined when it can't be resolved. Used both by the roster path
+ * ({@link resolveChannelMentions}) and the Graph `GET /users/{email}` path (email → Entra object id),
+ * so the "never silently drop a requested person" guarantee is identical for both.
+ */
+export function resolveMentionsFromLookup(
+  requested: readonly string[],
+  lookup: (loweredKey: string) => { id: string; name: string } | undefined,
+): { resolved: ChannelMention[]; unresolved: string[]; skipped: string[]; duplicate: string[] } {
   const resolved: ChannelMention[] = [];
   const unresolved: string[] = [];
   const skipped: string[] = [];
@@ -180,21 +194,22 @@ export function resolveChannelMentions(
   for (const req of requested) {
     const key = String(req ?? "").trim().toLowerCase();
     if (!key) continue; // blank input is not an addressable request (the tool also pre-filters these)
-    const hit = byKey.get(key);
-    if (!hit) {
-      unresolved.push(String(req));
+    const hit = lookup(key);
+    const id = String(hit?.id ?? "").trim();
+    if (!hit || !id) {
+      unresolved.push(String(req)); // no match / no id — never guessed or fabricated
       continue;
     }
-    if (seen.has(hit.id)) {
+    if (seen.has(id)) {
       duplicate.push(String(req)); // repeat of an already-counted person — surfaced, never silently dropped
       continue;
     }
-    seen.add(hit.id);
+    seen.add(id);
     if (resolved.length >= MAX_MENTIONS) {
-      skipped.push(String(req)); // valid member, but over the cap — surfaced, never silently dropped
+      skipped.push(String(req)); // valid target, but over the cap — surfaced, never silently dropped
       continue;
     }
-    resolved.push({ id: hit.id, name: atName(hit.name) });
+    resolved.push({ id, name: atName(hit.name) });
   }
   return { resolved, unresolved, skipped, duplicate };
 }

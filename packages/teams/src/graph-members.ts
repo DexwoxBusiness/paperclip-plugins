@@ -60,11 +60,6 @@ const tokenKey = (tenantId: string, clientId: string): string => `${tenantId}|${
  * worker sees a bounded set of tenants; this caps memory without an event-loop-blocking sweep per call. */
 const TOKEN_CACHE_SWEEP_AT = 256;
 
-/** Test hook: drop all cached tokens so each test starts clean. */
-export function _resetGraphTokenCache(): void {
-  tokenCache.clear();
-}
-
 /**
  * Mint an app-only Graph token (client-credentials) for the bot's Entra app. Throws with a clean,
  * secret-free message on failure. Returns the token + its lifetime so the caller can cache it.
@@ -172,6 +167,157 @@ const defaultGraphFetch: GraphFetch = (url, init) =>
       i: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal },
     ) => Promise<{ ok: boolean; status: number; json(): Promise<unknown>; text(): Promise<string> }>
   )(url, init);
+
+// -------------------------------------------------------------------------------------------------
+// Resolve people by email/UPN → their Entra object id (for @-mentions). This is the DIRECT path that
+// makes the team-roster read (and thus team.aadGroupId) unnecessary for mentions: Microsoft documents
+// that a bot can @-mention by Entra Object ID or UPN in an Adaptive Card, and Graph returns that object
+// id. Authorized by the app-only Graph permission User.Read.All (or User.ReadBasic.All) — a tenant
+// grant, not the RSC/roster path.
+//
+// A requested key can be an SMTP email (the `mail` property) OR a userPrincipalName — and they are NOT
+// interchangeable: GET /users/{key} only accepts a UPN or object id, so an SMTP-only address 404s
+// there. Instead we resolve the whole batch in ONE request with an advanced $filter that matches
+// EITHER property: `mail in (...) or userPrincipalName in (...)`. Advanced filter operators on `mail`
+// require the `ConsistencyLevel: eventual` header AND `$count=true`.
+//   https://learn.microsoft.com/graph/aad-advanced-queries
+//   https://learn.microsoft.com/graph/api/user-list
+// -------------------------------------------------------------------------------------------------
+
+/** A person resolved from Graph: their Entra object id + display name + email/UPN (lowercased email/upn). */
+export interface GraphUser {
+  /** Entra object id — a valid Adaptive Card mention id for bots. */
+  id: string;
+  name: string;
+  /** Lowercased mail (falls back to UPN); "" when Graph omits both. */
+  email: string;
+  /** Lowercased userPrincipalName (also a valid bot mention id). */
+  upn: string;
+}
+
+function toGraphUser(raw: unknown): GraphUser | null {
+  if (!raw || typeof raw !== "object") return null;
+  const u = raw as { id?: unknown; displayName?: unknown; mail?: unknown; userPrincipalName?: unknown };
+  const id = String(u.id ?? "").trim();
+  if (!id) return null;
+  const upn = String(u.userPrincipalName ?? "").trim().toLowerCase();
+  const email = String(u.mail ?? "").trim().toLowerCase() || upn;
+  const name = String(u.displayName ?? "").trim() || email || upn || id;
+  return { id, name, email, upn };
+}
+
+/** OData single-quote escaping ('' for a literal quote), wrapped in quotes: a@x.com -> 'a@x.com'. */
+const odataStr = (s: string): string => `'${s.replace(/'/g, "''")}'`;
+
+/**
+ * Resolve a batch of email/UPN keys to {@link GraphUser}s in ONE Graph request (no N+1). Filters on
+ * `mail in (...) or userPrincipalName in (...)` so an SMTP address that differs from the UPN still
+ * resolves. Follows @odata.nextLink. Throws GraphMembersError on a non-ok response so the caller can
+ * fall back / retry. Returns the raw matched users (caller indexes them by mail/upn).
+ */
+export async function fetchUsersByKeys(
+  input: { token: string; keys: readonly string[]; timeoutMs?: number },
+  fetchImpl: GraphFetch,
+): Promise<GraphUser[]> {
+  const keys = (input.keys ?? []).map((k) => String(k ?? "").trim()).filter(Boolean);
+  if (keys.length === 0) return [];
+  const list = keys.map(odataStr).join(",");
+  const filter = `mail in (${list}) or userPrincipalName in (${list})`;
+  const out: GraphUser[] = [];
+  const seen = new Set<string>();
+  // $count=true + ConsistencyLevel:eventual are REQUIRED for the `in` operator on mail (advanced query).
+  let url: string | undefined = `${GRAPH}/users?$select=id,displayName,mail,userPrincipalName&$count=true&$filter=${encodeURIComponent(filter)}`;
+  while (url) {
+    const res = await fetchImpl(url, { method: "GET", headers: { authorization: `Bearer ${input.token}`, ConsistencyLevel: "eventual" }, signal: timeoutSignal(input.timeoutMs) });
+    if (!res.ok) {
+      const detail = (await res.text().catch(() => "")).slice(0, 300);
+      throw new GraphMembersError(`graph users filter failed (${res.status}): ${detail}`, res.status);
+    }
+    const page = (await res.json()) as { value?: unknown[]; ["@odata.nextLink"]?: string };
+    for (const raw of page.value ?? []) {
+      const u = toGraphUser(raw);
+      if (u && !seen.has(u.id)) {
+        seen.add(u.id);
+        out.push(u);
+      }
+    }
+    url = page["@odata.nextLink"];
+  }
+  return out;
+}
+
+// Per-tenant cache of resolved email/UPN -> user, so repeated posts (a standup pings the same people
+// daily) don't re-hit Graph. Keyed `${tenant}|${loweredKey}`; a short TTL bounds staleness (renames).
+interface CachedUser {
+  user: GraphUser;
+  expiresAtMs: number;
+}
+const userCache = new Map<string, CachedUser>();
+const USER_CACHE_TTL_MS = 5 * 60_000;
+const userCacheKey = (tenantId: string, loweredKey: string): string => `${tenantId}|${loweredKey}`;
+
+/** Test hook: drop all cached app tokens AND resolved users so each test starts clean. */
+export function _resetGraphTokenCache(): void {
+  tokenCache.clear();
+  userCache.clear();
+}
+
+/**
+ * Resolve a batch of email/UPN keys to {@link GraphUser}s, keyed by the LOWERCASED requested key.
+ * Serves hits from the per-tenant cache and issues at most ONE batched Graph request for the misses
+ * (mints/caches the app token too). On a 401 the token is dropped and the batch retried once. A
+ * non-401 failure (e.g. 403 missing User.Read.All) throws so the caller can fall back to a UPN mention.
+ */
+export async function resolveGraphUsers(
+  input: { tenantId: string; clientId: string; clientSecret: string; keys: readonly string[]; timeoutMs?: number },
+  fetchImpl: GraphFetch = defaultGraphFetch,
+): Promise<Map<string, GraphUser>> {
+  const tenant = (input.tenantId ?? "").trim();
+  // Dedupe by LOWERCASED key: emails/UPNs are case-insensitive, so "A@x.com" and "a@x.com" are the same
+  // person — the map keys match the lowercased lookup in resolveMentionsFromLookup.
+  const keys = Array.from(new Set((input.keys ?? []).map((k) => String(k ?? "").trim().toLowerCase()).filter(Boolean)));
+  const out = new Map<string, GraphUser>();
+  if (keys.length === 0) return out;
+
+  const now = Date.now();
+  const misses: string[] = [];
+  for (const key of keys) {
+    const hit = userCache.get(userCacheKey(tenant, key));
+    if (hit && now < hit.expiresAtMs) out.set(key, hit.user);
+    else misses.push(key);
+  }
+  if (misses.length === 0) return out; // fully served from cache — no token, no Graph call
+
+  const cacheUser = (u: GraphUser): void => {
+    const exp = Date.now() + USER_CACHE_TTL_MS;
+    if (u.email) userCache.set(userCacheKey(tenant, u.email), { user: u, expiresAtMs: exp });
+    if (u.upn) userCache.set(userCacheKey(tenant, u.upn), { user: u, expiresAtMs: exp });
+  };
+  const runOnce = async (): Promise<void> => {
+    const token = await getAppToken(input, fetchImpl);
+    const users = await fetchUsersByKeys({ token, keys: misses, timeoutMs: input.timeoutMs }, fetchImpl);
+    // Index the matched users by BOTH mail and upn so a request by either resolves; cache each.
+    const byKey = new Map<string, GraphUser>();
+    for (const u of users) {
+      if (u.email) byKey.set(u.email, u);
+      if (u.upn) byKey.set(u.upn, u);
+      cacheUser(u);
+    }
+    for (const key of misses) {
+      const u = byKey.get(key);
+      if (u) out.set(key, u);
+    }
+  };
+  try {
+    await runOnce();
+  } catch (e) {
+    if (e instanceof GraphMembersError && e.status === 401) {
+      tokenCache.delete(tokenKey(tenant, input.clientId));
+      await runOnce();
+    } else throw e;
+  }
+  return out;
+}
 
 /**
  * Token (cached) + members in one call. `fetchImpl` defaults to native fetch (present in the Node

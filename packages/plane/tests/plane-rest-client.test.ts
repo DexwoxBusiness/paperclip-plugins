@@ -53,7 +53,7 @@ const router: Handler = (method, url) => {
   if (method === "GET" && /\/work-items\/search$/.test(path))
     return { status: 200, body: { issues: [{ id: "u1", name: "A", sequence_id: 1, project__identifier: "PCLIP", project_id: "p1" }] } };
   if (method === "GET" && /\/work-items\/PCLIP-12$/.test(path))
-    return { status: 200, body: { id: "i12", project: "p1", sequence_id: 12, name: "Title", description_html: "<p>d</p>", state: "Todo", labels: ["l1"], comments: [{ id: "c1", comment_html: "<p>hi</p>" }] } };
+    return { status: 200, body: { id: "i12", project: "p1", sequence_id: 12, name: "Title", description_html: "<p>d</p>", state: { id: "st-todo", name: "Todo", group: "unstarted" }, labels: ["l1"], comments: [{ id: "c1", comment_html: "<p>hi</p>" }] } };
   if (method === "GET" && /\/projects\/p1\/work-items$/.test(path))
     return {
       status: 200,
@@ -205,10 +205,34 @@ describe("createPlaneRestClient — work-items mappings & URLs", () => {
     const h = makeClient(router);
     const wi = await h.client.getWorkItem("PCLIP-12");
     expect(h.calls[0].url).toContain("/work-items/PCLIP-12");
+    // state comes back as an expanded object (expand=state) — map to its NAME, never "[object Object]"
     expect(wi).toMatchObject({ id: "i12", identifier: "PCLIP-12", name: "Title", state: "Todo" });
+    expect(wi.state).not.toBe("[object Object]");
     expect(wi.labels).toEqual(["l1"]);
     expect(wi.comments[0]).toMatchObject({ id: "c1", bodyHtml: "<p>hi</p>" });
     expect(wi.url).toBe("https://plane.example.com/acme/browse/PCLIP-12/");
+  });
+
+  it("list_work_items gives the agent the readable state NAME (object→name, string→as-is, no-name→id)", async () => {
+    const h = makeClient((method, url) => {
+      const path = url.split("?")[0];
+      if (method === "GET" && /\/projects\/p1$/.test(path)) return { status: 200, body: { identifier: "PROJ" } };
+      if (method === "GET" && /\/projects\/p1\/work-items$/.test(path))
+        return {
+          status: 200,
+          body: {
+            results: [
+              { id: "w1", name: "One", sequence_id: 1, state: { id: "s1", name: "In Progress" } }, // object → name
+              { id: "w2", name: "Two", sequence_id: 2, state: "raw-uuid" }, // plain string → preserved
+              { id: "w3", name: "Three", sequence_id: 3, state: { id: "s3" } }, // object without name → id
+            ],
+          },
+        };
+      return { status: 404, body: {} };
+    });
+    const res = await h.client.listWorkItems({ projectId: "p1" });
+    expect(res.items.map((i) => i.state)).toEqual(["In Progress", "raw-uuid", "s3"]);
+    expect(res.items.every((i) => i.state !== "[object Object]")).toBe(true);
   });
 
   it("searches via work-items/search, parses the `issues` array + project__identifier, and does NO per-hit project lookup (Kody perf)", async () => {

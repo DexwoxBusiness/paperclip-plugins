@@ -208,6 +208,18 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
     return Array.isArray(raw.labels) ? raw.labels.map((l) => String(l)) : [];
   }
 
+  /** A work item's `state` is a UUID string by default, or (with expand=state) an expanded object
+   * `{ id, name, group, ... }`. Prefer the human-readable NAME, fall back to the id/uuid, else "".
+   * Without this, `String(state)` on the expanded object yields the useless "[object Object]". */
+  function stateOf(state: unknown): string {
+    if (typeof state === "string") return state;
+    if (state && typeof state === "object") {
+      const s = state as Record<string, unknown>;
+      return String(s.name ?? s.id ?? "");
+    }
+    return "";
+  }
+
   function commentsOf(raw: Record<string, unknown>): PlaneComment[] {
     const arr = Array.isArray(raw.comments) ? raw.comments : [];
     return arr.map((c) => {
@@ -284,7 +296,7 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
       identifier,
       name: String(raw.name ?? ""),
       descriptionHtml: String(raw.description_html ?? raw.description ?? ""),
-      state: String(raw.state ?? ""),
+      state: stateOf(raw.state), // expand=state → object; take the name, never "[object Object]"
       priority: typeof raw.priority === "string" ? raw.priority : undefined,
       labels: labelsOf(raw),
       assignees: assigneesOf(raw),
@@ -334,7 +346,7 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
           id: String(o.id ?? ""),
           identifier,
           name: String(o.name ?? ""),
-          state: String(o.state ?? ""),
+          state: stateOf(o.state),
           url: browseUrl(identifier),
         };
       });
@@ -372,13 +384,7 @@ export function createPlaneRestClient(deps: PlaneRestClientDeps): PlaneRestClien
         const o = (r ?? {}) as Record<string, unknown>;
         const seq = o.sequence_id;
         const identifier = projIdent && seq !== undefined ? `${projIdent}-${seq}` : String(o.id ?? "");
-        const state =
-          typeof o.state === "string"
-            ? o.state
-            : o.state && typeof o.state === "object"
-              ? String((o.state as Record<string, unknown>).name ?? (o.state as Record<string, unknown>).id ?? "")
-              : "";
-        return { id: String(o.id ?? ""), identifier, name: String(o.name ?? ""), state, url: browseUrl(identifier), assignees: assigneesOf(o) };
+        return { id: String(o.id ?? ""), identifier, name: String(o.name ?? ""), state: stateOf(o.state), url: browseUrl(identifier), assignees: assigneesOf(o) };
       });
       if (input.assigneeId) {
         const aid = input.assigneeId;

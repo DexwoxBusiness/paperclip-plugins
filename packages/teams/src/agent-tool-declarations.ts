@@ -133,6 +133,11 @@ export const TEAMS_AGENT_TOOLS = {
           },
         },
         heading: { type: "string", description: "Optional bold heading for a plain announcement (ignored when collect=true)." },
+        markdown: {
+          type: "boolean",
+          description:
+            "When true, render a safe Markdown subset in `text` — **bold**, *italics*, and `-`/`1.` lists — so an authored report reads well. Default false = plain text (Markdown shows literally). Use it for summaries you formatted. Safe even when you quote people's replies: links/images never render as clickable and `@` never pings.",
+        },
         mentions: {
           type: "array",
           description:

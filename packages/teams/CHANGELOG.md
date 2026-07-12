@@ -1,5 +1,11 @@
 # @dexwox-labs/paperclip-plugin-teams
 
+## 0.13.0
+
+### Minor Changes
+
+- [#55](https://github.com/DexwoxBusiness/paperclip-plugins/pull/55) [`7932b43`](https://github.com/DexwoxBusiness/paperclip-plugins/commit/7932b43c37c1500423a90927b1f1f77c8ca5705b) Thanks [@DexwoxBusiness](https://github.com/DexwoxBusiness)! - Sanitse issues fixes for md content to card
+
 ## 0.12.0
 
 ### Minor Changes

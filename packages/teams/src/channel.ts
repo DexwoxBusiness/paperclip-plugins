@@ -13,7 +13,7 @@
  */
 
 import { adaptiveCard, inputText, submitAction, textBlock, type AdaptiveCard, type CardAction, type CardElement, type MsTeamsMentionEntity } from "./adaptive-card.js";
-import { sanitizeCardText, sanitizeInputPrefill } from "./card-safety.js";
+import { sanitizeCardMarkdown, sanitizeCardText, sanitizeInputPrefill } from "./card-safety.js";
 import { type AskField } from "./ask.js"; // reuse the structured-input shape (id/label/multiline/placeholder/prefill)
 
 export type ChannelPostStatus = "open" | "closed";
@@ -255,7 +255,10 @@ export function effectiveChannelFields(post: Pick<ChannelPost, "fields">): AskFi
 export function buildAnnouncementCard(text: string, opts: { heading?: string; mentions?: ChannelMention[] } = {}): AdaptiveCard {
   const body: CardElement[] = [];
   if (opts.heading) body.push(textBlock(sanitizeCardText(opts.heading, 200), { weight: "Bolder", size: "Large" }));
-  body.push(textBlock(sanitizeCardText(text), { wrap: true }));
+  // Agent-authored report body: preserve Markdown + line breaks so it renders readably (Teams TextBlocks
+  // render a Markdown subset). sanitizeCardMarkdown keeps formatting but still strips control chars,
+  // defuses @-mentions, and caps length. (sanitizeCardText is for UNTRUSTED text and escapes all MD.)
+  body.push(textBlock(sanitizeCardMarkdown(text), { wrap: true }));
   const mentions = renderMentions(opts.mentions);
   if (mentions) body.push(mentionLine(mentions.atRuns));
   const card = adaptiveCard(body);
@@ -269,7 +272,7 @@ export function buildAnnouncementCard(text: string, opts: { heading?: string; me
  * are control-safe-stripped (an Input.Text value round-trips verbatim).
  */
 export function buildChannelPromptCard(post: ChannelPost, opts: { mentions?: ChannelMention[] } = {}): AdaptiveCard {
-  const body: CardElement[] = [textBlock(sanitizeCardText(post.prompt), { weight: "Bolder", wrap: true })];
+  const body: CardElement[] = [textBlock(sanitizeCardMarkdown(post.prompt), { weight: "Bolder", wrap: true })];
   const mentions = renderMentions(opts.mentions);
   if (mentions) body.push(mentionLine(mentions.atRuns)); // after the prompt, before the inputs
   for (const f of effectiveChannelFields(post)) {

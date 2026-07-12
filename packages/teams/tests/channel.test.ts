@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { validateAdaptiveCard } from "../src/adaptive-card.js";
+import { sanitizeCardMarkdown } from "../src/card-safety.js";
 import {
   buildAnnouncementCard,
   buildChannelClosedCard,
@@ -239,5 +240,31 @@ describe("channel cards with @-mentions", () => {
     const card = buildAnnouncementCard("hi", { mentions: [{ id: "29:x", name: "Ev<il>Name" }] });
     expect(card.msteams?.entities?.[0]).toEqual({ type: "mention", text: "<at>EvilName</at>", mentioned: { id: "29:x", name: "EvilName" } });
     expect(validateAdaptiveCard(card).ok).toBe(true);
+  });
+});
+
+describe("agent report Markdown renders (readable, not raw ** and -)", () => {
+  it("sanitizeCardMarkdown keeps markdown + newlines, defuses @, strips controls, caps length", () => {
+    expect(sanitizeCardMarkdown("**Progress:**\n- DEX-1 done\n- DEX-2 in review")).toBe("**Progress:**\n- DEX-1 done\n- DEX-2 in review");
+    expect(sanitizeCardMarkdown("ping @channel")).toBe("ping @​channel"); // @ defused
+    expect(sanitizeCardMarkdown("a bc")).toBe("abc"); // C0 controls stripped
+    expect(sanitizeCardMarkdown("\tkept\nkept")).toBe("\tkept\nkept"); // tab + newline preserved
+    expect(sanitizeCardMarkdown("x".repeat(5), 3)).toBe("xx…"); // capped
+    expect(sanitizeCardMarkdown(undefined)).toBe("");
+  });
+
+  it("announcement body preserves bold/bullets/newlines instead of escaping them", () => {
+    const report = "**Plane progress:**\n- DEXLEND-129 done\n- DEXLEND-130 in review\n\nNo blockers.";
+    const card = buildAnnouncementCard(report, { heading: "Daily wrap-up 2026-07-12" });
+    const body = String(card.body[card.body.length - 1].text);
+    expect(body).toBe(report); // rendered verbatim (Teams renders the MD) — NOT backslash-escaped, NOT newline-flattened
+    expect(body).not.toContain("\\*"); // markdown not escaped
+    expect(body).toContain("\n"); // newlines kept (bullets stay on separate lines)
+    expect(validateAdaptiveCard(card).ok).toBe(true);
+  });
+
+  it("prompt card body also renders agent markdown", () => {
+    const card = buildChannelPromptCard(post({ prompt: "**Stand-up** — reply below" }));
+    expect(String(card.body[0].text)).toBe("**Stand-up** — reply below");
   });
 });

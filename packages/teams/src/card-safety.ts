@@ -35,6 +35,25 @@ export function sanitizeCardText(text: string | undefined, maxLen = MAX_TEXT_LEN
   return escaped.length > maxLen ? `${escaped.slice(0, maxLen - 1)}${ELLIPSIS}` : escaped;
 }
 
+/**
+ * Sanitize AGENT-AUTHORED text for a Markdown-rendering TextBlock while PRESERVING formatting.
+ *
+ * Unlike {@link sanitizeCardText} (which escapes ALL Markdown and flattens newlines because its input
+ * is untrusted), this keeps Markdown (bold, bullet/numbered lists, links) AND newlines so an agent's
+ * report renders readably in Teams instead of showing raw `**` and `-`. It still strips unsafe C0
+ * control chars (keeps tab + newline), defuses every `@` with a zero-width break so the body text can
+ * NOT inject unintended Teams mentions (real pings go through post_to_channel's `mentions` param), and
+ * caps the length. Use ONLY for text the agent produced (announcement body / prompt), never for
+ * untrusted end-user input echoed back into a card.
+ */
+export function sanitizeCardMarkdown(text: string | undefined, maxLen = MAX_TEXT_LEN): string {
+  if (typeof text !== "string" || !text) return "";
+  const cleaned = text
+    .replace(INPUT_UNSAFE_CHARS, "") // strip C0 controls + DEL, but KEEP tab + newline (formatting)
+    .replace(/@/g, `@${ZERO_WIDTH}`); // defuse @-mentions so the body can't ping anyone unintentionally
+  return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen - 1)}${ELLIPSIS}` : cleaned;
+}
+
 /** Sanitize a value prefilled into an Input.Text edit box: strip unsafe C0 controls + DEL (keep
  * tab/newline for multiline), length-bound, and do NOT Markdown-escape (round-tripped verbatim). */
 export function sanitizeInputPrefill(text: string | undefined, maxLen = MAX_TEXT_LEN): string {

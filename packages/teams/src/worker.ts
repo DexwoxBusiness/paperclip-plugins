@@ -793,9 +793,12 @@ const teamsPlugin = definePlugin({
             unresolvedMentions = requestedMentions; // couldn't resolve → nothing pinged (still post the message)
           }
         }
+        // Opt-in Markdown rendering (default false = fully escaped). Safe even for consolidations that
+        // quote replies: sanitizeCardMarkdown neutralizes link/image masking + @-mentions.
+        const markdown = p.markdown === true;
         const card = collect
-          ? buildChannelPromptCard(post, { mentions })
-          : buildAnnouncementCard(text, { heading: typeof p.heading === "string" ? p.heading : undefined, mentions });
+          ? buildChannelPromptCard(post, { mentions, markdown })
+          : buildAnnouncementCard(text, { heading: typeof p.heading === "string" ? p.heading : undefined, mentions, markdown });
         // Post the card FIRST; only persist a collecting post once it actually landed (post-before-create,
         // like ask/escalation). An announcement has nothing to collect, so it is never persisted.
         const ref = await bot.postChannelCard(channelRef, card);

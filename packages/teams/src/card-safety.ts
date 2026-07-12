@@ -39,17 +39,20 @@ export function sanitizeCardText(text: string | undefined, maxLen = MAX_TEXT_LEN
  * Sanitize AGENT-AUTHORED text for a Markdown-rendering TextBlock while PRESERVING formatting.
  *
  * Unlike {@link sanitizeCardText} (which escapes ALL Markdown and flattens newlines because its input
- * is untrusted), this keeps Markdown (bold, bullet/numbered lists, links) AND newlines so an agent's
- * report renders readably in Teams instead of showing raw `**` and `-`. It still strips unsafe C0
- * control chars (keeps tab + newline), defuses every `@` with a zero-width break so the body text can
- * NOT inject unintended Teams mentions (real pings go through post_to_channel's `mentions` param), and
- * caps the length. Use ONLY for text the agent produced (announcement body / prompt), never for
- * untrusted end-user input echoed back into a card.
+ * is untrusted), this keeps the SAFE, COSMETIC Markdown subset — bold/italic emphasis, bullet/numbered
+ * lists, and headings — plus newlines, so an agent's report renders readably instead of showing raw
+ * `**`/`-`. It still neutralizes the exploitable bits, because an agent report may embed VERBATIM
+ * end-user replies (from get_channel_responses): it escapes `[`/`]` so `[click](url)` / `![]()` cannot
+ * render as a (maskable) link or image, defuses every `@` with a zero-width break so the body can't
+ * ping anyone, strips unsafe C0 control chars (keeps tab + newline), and caps the length. Emphasis and
+ * lists have no injection surface, so leaving them rendered is safe. Gate behind an explicit opt-in
+ * (post_to_channel `markdown:true`); the default path stays fully escaped ({@link sanitizeCardText}).
  */
 export function sanitizeCardMarkdown(text: string | undefined, maxLen = MAX_TEXT_LEN): string {
   if (typeof text !== "string" || !text) return "";
   const cleaned = text
     .replace(INPUT_UNSAFE_CHARS, "") // strip C0 controls + DEL, but KEEP tab + newline (formatting)
+    .replace(/[[\]]/g, (c) => `\\${c}`) // neutralize [text](url) / ![]() masking so embedded replies can't hide a URL
     .replace(/@/g, `@${ZERO_WIDTH}`); // defuse @-mentions so the body can't ping anyone unintentionally
   return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen - 1)}${ELLIPSIS}` : cleaned;
 }

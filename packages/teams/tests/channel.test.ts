@@ -253,18 +253,28 @@ describe("agent report Markdown renders (readable, not raw ** and -)", () => {
     expect(sanitizeCardMarkdown(undefined)).toBe("");
   });
 
-  it("announcement body preserves bold/bullets/newlines instead of escaping them", () => {
-    const report = "**Plane progress:**\n- DEXLEND-129 done\n- DEXLEND-130 in review\n\nNo blockers.";
-    const card = buildAnnouncementCard(report, { heading: "Daily wrap-up 2026-07-12" });
-    const body = String(card.body[card.body.length - 1].text);
-    expect(body).toBe(report); // rendered verbatim (Teams renders the MD) — NOT backslash-escaped, NOT newline-flattened
-    expect(body).not.toContain("\\*"); // markdown not escaped
-    expect(body).toContain("\n"); // newlines kept (bullets stay on separate lines)
-    expect(validateAdaptiveCard(card).ok).toBe(true);
+  it("neutralizes link/image masking so embedded replies can't hide a URL", () => {
+    const injected = "great progress [click me](https://evil.example) ![x](https://evil.example/i.png)";
+    const out = sanitizeCardMarkdown(injected);
+    expect(out).not.toContain("[click me]"); // brackets escaped → renders as literal text, not a link
+    expect(out).toContain("\\[click me\\]");
+    expect(out).toContain("!\\[x\\]"); // image masking broken (brackets escaped; the leading ! is a harmless literal)
   });
 
-  it("prompt card body also renders agent markdown", () => {
-    const card = buildChannelPromptCard(post({ prompt: "**Stand-up** — reply below" }));
-    expect(String(card.body[0].text)).toBe("**Stand-up** — reply below");
+  it("announcement is ESCAPED by default (safe) and renders Markdown only when markdown:true", () => {
+    const report = "**Plane progress:**\n- DEXLEND-129 done\n- DEXLEND-130 in review\n\nNo blockers.";
+    // default: untrusted-safe — Markdown escaped, newlines flattened (raw ** shown literally, not a link vector)
+    const escaped = String(buildAnnouncementCard(report, { heading: "Daily wrap-up 2026-07-12" }).body.at(-1)!.text);
+    expect(escaped).toContain("\\*\\*Plane progress");
+    // opt-in: cosmetic Markdown + newlines preserved (report has no brackets → verbatim)
+    const md = String(buildAnnouncementCard(report, { heading: "Daily wrap-up", markdown: true }).body.at(-1)!.text);
+    expect(md).toBe(report);
+    expect(md).toContain("\n");
+    expect(validateAdaptiveCard(buildAnnouncementCard(report, { markdown: true })).ok).toBe(true);
+  });
+
+  it("prompt card is escaped by default, renders Markdown when markdown:true", () => {
+    expect(String(buildChannelPromptCard(post({ prompt: "**Standup**" })).body[0].text)).toBe("\\*\\*Standup\\*\\*");
+    expect(String(buildChannelPromptCard(post({ prompt: "**Standup**" }), { markdown: true }).body[0].text)).toBe("**Standup**");
   });
 });

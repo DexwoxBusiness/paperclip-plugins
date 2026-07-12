@@ -252,13 +252,13 @@ export function effectiveChannelFields(post: Pick<ChannelPost, "fields">): AskFi
 /** A plain announcement card (no inputs, no actions) — e.g. a consolidated report the agent built.
  * When `mentions` are supplied, a subtle "cc:" line of real @-mentions is appended and the matching
  * `msteams.entities` are stamped on the card so Teams notifies each mentioned person. */
-export function buildAnnouncementCard(text: string, opts: { heading?: string; mentions?: ChannelMention[] } = {}): AdaptiveCard {
+export function buildAnnouncementCard(text: string, opts: { heading?: string; mentions?: ChannelMention[]; markdown?: boolean } = {}): AdaptiveCard {
   const body: CardElement[] = [];
   if (opts.heading) body.push(textBlock(sanitizeCardText(opts.heading, 200), { weight: "Bolder", size: "Large" }));
-  // Agent-authored report body: preserve Markdown + line breaks so it renders readably (Teams TextBlocks
-  // render a Markdown subset). sanitizeCardMarkdown keeps formatting but still strips control chars,
-  // defuses @-mentions, and caps length. (sanitizeCardText is for UNTRUSTED text and escapes all MD.)
-  body.push(textBlock(sanitizeCardMarkdown(text), { wrap: true }));
+  // SAFE-BY-DEFAULT: escape everything (sanitizeCardText) unless the caller explicitly opts into Markdown.
+  // The body can carry verbatim end-user replies, so Markdown is opt-in; even then sanitizeCardMarkdown
+  // neutralizes link/image masking + @-mentions and only renders cosmetic emphasis/lists.
+  body.push(textBlock(opts.markdown ? sanitizeCardMarkdown(text) : sanitizeCardText(text), { wrap: true }));
   const mentions = renderMentions(opts.mentions);
   if (mentions) body.push(mentionLine(mentions.atRuns));
   const card = adaptiveCard(body);
@@ -271,8 +271,8 @@ export function buildAnnouncementCard(text: string, opts: { heading?: string; me
  * "Send" button whose Submit carries the postId. All display text is Markdown-sanitized; prefills
  * are control-safe-stripped (an Input.Text value round-trips verbatim).
  */
-export function buildChannelPromptCard(post: ChannelPost, opts: { mentions?: ChannelMention[] } = {}): AdaptiveCard {
-  const body: CardElement[] = [textBlock(sanitizeCardMarkdown(post.prompt), { weight: "Bolder", wrap: true })];
+export function buildChannelPromptCard(post: ChannelPost, opts: { mentions?: ChannelMention[]; markdown?: boolean } = {}): AdaptiveCard {
+  const body: CardElement[] = [textBlock(opts.markdown ? sanitizeCardMarkdown(post.prompt) : sanitizeCardText(post.prompt), { weight: "Bolder", wrap: true })];
   const mentions = renderMentions(opts.mentions);
   if (mentions) body.push(mentionLine(mentions.atRuns)); // after the prompt, before the inputs
   for (const f of effectiveChannelFields(post)) {

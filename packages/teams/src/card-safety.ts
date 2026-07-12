@@ -52,8 +52,9 @@ export function sanitizeCardMarkdown(text: string | undefined, maxLen = MAX_TEXT
   if (typeof text !== "string" || !text) return "";
   const cleaned = text
     .replace(INPUT_UNSAFE_CHARS, "") // strip C0 controls + DEL, but KEEP tab + newline (formatting)
-    .replace(/[[\]]/g, (c) => `\\${c}`) // neutralize [text](url) / ![]() masking so embedded replies can't hide a URL
-    .replace(/@/g, `@${ZERO_WIDTH}`); // defuse @-mentions so the body can't ping anyone unintentionally
+    .replace(/\\/g, "\\\\") // escape existing backslashes FIRST — otherwise a pre-escaped reply like `\[x\](url)` would
+    .replace(/[[\]]/g, (c) => `\\${c}`) // survive as a live link (`\\` renders as a literal backslash, leaving the bracket unescaped)
+    .replace(/@/g, `@${ZERO_WIDTH}`); // then neutralize [text](url)/![]() masking + defuse @-mentions
   return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen - 1)}${ELLIPSIS}` : cleaned;
 }
 

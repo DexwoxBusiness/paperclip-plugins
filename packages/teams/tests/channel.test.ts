@@ -261,6 +261,14 @@ describe("agent report Markdown renders (readable, not raw ** and -)", () => {
     expect(out).toContain("!\\[x\\]"); // image masking broken (brackets escaped; the leading ! is a harmless literal)
   });
 
+  it("neutralizes PRE-ESCAPED link syntax too (backslashes are escaped first)", () => {
+    // A malicious reply that already contains `\[x\]` must not survive as a live link: escaping only the
+    // brackets would leave `\\[` (a literal backslash + an UNescaped bracket). We double backslashes first.
+    expect(sanitizeCardMarkdown("[a]")).toBe("\\[a\\]"); // no pre-escape: one backslash per bracket
+    expect(sanitizeCardMarkdown("\\[a\\]")).toBe("\\\\\\[a\\\\\\]"); // pre-escaped: backslash doubled → bracket stays escaped
+    expect(sanitizeCardMarkdown("path\\to\\file")).toBe("path\\\\to\\\\file"); // legit backslashes doubled (render as one)
+  });
+
   it("announcement is ESCAPED by default (safe) and renders Markdown only when markdown:true", () => {
     const report = "**Plane progress:**\n- DEXLEND-129 done\n- DEXLEND-130 in review\n\nNo blockers.";
     // default: untrusted-safe — Markdown escaped, newlines flattened (raw ** shown literally, not a link vector)

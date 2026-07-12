@@ -1,5 +1,11 @@
 # @dexwox-labs/paperclip-plugin-plane
 
+## 0.6.0
+
+### Minor Changes
+
+- [#58](https://github.com/DexwoxBusiness/paperclip-plugins/pull/58) [`e5b2241`](https://github.com/DexwoxBusiness/paperclip-plugins/commit/e5b2241b37b42a43cab2355ca1647e27f3cb10f0) Thanks [@DexwoxBusiness](https://github.com/DexwoxBusiness)! - Fixing to get proper status of the issues from planes instead of object
+
 ## 0.5.1
 
 ### Patch Changes
